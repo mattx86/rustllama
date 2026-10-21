@@ -224,6 +224,10 @@ pub const VERDICT_MATVEC_Q4K_W4A8: &str = "matvec:q4_k_w4a8";
 /// so it auto-enables only where correct AND faster. Fail-closed. The Q8_0 analog
 /// of [`VERDICT_MATVEC_Q4K_W4A8`].
 pub const VERDICT_MATVEC_Q8_0_W8A8: &str = "matvec:q8_0_w8a8";
+/// T3b int-dot fan-out: the Q4_0 / Q5_0 W8A8 DECODE matvecs (symmetric, MMVQ-style
+/// int8 activations, lossy) — same probe + fail-closed story as the Q8_0 analog.
+pub const VERDICT_MATVEC_Q4_0_W8A8: &str = "matvec:q4_0_w8a8";
+pub const VERDICT_MATVEC_Q5_0_W8A8: &str = "matvec:q5_0_w8a8";
 /// #2 on-device activation-residency DECODE attention block (whole attention
 /// block GPU-resident on one stream: rmsnorm→qkv→qk-head-norm→rope→flash→o→
 /// residual+norm, no per-op host round-trip). Unlike the other verdicts this is

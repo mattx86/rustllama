@@ -1007,6 +1007,53 @@ fn try_matvec_q8_0_w8a8_cuda(
     guard.matvec_q8_0_w8a8(weight_key, w_bytes, x, out, m, k)
 }
 
+/// T3b — Q4_0 W8A8 int-dot DECODE gate + driver (fail-closed; mirrors
+/// [`q8_0_w8a8_enabled`] / [`try_matvec_q8_0_w8a8_cuda`]).
+fn q4_0_w8a8_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_MATVEC_Q4_0_W8A8) && cuda_active())
+}
+
+fn try_matvec_q4_0_w8a8_cuda(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_q4_0_w8a8(weight_key, w_bytes, x, out, m, k)
+}
+
+/// T3b — Q5_0 W8A8 int-dot DECODE gate + driver (fail-closed).
+fn q5_0_w8a8_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_MATVEC_Q5_0_W8A8) && cuda_active())
+}
+
+fn try_matvec_q5_0_w8a8_cuda(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_q5_0_w8a8(weight_key, w_bytes, x, out, m, k)
+}
+
 /// Batched XMX/DPAS bf16 GEMM via the USM_ATTN SYCL stream: dequantize W→f32
 /// and run the `joint_matrix` GEMM (the kernel zero-pads the M/N/K tails, so no
 /// dim alignment is required). `false` on any miss — no USM_ATTN context, the
@@ -15328,6 +15375,21 @@ pub fn try_matvec_tensor_usm_f32(
             if matches!(ck_kind, ck::CudaPackedKind::Q8_0)
                 && q8_0_w8a8_enabled()
                 && try_matvec_q8_0_w8a8_cuda(wb.as_ptr() as usize, wb, x, out, m, k)
+            {
+                return true;
+            }
+            // Q4_0 / Q5_0 decode: the lossy W8A8 int-dot matvecs (T3b) FIRST where
+            // their verdict+perf gate passed; a miss falls through to the f32 warp
+            // matvec below. K % 32 handled by the kernel wrapper.
+            if matches!(ck_kind, ck::CudaPackedKind::Q4_0)
+                && q4_0_w8a8_enabled()
+                && try_matvec_q4_0_w8a8_cuda(wb.as_ptr() as usize, wb, x, out, m, k)
+            {
+                return true;
+            }
+            if matches!(ck_kind, ck::CudaPackedKind::Q5_0)
+                && q5_0_w8a8_enabled()
+                && try_matvec_q5_0_w8a8_cuda(wb.as_ptr() as usize, wb, x, out, m, k)
             {
                 return true;
             }

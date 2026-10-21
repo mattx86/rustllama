@@ -6059,6 +6059,213 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Q4_0 W8A8 DECODE matvec (verdict: matvec:q4_0_w8a8, LOSSY; T3b) ----
+    // Symmetric Q4_0 (weight = nibble-8). Same two-part gate as the Q8_0 probe:
+    // correctness vs the fair W8A8 reference, then perf vs the f32 warp matvec.
+    #[allow(clippy::never_loop)]
+    for _w8 in 0..1usize {
+        let name = "matvec:q4_0_w8a8";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q4_0").expect("layout");
+        let cpu = cpu_matvec_for("q4_0");
+        let x = gen_x(MV_K, 4451);
+        let Some((w, _)) = finite_ref(layout, cpu, &x) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let xr = int8_act_roundtrip(&x);
+        let mut cpu_out = vec![0f32; MV_M];
+        cpu(&w, &xr, &mut cpu_out, MV_M, MV_K);
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &x),
+            ck::CudaDeviceBuffer::alloc(&stream, MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: live device buffers on `stream` sized (M,K)/(K)/(M).
+        let res = unsafe {
+            ck::matvec_q4_0_w8a8(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        }
+        let (cos, max_rel) = compare(&cu_download_f32(&ob, MV_M), &cpu_out);
+        if !(cos > 0.999 && max_rel < 0.05) {
+            cu_emit(
+                name,
+                "MISCOMPUTE",
+                &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+            );
+            *counts.entry("MISCOMPUTE").or_default() += 1;
+            continue;
+        }
+        const PM: usize = 4096;
+        const PK: usize = 4096;
+        const WARMUP: usize = 3;
+        const ITERS: usize = 50;
+        let wp = gen_quant_bytes(layout, PM, PK, 0x9AE1);
+        let xp: Vec<f32> = gen_x(PK, 60);
+        let (Some(wpb), Some(xpb), Some(mut opb)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &wp),
+            cu_upload_f32(&stream, &xp),
+            ck::CudaDeviceBuffer::alloc(&stream, PM * 4),
+        ) else {
+            cu_emit(name, "SLOW", "perf-shape device alloc failed");
+            *counts.entry("SLOW").or_default() += 1;
+            continue;
+        };
+        let (wptr, xptr, optr) = (
+            wpb.as_ptr(),
+            xpb.as_ptr() as *const f32,
+            opb.as_mut_ptr() as *mut f32,
+        );
+        // SAFETY: live device buffers sized (PM,PK); each wrapper syncs.
+        let (t_w8a8, t_f32) = unsafe {
+            for _ in 0..WARMUP {
+                let _ = ck::matvec_q4_0_w8a8(&stream, wptr, xptr, optr, PM, PK);
+                let _ = ck::matvec_q4_0_packed_f32(&stream, wptr, xptr, optr, PM, PK);
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = ck::matvec_q4_0_w8a8(&stream, wptr, xptr, optr, PM, PK);
+            }
+            let t8 = t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = ck::matvec_q4_0_packed_f32(&stream, wptr, xptr, optr, PM, PK);
+            }
+            let tf = t1.elapsed().as_secs_f64();
+            (t8, tf)
+        };
+        let detail = format!(
+            "w8a8 {:.4} vs f32 {:.4} ms/call ({PM}x{PK})",
+            t_w8a8 * 1e3 / ITERS as f64,
+            t_f32 * 1e3 / ITERS as f64,
+        );
+        if t_w8a8 < t_f32 * 0.95 {
+            cu_emit(name, "OK", &detail);
+            *counts.entry("OK").or_default() += 1;
+        } else {
+            cu_emit(name, "SLOW", &detail);
+            *counts.entry("SLOW").or_default() += 1;
+        }
+    }
+
+    // ---- Q5_0 W8A8 DECODE matvec (verdict: matvec:q5_0_w8a8, LOSSY; T3b) ----
+    // Symmetric Q5_0 (weight = (nibble | 5th_bit<<4) - 16). Same gate as Q4_0.
+    #[allow(clippy::never_loop)]
+    for _w8 in 0..1usize {
+        let name = "matvec:q5_0_w8a8";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q5_0").expect("layout");
+        let cpu = cpu_matvec_for("q5_0");
+        let x = gen_x(MV_K, 4452);
+        let Some((w, _)) = finite_ref(layout, cpu, &x) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let xr = int8_act_roundtrip(&x);
+        let mut cpu_out = vec![0f32; MV_M];
+        cpu(&w, &xr, &mut cpu_out, MV_M, MV_K);
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &x),
+            ck::CudaDeviceBuffer::alloc(&stream, MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: live device buffers on `stream` sized (M,K)/(K)/(M).
+        let res = unsafe {
+            ck::matvec_q5_0_w8a8(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        }
+        let (cos, max_rel) = compare(&cu_download_f32(&ob, MV_M), &cpu_out);
+        if !(cos > 0.999 && max_rel < 0.05) {
+            cu_emit(
+                name,
+                "MISCOMPUTE",
+                &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+            );
+            *counts.entry("MISCOMPUTE").or_default() += 1;
+            continue;
+        }
+        const PM: usize = 4096;
+        const PK: usize = 4096;
+        const WARMUP: usize = 3;
+        const ITERS: usize = 50;
+        let wp = gen_quant_bytes(layout, PM, PK, 0x9AE2);
+        let xp: Vec<f32> = gen_x(PK, 61);
+        let (Some(wpb), Some(xpb), Some(mut opb)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &wp),
+            cu_upload_f32(&stream, &xp),
+            ck::CudaDeviceBuffer::alloc(&stream, PM * 4),
+        ) else {
+            cu_emit(name, "SLOW", "perf-shape device alloc failed");
+            *counts.entry("SLOW").or_default() += 1;
+            continue;
+        };
+        let (wptr, xptr, optr) = (
+            wpb.as_ptr(),
+            xpb.as_ptr() as *const f32,
+            opb.as_mut_ptr() as *mut f32,
+        );
+        // SAFETY: live device buffers sized (PM,PK); each wrapper syncs.
+        let (t_w8a8, t_f32) = unsafe {
+            for _ in 0..WARMUP {
+                let _ = ck::matvec_q5_0_w8a8(&stream, wptr, xptr, optr, PM, PK);
+                let _ = ck::matvec_q5_0_packed_f32(&stream, wptr, xptr, optr, PM, PK);
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = ck::matvec_q5_0_w8a8(&stream, wptr, xptr, optr, PM, PK);
+            }
+            let t8 = t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = ck::matvec_q5_0_packed_f32(&stream, wptr, xptr, optr, PM, PK);
+            }
+            let tf = t1.elapsed().as_secs_f64();
+            (t8, tf)
+        };
+        let detail = format!(
+            "w8a8 {:.4} vs f32 {:.4} ms/call ({PM}x{PK})",
+            t_w8a8 * 1e3 / ITERS as f64,
+            t_f32 * 1e3 / ITERS as f64,
+        );
+        if t_w8a8 < t_f32 * 0.95 {
+            cu_emit(name, "OK", &detail);
+            *counts.entry("OK").or_default() += 1;
+        } else {
+            cu_emit(name, "SLOW", &detail);
+            *counts.entry("SLOW").or_default() += 1;
+        }
+    }
+
     // ---- Blackwell SM12x FP4 tensor-core GEMM (W4A4) ----
     // The new hand-rolled block-scaled `mma.sync` path (cuda/rsl_blackwell.cuh).
     // SKIP unless this is a real SM12x Blackwell device built with the TC path

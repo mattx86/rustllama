@@ -1817,6 +1817,116 @@ extern "C" int rsl_cuda_matvec_q8_0_w8a8(rsl_cuda_stream *s, const void *w,
     return rsl_cuda_check("rsl_cuda_matvec_q8_0_w8a8");
 }
 
+// ============================================================
+// Q4_0 W8A8 int-dot DECODE matvec (MMVQ-style; T3b). 18 B / 32-wt block
+// { f16 d, 16 B qs }. SYMMETRIC: weight = nibble - 8, with qs[j] low nibble =
+// weight j, high nibble = weight j+16 (same split as `q4_0_row_dot`). Per-32 int8
+// activation (the SAME `q4k_quant_act_kernel`, xsum unused). Lane `p` (0..31) owns
+// weight position `p`: p<16 → qs[p]&0xF, p>=16 → qs[p-16]>>4. int dot + warp
+// shuffle-reduce, folded by d·xs in f32. K % 32 == 0. Verdict `matvec:q4_0_w8a8`.
+// ============================================================
+__global__ void matvec_q4_0_w8a8_decode_kernel(const unsigned char *w,
+                                               const signed char *xq, const float *xs,
+                                               float *out, int M, int K) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y; // one warp per output row
+    if (row >= M) return;
+    int lane = threadIdx.x; // 0..31 — weight position within the 32-block
+    const int bpr = K / 32;
+    float acc = 0.0f;
+    for (int b = 0; b < bpr; ++b) {
+        const unsigned char *blk = w + ((size_t)row * bpr + b) * 18;
+        const unsigned char *qs = blk + 2;
+        int nib = (lane < 16) ? (int)(qs[lane] & 0x0F) : (int)(qs[lane - 16] >> 4);
+        int w_i8 = nib - 8;
+        int prod = w_i8 * (int)xq[(size_t)b * 32 + lane];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            prod += __shfl_down_sync(0xffffffffu, prod, off);
+        if (lane == 0) {
+            float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+            acc += xs[b] * d * (float)prod;
+        }
+    }
+    if (lane == 0) out[row] = acc;
+}
+
+extern "C" int rsl_cuda_matvec_q4_0_w8a8(rsl_cuda_stream *s, const void *w,
+                                         const float *x, float *out, int M, int K) {
+    if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % 32) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    size_t ne = (size_t)K;
+    size_t nsub = (size_t)(K / 32);
+    if (rsl_q4k_ensure_scratch(s, ne, nsub, 0) != 0)
+        return -2;
+    signed char *xq = s->q4k_act_xq;
+    float *xs = s->q4k_act_xs;
+    dim3 qb(32, 8);
+    dim3 qg((unsigned)((ne / 32 + 7) / 8));
+    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, nullptr, (int)ne);
+    dim3 block(32, 8);
+    dim3 grid((unsigned)((M + 7) / 8));
+    matvec_q4_0_w8a8_decode_kernel<<<grid, block, 0, s->stream>>>(
+        (const unsigned char *)w, xq, xs, out, M, K);
+    return rsl_cuda_check("rsl_cuda_matvec_q4_0_w8a8");
+}
+
+// ============================================================
+// Q5_0 W8A8 int-dot DECODE matvec (T3b). 22 B / 32-wt block { f16 d, u32 qh,
+// 16 B qs }. SYMMETRIC: weight = (nibble | (5th_bit << 4)) - 16, where the 5th
+// bit of weight position `p` is `(qh >> p) & 1` (derived from `q5_0_row_dot`:
+// low-half bit = (qh>>j)&1, high-half bit = (qh>>(j+16))&1 — i.e. bit p for all
+// p). Otherwise identical to Q4_0 above. K % 32 == 0. Verdict `matvec:q5_0_w8a8`.
+// ============================================================
+__global__ void matvec_q5_0_w8a8_decode_kernel(const unsigned char *w,
+                                               const signed char *xq, const float *xs,
+                                               float *out, int M, int K) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= M) return;
+    int lane = threadIdx.x; // 0..31 — weight position within the 32-block
+    const int bpr = K / 32;
+    float acc = 0.0f;
+    for (int b = 0; b < bpr; ++b) {
+        const unsigned char *blk = w + ((size_t)row * bpr + b) * 22;
+        unsigned int qh = (unsigned)blk[2] | ((unsigned)blk[3] << 8) |
+                          ((unsigned)blk[4] << 16) | ((unsigned)blk[5] << 24);
+        const unsigned char *qs = blk + 6;
+        int nib = (lane < 16) ? (int)(qs[lane] & 0x0F) : (int)(qs[lane - 16] >> 4);
+        int hb = (int)((qh >> lane) & 1u);
+        int w_i8 = (nib | (hb << 4)) - 16;
+        int prod = w_i8 * (int)xq[(size_t)b * 32 + lane];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            prod += __shfl_down_sync(0xffffffffu, prod, off);
+        if (lane == 0) {
+            float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+            acc += xs[b] * d * (float)prod;
+        }
+    }
+    if (lane == 0) out[row] = acc;
+}
+
+extern "C" int rsl_cuda_matvec_q5_0_w8a8(rsl_cuda_stream *s, const void *w,
+                                         const float *x, float *out, int M, int K) {
+    if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % 32) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    size_t ne = (size_t)K;
+    size_t nsub = (size_t)(K / 32);
+    if (rsl_q4k_ensure_scratch(s, ne, nsub, 0) != 0)
+        return -2;
+    signed char *xq = s->q4k_act_xq;
+    float *xs = s->q4k_act_xs;
+    dim3 qb(32, 8);
+    dim3 qg((unsigned)((ne / 32 + 7) / 8));
+    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, nullptr, (int)ne);
+    dim3 block(32, 8);
+    dim3 grid((unsigned)((M + 7) / 8));
+    matvec_q5_0_w8a8_decode_kernel<<<grid, block, 0, s->stream>>>(
+        (const unsigned char *)w, xq, xs, out, M, K);
+    return rsl_cuda_check("rsl_cuda_matvec_q5_0_w8a8");
+}
+
 // IQ4_NL / IQ4_XS 16-entry non-linear codebook (ggml kvalues_iq4nl).
 // Read-only device global (divergent index -> global/L2 beats __constant__).
 __device__ const signed char RSL_KVALUES_IQ4NL[16] = {
