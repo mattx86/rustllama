@@ -12139,7 +12139,88 @@ impl LlamaModel {
         // across layers; a drain to host happens on a fallback to the host path
         // and once after the loop (before the final norm / LM head).
         let mut hidden_dev_resident = false;
-        for layer_idx in 0..n_layers_used {
+
+        // T2 (B1) — whole-decode-step CUDA graph: for a PURE-DENSE model with all
+        // preconditions met and the step verdict (or `RUSTLLAMA_DEV_STEP_GRAPH`)
+        // on, capture EVERY layer's attention+FFN chain into ONE cudaGraph and
+        // replay it with ONE launch + ONE sync for the whole token — vs the
+        // per-layer loop below (one launch + one sync PER layer). Declines (runs
+        // the per-layer loop unchanged) on ANY unmet precondition; the captured
+        // kernels are the SAME as the per-layer graph, so it's fail-soft +
+        // parity-probed on-device. On success `hidden` (post-stack) + the F32 host
+        // KV caches are synced, and the per-layer loop is skipped (bound → 0).
+        let step_graph_ran = moe_cfg.is_none()
+            && moe_blocks.is_none()
+            && !self.weights.is_hybrid()
+            && !self.weights.is_mla()
+            && self.yarn_mscale == 1.0
+            && n_layers_used == n_blocks_total
+            && crate::accel::stream_window() == 0
+            && crate::accel::dev_step_cuda_graph_enabled()
+            && (0..n_layers_used).all(|i| {
+                kv.layer_cap(i) == kv.max_ctx && matches!(kv.layers[i], KvLayer::F32 { .. })
+            })
+            && {
+                let dev_softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
+                let mut sls: Vec<rustllama_kernels_cuda::StepLayer> =
+                    Vec::with_capacity(n_layers_used);
+                let mut gathered = true;
+                for i in 0..n_layers_used {
+                    let b = &self.weights.blocks[i];
+                    if b.b_q().is_some() || b.b_k().is_some() || b.b_v().is_some() {
+                        gathered = false;
+                        break;
+                    }
+                    match crate::accel::make_step_layer(
+                        b.w_q(),
+                        b.w_k(),
+                        b.w_v(),
+                        b.w_o(),
+                        Some((&b.w_gate, &b.w_up, &b.w_down, d_ff)),
+                        b.attn_norm(),
+                        b.ffn_norm(),
+                        b.q_norm(),
+                        b.k_norm(),
+                        &self.rope_inv_freq,
+                        self.cfg.swa_window(i) as u32,
+                        dev_softcap,
+                    ) {
+                        Some(sl) => sls.push(sl),
+                        None => {
+                            gathered = false;
+                            break;
+                        }
+                    }
+                }
+                if !gathered {
+                    false
+                } else {
+                    let mctx = kv.max_ctx;
+                    let mut kc: Vec<&mut [f32]> = Vec::with_capacity(n_layers_used);
+                    let mut vc: Vec<&mut [f32]> = Vec::with_capacity(n_layers_used);
+                    for l in kv.layers.iter_mut().take(n_layers_used) {
+                        if let KvLayer::F32 { k, v } = l {
+                            kc.push(&mut k[..]);
+                            vc.push(&mut v[..]);
+                        }
+                    }
+                    crate::accel::try_decode_step_cuda_graph_f32(
+                        &sls,
+                        &mut hidden,
+                        &mut kc,
+                        &mut vc,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        d,
+                        cur_pos,
+                        mctx,
+                        cfg.rms_eps,
+                    )
+                }
+            };
+
+        for layer_idx in 0..(if step_graph_ran { 0 } else { n_layers_used }) {
             let block: &dyn AttnBlock = if let Some(mbs) = moe_blocks {
                 &mbs[layer_idx]
             } else {

@@ -3790,6 +3790,12 @@ pub struct CudaMatvecCache {
     // exec_update. Sized to n_layers (rebuilt on a layer-count change); dropped
     // (execs destroyed) on model reload via `clear`.
     attn_graph_exec: Vec<Option<CudaGraphExecHandle>>,
+    // T2 (B1): the ONE cached executable graph for the WHOLE-DECODE-STEP graph —
+    // every dense layer's chain captured into a single graph and replayed with one
+    // launch + one `stream_sync` per token (vs the per-layer graph's one of each
+    // PER layer). `None` until the first step-graph launch; invalidated alongside
+    // `attn_graph_exec` on a mirror-ctx change and on `clear`.
+    step_graph_exec: Option<CudaGraphExecHandle>,
     // A1: when set, the EAGER decode block routes its Q4_K matvecs through the
     // lossy, verdict-gated W4A8 int8-activation kernel instead of the bit-exact
     // f32 warp matvec. Set per-call at the top of `decode_attn_block_f32` from
@@ -3819,6 +3825,35 @@ pub struct CudaMatvecCache {
     stream: CudaStream,
 }
 
+/// T2 (B1) — one dense layer's inputs for the whole-decode-step graph
+/// ([`CudaMatvecCache::decode_step_graph_f32`]). The caller gathers one of these
+/// per layer (weights + norm-weight slices + per-layer SWA window / soft-cap)
+/// before the capture; every weight byte-slice + norm slice must outlive the
+/// driver call. Mirrors the per-layer `decode_attn_block_f32_graph` args.
+#[derive(Clone, Copy)]
+pub struct StepLayer<'a> {
+    pub wq: (CudaPackedKind, usize, &'a [u8]),
+    pub wk: (CudaPackedKind, usize, &'a [u8]),
+    pub wv: (CudaPackedKind, usize, &'a [u8]),
+    pub wo: (CudaPackedKind, usize, &'a [u8]),
+    /// Dense SwiGLU FFN (gate, up, down, d_ff). The step graph requires EVERY
+    /// layer dense (FFN in-graph) — a `None` here makes the driver decline.
+    pub dense_ffn: Option<(
+        (CudaPackedKind, usize, &'a [u8]),
+        (CudaPackedKind, usize, &'a [u8]),
+        (CudaPackedKind, usize, &'a [u8]),
+        usize,
+    )>,
+    pub attn_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+    pub inv_freq: &'a [f32],
+    /// Per-layer SWA window (0 = full) + Gemma2 attention-logit soft-cap (0 = off).
+    pub window: i32,
+    pub softcap: f32,
+}
+
 impl CudaMatvecCache {
     /// Create a cache on `device_index` with a device-memory budget for
     /// cached weights (bytes). `None` when no such device / stream fails.
@@ -3840,6 +3875,7 @@ impl CudaMatvecCache {
             attn_act: None,
             attn_norms: None,
             attn_graph_exec: Vec::new(),
+            step_graph_exec: None,
             q4k_w4a8: false,
             stream_window_layers: 0,
             current_layer_tag: 0,
@@ -4010,6 +4046,8 @@ impl CudaMatvecCache {
         // which are now evicted; the next model re-captures + re-instantiates from
         // scratch. Empties the Vec (Drop frees each cudaGraphExec_t).
         self.attn_graph_exec = Vec::new();
+        // T2: drop the cached whole-step graph exec for the same reason.
+        self.step_graph_exec = None;
     }
 
     fn ensure_scratch(
@@ -5291,6 +5329,396 @@ impl CudaMatvecCache {
                 if !a.download_at_async(o_hn2 * 4, h2b) {
                     return false;
                 }
+            }
+        }
+        consume_error_count() == 0
+    }
+
+    /// T2 (B1) — WHOLE-DECODE-STEP CUDA graph: capture EVERY dense layer's chain
+    /// (`issue_layer_chain`) into ONE graph and replay it with ONE `graph_launch`
+    /// + ONE `stream_sync` per token — vs the per-layer graph's one launch + one
+    /// sync PER layer. The captured kernels are the SAME as the per-layer graph,
+    /// so the result is byte-identical to (and correctness-anchored by) the
+    /// validated per-layer path; this removes `(n_layers-1)` syncs + the per-layer
+    /// host round-trips per token. PURE-DENSE only: every `StepLayer` must carry
+    /// `dense_ffn` (FFN in-graph) — the caller gates on that + the
+    /// `step:dev_resident_cuda_graph` verdict + F32-KV / no-bias / no-ring / no-YaRN
+    /// / no-streaming preconditions.
+    ///
+    /// `hidden` is the d_model residual stream (in: layer-0 input; out: post-stack,
+    /// pre-final-norm). `k_caches[i]`/`v_caches[i]` are layer i's host KV cache
+    /// (`d_kv*max_ctx`, head-major): they SEED each layer's device mirror with the
+    /// prefill history before capture, and RECEIVE this token's K/V at `[pos]`
+    /// after the single sync — read back from each layer's PERSISTENT mirror (the
+    /// shared activation slab holds only the LAST layer's, so it can't be used).
+    ///
+    /// SAFETY: every weight byte-slice + norm slice must outlive the call and be
+    /// sized to the dims; host caches sized `d_kv*max_ctx`; `pos < max_ctx`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn decode_step_graph_f32(
+        &mut self,
+        layers: &[StepLayer],
+        hidden: &mut [f32],
+        k_caches: &mut [&mut [f32]],
+        v_caches: &mut [&mut [f32]],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        pos: usize,
+        max_ctx: usize,
+        rms_eps: f32,
+    ) -> bool {
+        // W4A8 self-syncs ⇒ uncapturable; force the bit-exact f32 warp matvec for
+        // the whole step (same invariant as the per-layer graph).
+        self.q4k_w4a8 = false;
+        let n_layers = layers.len();
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        if n_layers == 0
+            || hidden.len() != d_model
+            || head_dim % 2 != 0
+            || n_kv_heads == 0
+            || n_heads % n_kv_heads != 0
+            || pos >= max_ctx
+            || k_caches.len() != n_layers
+            || v_caches.len() != n_layers
+        {
+            return false;
+        }
+        // Every layer must be dense with a uniform d_ff + matching norm shapes.
+        let Some((_, _, _, d_ff)) = layers[0].dense_ffn else {
+            return false;
+        };
+        for l in layers {
+            if l.dense_ffn.map(|f| f.3) != Some(d_ff)
+                || l.attn_norm.len() != d_model
+                || l.post_norm.len() != d_model
+                || l.inv_freq.len() != head_dim / 2
+            {
+                return false;
+            }
+        }
+        // Mirror ctx: rebuild mirrors + BOTH exec caches on a shape change.
+        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        if self.attn_mirror_ctx != mctx {
+            self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_valid_len = vec![0; n_layers];
+            self.attn_mirror_ctx = mctx;
+            self.attn_graph_exec = (0..n_layers).map(|_| None).collect();
+            self.step_graph_exec = None;
+        }
+        if self.attn_valid_len.len() != n_layers {
+            self.attn_valid_len = vec![0; n_layers];
+        }
+
+        // Slab sizing: ONE activation slab (shared across layers — offset-0 hidden
+        // carries the residual stream from layer to layer) + an N-LAYER norm slab
+        // (each layer's norms must be resident before capture; token-invariant but
+        // re-uploaded here — tiny vs the removed per-layer syncs).
+        let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * 4;
+        let norm_floats = 2 * d_model + 2 * head_dim + head_dim / 2;
+        let mir_bytes = d_kv * max_ctx * 4;
+        if !Self::ensure_scratch(&mut self.attn_act, &self.stream, act_bytes)
+            || !Self::ensure_scratch(
+                &mut self.attn_norms,
+                &self.stream,
+                norm_floats * n_layers * 4,
+            )
+        {
+            return false;
+        }
+        for i in 0..n_layers {
+            if !Self::ensure_scratch(&mut self.attn_k_mirror[i], &self.stream, mir_bytes)
+                || !Self::ensure_scratch(&mut self.attn_v_mirror[i], &self.stream, mir_bytes)
+            {
+                return false;
+            }
+            // Fill any prefill gap for this layer from its host cache (pre-capture
+            // H2D), then require contiguity to `pos` — else decline the step graph.
+            if (pos as u32) > self.attn_valid_len[i]
+                && !self.seed_attn_mirror_f32(
+                    i,
+                    &k_caches[i][..],
+                    &v_caches[i][..],
+                    pos,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    n_layers,
+                )
+            {
+                return false;
+            }
+            if (pos as u32) > self.attn_valid_len[i] {
+                return false;
+            }
+        }
+
+        let fb = |s: &[f32]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+        };
+        // Weight pre-warm (BEFORE capture): all 7 weights for every layer.
+        for l in layers {
+            if !self.ensure_weight(l.wq.1, l.wq.2)
+                || !self.ensure_weight(l.wk.1, l.wk.2)
+                || !self.ensure_weight(l.wv.1, l.wv.2)
+                || !self.ensure_weight(l.wo.1, l.wo.2)
+            {
+                return false;
+            }
+            if let Some((wg, wu, wd, _)) = l.dense_ffn {
+                if !self.ensure_weight(wg.1, wg.2)
+                    || !self.ensure_weight(wu.1, wu.2)
+                    || !self.ensure_weight(wd.1, wd.2)
+                {
+                    return false;
+                }
+            }
+        }
+        // H2D uploads (BEFORE capture): hidden once + every layer's norms into its
+        // own `norm_floats`-sized block of the slab.
+        let (no_attn, no_post, no_qn, no_kn, no_if) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + head_dim,
+            2 * d_model + 2 * head_dim,
+        );
+        if !self
+            .attn_act
+            .as_mut()
+            .unwrap()
+            .upload_at_async(0, fb(hidden))
+        {
+            return false;
+        }
+        {
+            let nrm = self.attn_norms.as_mut().unwrap();
+            for (i, l) in layers.iter().enumerate() {
+                let base = i * norm_floats;
+                if !nrm.upload_at_async((base + no_attn) * 4, fb(l.attn_norm))
+                    || !nrm.upload_at_async((base + no_post) * 4, fb(l.post_norm))
+                    || !nrm.upload_at_async((base + no_if) * 4, fb(l.inv_freq))
+                {
+                    return false;
+                }
+                if let Some(w) = l.q_norm {
+                    if !nrm.upload_at_async((base + no_qn) * 4, fb(w)) {
+                        return false;
+                    }
+                }
+                if let Some(w) = l.k_norm {
+                    if !nrm.upload_at_async((base + no_kn) * 4, fb(w)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if !stream_sync(&self.stream) {
+            return false;
+        }
+
+        // Shared activation-slab ptrs (same offsets as the per-layer block; reused
+        // by every layer — the chain overwrites them per layer but offset-0 hidden
+        // carries the residual forward).
+        let (o_hidden, o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + d_q,
+            2 * d_model + d_q + d_kv,
+            2 * d_model + d_q + 2 * d_kv,
+            2 * d_model + 2 * d_q + 2 * d_kv,
+            3 * d_model + 2 * d_q + 2 * d_kv,
+        );
+        let ffn_base = 4 * d_model + 2 * d_q + 2 * d_kv;
+        let (o_gate, o_up, o_act) = (ffn_base, ffn_base + d_ff, ffn_base + 2 * d_ff);
+        let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
+            let a = self.attn_act.as_ref().unwrap();
+            (
+                a.f32_ptr_at(o_hidden),
+                a.f32_ptr_at(o_hnorm),
+                a.f32_ptr_at(o_q),
+                a.f32_ptr_at(o_k),
+                a.f32_ptr_at(o_v),
+                a.f32_ptr_at(o_attn),
+                a.f32_ptr_at(o_o),
+                a.f32_ptr_at(o_hn2),
+                a.f32_ptr_at(o_gate),
+                a.f32_ptr_at(o_up),
+                a.f32_ptr_at(o_act),
+            )
+        };
+        // Per-layer norm + mirror ptrs (copied out as raw ptrs → no borrow held
+        // across the capture loop's `&mut self` calls).
+        type LayerPtrs = (
+            *mut f32,
+            *mut f32,
+            *mut f32,
+            *mut f32,
+            *mut f32,
+            *mut f32,
+            *mut f32,
+        );
+        let layer_ptrs: Vec<LayerPtrs> = (0..n_layers)
+            .map(|i| {
+                let base = i * norm_floats;
+                let n = self.attn_norms.as_ref().unwrap();
+                (
+                    n.f32_ptr_at(base + no_attn),
+                    n.f32_ptr_at(base + no_post),
+                    n.f32_ptr_at(base + no_qn),
+                    n.f32_ptr_at(base + no_kn),
+                    n.f32_ptr_at(base + no_if),
+                    self.attn_k_mirror[i].as_ref().unwrap().ptr as *mut f32,
+                    self.attn_v_mirror[i].as_ref().unwrap().ptr as *mut f32,
+                )
+            })
+            .collect();
+
+        // ================= BEGIN CAPTURE (one for the whole step) =================
+        if !graph_begin_capture(&self.stream) {
+            return false;
+        }
+        let mut chain_ok = true;
+        for (i, l) in layers.iter().enumerate() {
+            let (pan, ppn, pqn, pkn, pif, km_base, vm_base) = layer_ptrs[i];
+            chain_ok = chain_ok
+                && unsafe {
+                    self.issue_layer_chain(
+                        ph,
+                        phn,
+                        pq,
+                        pk,
+                        pv,
+                        pat,
+                        po,
+                        phn2,
+                        p_gate,
+                        p_up,
+                        p_act,
+                        pan,
+                        ppn,
+                        pqn,
+                        pkn,
+                        pif,
+                        km_base,
+                        vm_base,
+                        l.wq,
+                        l.wk,
+                        l.wv,
+                        l.wo,
+                        l.dense_ffn,
+                        l.q_norm.is_some(),
+                        l.k_norm.is_some(),
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        d_model,
+                        d_q,
+                        d_kv,
+                        d_ff,
+                        pos,
+                        max_ctx,
+                        l.window,
+                        l.softcap,
+                        rms_eps,
+                    )
+                };
+        }
+        // ================= END CAPTURE (always) =================
+        let graph = graph_end_capture(&self.stream);
+        let Some(graph) = graph else {
+            return false;
+        };
+        if !chain_ok {
+            unsafe { graph_destroy(graph) };
+            return false;
+        }
+        // Patch the cached step-exec in place (subsequent tokens — cheap) or
+        // instantiate first time / on topology change.
+        let mut launch_ok = true;
+        if self.step_graph_exec.is_some() {
+            let updated = {
+                let e = self.step_graph_exec.as_ref().unwrap();
+                unsafe { graph_exec_update(e, graph) }
+            };
+            if !updated {
+                self.step_graph_exec = None;
+                match unsafe { graph_instantiate(graph) } {
+                    Some(e) => self.step_graph_exec = Some(e),
+                    None => launch_ok = false,
+                }
+            }
+        } else {
+            match unsafe { graph_instantiate(graph) } {
+                Some(e) => self.step_graph_exec = Some(e),
+                None => launch_ok = false,
+            }
+        }
+        unsafe { graph_destroy(graph) };
+        if !launch_ok {
+            return false;
+        }
+        {
+            let e = self.step_graph_exec.as_ref().unwrap();
+            if !unsafe { graph_launch(e, &self.stream) } {
+                return false;
+            }
+        }
+        if !stream_sync(&self.stream) {
+            return false;
+        }
+        if consume_error_count() != 0 {
+            return false;
+        }
+
+        // Advance each layer's valid range (mirror row [pos] is now written).
+        for i in 0..n_layers {
+            if pos as u32 == self.attn_valid_len[i] {
+                self.attn_valid_len[i] = pos as u32 + 1;
+            }
+        }
+        // DEFERRED D2H (after the single sync): this token's K/V for each layer
+        // read FROM ITS MIRROR (the shared slab holds only the last layer's) into
+        // the host KV cache at `[pos]`, head-major; plus the final hidden once.
+        for i in 0..n_layers {
+            for h in 0..n_kv_heads {
+                let off = (h * max_ctx + pos) * head_dim;
+                let kb: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        k_caches[i][off..off + head_dim].as_mut_ptr() as *mut u8,
+                        head_dim * 4,
+                    )
+                };
+                let vb: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        v_caches[i][off..off + head_dim].as_mut_ptr() as *mut u8,
+                        head_dim * 4,
+                    )
+                };
+                let km_ok = self.attn_k_mirror[i]
+                    .as_ref()
+                    .unwrap()
+                    .download_at_async(off * 4, kb);
+                let vm_ok = self.attn_v_mirror[i]
+                    .as_ref()
+                    .unwrap()
+                    .download_at_async(off * 4, vb);
+                if !km_ok || !vm_ok {
+                    return false;
+                }
+            }
+        }
+        {
+            let a = self.attn_act.as_ref().unwrap();
+            let hb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4)
+            };
+            if !a.download_at_async(0, hb) {
+                return false;
             }
         }
         consume_error_count() == 0

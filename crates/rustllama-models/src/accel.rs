@@ -10083,6 +10083,24 @@ fn dev_layer_cuda_graph_enabled() -> bool {
     *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH))
 }
 
+/// T2 (B1) WHOLE-DECODE-STEP graph gate — perf-gated on
+/// [`rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH`]. Fail-closed: OFF
+/// unless the step parity+perf probe passed. `RUSTLLAMA_DEV_STEP_GRAPH=1` force-
+/// enables it (for on-pod A/B before the verdict is banked); `=0` force-disables.
+/// The caller ([`try_decode_step_cuda_graph_f32`]) AND's this with the two
+/// per-layer graph verdicts + `cuda_active()` + `stream_window()==0`, so any
+/// unmet precondition declines to the per-layer ladder without corruption.
+pub fn dev_step_cuda_graph_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("RUSTLLAMA_DEV_STEP_GRAPH").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => kernel_verdict(rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH),
+        },
+    )
+}
+
 /// Run the WHOLE attention block for one decode token on the GPU, keeping the
 /// activation resident on device (#2) — `CudaMatvecCache::decode_attn_block_f32`
 /// behind the gate + weight/norm extraction + mirror seeding. On success `hidden`
@@ -10407,6 +10425,122 @@ pub fn try_decode_attn_block_cuda_graph_f32(
         }
     }
     (ok, ok && ffn_requested)
+}
+
+/// T2 (B1) — build one dense layer's [`ck::StepLayer`] from its weight Tensors +
+/// norm slices for the whole-decode-step graph. `None` if any weight isn't a
+/// packed CUDA kind, or the dense FFN is absent (⇒ the caller declines the step
+/// graph for this model). Borrows the Tensor bytes + norm slices for the call.
+#[allow(clippy::too_many_arguments)]
+pub fn make_step_layer<'a>(
+    w_q: &'a Tensor,
+    w_k: &'a Tensor,
+    w_v: &'a Tensor,
+    w_o: &'a Tensor,
+    dense_ffn: Option<(&'a Tensor, &'a Tensor, &'a Tensor, usize)>,
+    attn_norm: &'a [f32],
+    post_norm: &'a [f32],
+    q_norm: Option<&'a [f32]>,
+    k_norm: Option<&'a [f32]>,
+    inv_freq: &'a [f32],
+    window: u32,
+    softcap: f32,
+) -> Option<ck::StepLayer<'a>> {
+    let (kq, kk, kv, ko) = (
+        dtype_to_cuda_kind(w_q.dtype)?,
+        dtype_to_cuda_kind(w_k.dtype)?,
+        dtype_to_cuda_kind(w_v.dtype)?,
+        dtype_to_cuda_kind(w_o.dtype)?,
+    );
+    let (qb, kb, vb, ob) = (
+        w_q.storage.as_bytes(),
+        w_k.storage.as_bytes(),
+        w_v.storage.as_bytes(),
+        w_o.storage.as_bytes(),
+    );
+    let (wg, wu, wd, d_ff) = dense_ffn?;
+    let (kg, ku, kd) = (
+        dtype_to_cuda_kind(wg.dtype)?,
+        dtype_to_cuda_kind(wu.dtype)?,
+        dtype_to_cuda_kind(wd.dtype)?,
+    );
+    let (gb, ub, db) = (
+        wg.storage.as_bytes(),
+        wu.storage.as_bytes(),
+        wd.storage.as_bytes(),
+    );
+    Some(ck::StepLayer {
+        wq: (kq, qb.as_ptr() as usize, qb),
+        wk: (kk, kb.as_ptr() as usize, kb),
+        wv: (kv, vb.as_ptr() as usize, vb),
+        wo: (ko, ob.as_ptr() as usize, ob),
+        dense_ffn: Some((
+            (kg, gb.as_ptr() as usize, gb),
+            (ku, ub.as_ptr() as usize, ub),
+            (kd, db.as_ptr() as usize, db),
+            d_ff,
+        )),
+        attn_norm,
+        post_norm,
+        q_norm,
+        k_norm,
+        inv_freq,
+        window: window as i32,
+        softcap,
+    })
+}
+
+/// T2 (B1) — drive the whole-decode-step CUDA graph for all dense `layers`. Gated
+/// AND with the two per-layer graph verdicts + `cuda_active()` + no-streaming;
+/// fail-closed ⇒ `false` ⇒ the caller runs the existing per-layer ladder. On
+/// `true` the host KV caches + `hidden` are synced from the device (one launch +
+/// one sync replaced the per-layer flood). Correctness is the per-layer graph's
+/// (identical kernels), graded on-device by `doctor --cuda-parity`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_step_cuda_graph_f32(
+    layers: &[ck::StepLayer],
+    hidden: &mut [f32],
+    k_caches: &mut [&mut [f32]],
+    v_caches: &mut [&mut [f32]],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    pos: usize,
+    max_ctx: usize,
+    rms_eps: f32,
+) -> bool {
+    if !dev_step_cuda_graph_enabled()
+        || !dev_attn_cuda_graph_enabled()
+        || !dev_layer_cuda_graph_enabled()
+        || !cuda_active()
+        || stream_window() != 0
+    {
+        return false;
+    }
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut g) = cache.lock() else {
+        return false;
+    };
+    let ok = unsafe {
+        g.decode_step_graph_f32(
+            layers, hidden, k_caches, v_caches, n_heads, n_kv_heads, head_dim, d_model, pos,
+            max_ctx, rms_eps,
+        )
+    };
+    if ok {
+        static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                "T2 whole-decode-step CUDA graph ENGAGED — all dense layers captured \
+                 into ONE cudaGraph + replayed as ONE launch + ONE sync per token \
+                 (verdict step:dev_resident_cuda_graph) (logged once)"
+            );
+        }
+    }
+    ok
 }
 
 /// Whether the Feature-1a SYCL device-resident DECODE attention block is enabled.

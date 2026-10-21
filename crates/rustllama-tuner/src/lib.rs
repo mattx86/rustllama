@@ -283,6 +283,17 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH: &str = "attn:dev_resident_
 /// anchor, not a separate dispatch gate — the graph path is already fail-soft to
 /// the eager block on any capture/launch error.
 pub const VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH: &str = "layer:dev_resident_cuda_graph";
+/// T2 (B1): WHOLE-DECODE-STEP CUDA graph — EVERY dense layer's attention+FFN chain
+/// captured into ONE `cudaGraph` and replayed with ONE launch + ONE `stream_sync`
+/// per token (vs the per-layer graph's one of each PER layer), removing
+/// `(n_layers-1)` syncs + per-layer host round-trips. The captured kernels are the
+/// IDENTICAL `issue_layer_chain` the per-layer graph uses, so it is byte-identical
+/// to (and correctness-anchored by) [`VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH`]
+/// / [`VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH`]; this is a PERF-only verdict graded
+/// by `doctor --cuda-parity step:dev_resident_cuda_graph`. Read by
+/// `accel::dev_step_cuda_graph_enabled`; gated AND with the two per-layer graph
+/// verdicts (pure-dense, F32-KV, no-bias/ring/YaRN/streaming), fail-closed OFF.
+pub const VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH: &str = "step:dev_resident_cuda_graph";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror
