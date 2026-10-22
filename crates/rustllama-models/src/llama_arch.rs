@@ -8903,7 +8903,7 @@ impl LlamaModel {
                                         && h.is_folded(&w_down.name)
                                         && !no_hadamard_enabled() =>
                                 {
-                                    crate::accel::try_folded_ffn_rmsfold_smfold_usm_f32(
+                                    crate::accel::try_folded_ffn_rmsfold_smfold(
                                         &hidden,
                                         &block.post_attention_norm,
                                         h.signs_for(d),
@@ -9665,7 +9665,7 @@ impl LlamaModel {
                                         && h.is_folded(&w_down.name)
                                         && !no_hadamard_enabled() =>
                                 {
-                                    crate::accel::try_folded_ffn_rmsfold_smfold_usm_f32(
+                                    crate::accel::try_folded_ffn_rmsfold_smfold(
                                         &hidden,
                                         &block.post_attention_norm,
                                         h.signs_for(d),

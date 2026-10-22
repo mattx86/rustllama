@@ -3975,6 +3975,21 @@ pub struct CudaMatvecCache {
     rmsfold_wnorm_key: Option<(usize, usize)>,
     rmsfold_signs: Option<RawDevBuf>,
     rmsfold_signs_key: Option<(usize, usize)>,
+    // B2 FFN (Kindi rmsfold+smfold): the width-`d_ff` legs of the device-resident
+    // dense FFN (gate/up projections, the SiLU-gate `act`, and its Hadamard-rotated
+    // `arot` down-proj input). The width-`d` stages (rmsnorm/hadamard of the gate/up
+    // INPUT) reuse the `rmsfold_*` buffers — qkv and FFN never run in the same layer.
+    // `ffn_wnorm` caches the post-attn norm weight SEPARATELY from `rmsfold_wnorm`
+    // (attn-norm vs post-attn-norm alternate every layer; a shared key would thrash);
+    // `ffn_signs_ff` caches the width-`d_ff` down-input signs. Both host-addr-keyed.
+    ffn_gate: Option<RawDevBuf>,
+    ffn_up: Option<RawDevBuf>,
+    ffn_act: Option<RawDevBuf>,
+    ffn_arot: Option<RawDevBuf>,
+    ffn_wnorm: Option<RawDevBuf>,
+    ffn_wnorm_key: Option<(usize, usize)>,
+    ffn_signs_ff: Option<RawDevBuf>,
+    ffn_signs_ff_key: Option<(usize, usize)>,
     // Phase 2: a second CUDA stream for PREFETCH — the next layer's weights
     // upload here (async) while the current layer computes on `stream`. Declared
     // before `stream` but after `weights` so prefetch buffers (in `weights`,
@@ -4034,6 +4049,14 @@ impl CudaMatvecCache {
             rmsfold_wnorm_key: None,
             rmsfold_signs: None,
             rmsfold_signs_key: None,
+            ffn_gate: None,
+            ffn_up: None,
+            ffn_act: None,
+            ffn_arot: None,
+            ffn_wnorm: None,
+            ffn_wnorm_key: None,
+            ffn_signs_ff: None,
+            ffn_signs_ff_key: None,
             ff_scratch: None,
             ptr_scratch: None,
             wt_scratch: None,
@@ -4213,6 +4236,15 @@ impl CudaMatvecCache {
         self.rmsfold_wnorm_key = None;
         self.rmsfold_signs = None;
         self.rmsfold_signs_key = None;
+        // B2 FFN: same per-model (host-addr-keyed) lifetime as the rmsfold scratch.
+        self.ffn_gate = None;
+        self.ffn_up = None;
+        self.ffn_act = None;
+        self.ffn_arot = None;
+        self.ffn_wnorm = None;
+        self.ffn_wnorm_key = None;
+        self.ffn_signs_ff = None;
+        self.ffn_signs_ff_key = None;
         // Streaming residency bookkeeping is per-model (keyed by host addr like
         // `weights`), so it must reset on reload too.
         self.layer_keys.clear();
@@ -4570,6 +4602,182 @@ impl CudaMatvecCache {
             if !self.rmsfold_out.as_ref().unwrap().download(ob) {
                 return false;
             }
+        }
+        true
+    }
+
+    /// B2 (Kindi rmsfold+smfold): device-resident dense FFN for a folded hybrid
+    /// layer (PTQ1_0). The whole FFN stays resident on THIS stream: GPU RMSNorm →
+    /// Hadamard (gate/up input, "rmsfold") → gate + up matvec → SiLU-gate →
+    /// Hadamard (down input, "smfold") → down matvec → one D2H of the result.
+    /// Eliminates the two CPU Hadamard rotations + the per-projection host
+    /// round-trips the CPU `dense_ffn_one_into` pays. `out` is `w_down(silu(
+    /// w_gate(x))·w_up(x))` ONLY (ffn_out) — the caller adds the residual. Width-`d`
+    /// stages reuse the `rmsfold_*` scratch (qkv + FFN never run in the same layer);
+    /// the width-`d_ff` legs use the `ffn_*` buffers. Returns false ⇒ CPU path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_ptq1_0_ffn_rmsfold_smfold(
+        &mut self,
+        hidden: &[f32],
+        norm_weight: &[f32],
+        signs_in: &[f32],
+        signs_ff: &[f32],
+        block: usize,
+        eps: f32,
+        wg_key: usize,
+        wg_bytes: &[u8],
+        wu_key: usize,
+        wu_bytes: &[u8],
+        wd_key: usize,
+        wd_bytes: &[u8],
+        out: &mut [f32],
+        d: usize,
+        d_ff: usize,
+    ) -> bool {
+        let align = CudaPackedKind::Ptq1_0.k_alignment();
+        if d == 0
+            || d_ff == 0
+            || block == 0
+            || d % block != 0
+            || d_ff % block != 0
+            || d % align != 0
+            || d_ff % align != 0
+            || hidden.len() != d
+            || norm_weight.len() < d
+            || signs_in.len() < d
+            || signs_ff.len() < d_ff
+            || out.len() != d
+        {
+            return false;
+        }
+        let rb = CudaPackedKind::Ptq1_0.row_bytes(d);
+        let rb_ff = CudaPackedKind::Ptq1_0.row_bytes(d_ff);
+        // gate/up: [d_ff × d]; down: [d × d_ff].
+        if wg_bytes.len() < d_ff * rb || wu_bytes.len() < d_ff * rb || wd_bytes.len() < d * rb_ff {
+            return false;
+        }
+        if !self.ensure_weight(wg_key, wg_bytes)
+            || !self.ensure_weight(wu_key, wu_bytes)
+            || !self.ensure_weight(wd_key, wd_bytes)
+        {
+            return false;
+        }
+        // Width-`d` stages reuse the rmsfold scratch; width-`d_ff` legs are own.
+        if !Self::ensure_scratch(&mut self.rmsfold_hidden, &self.stream, d * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_hnorm, &self.stream, d * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_xrot, &self.stream, d * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_out, &self.stream, d * 4)
+            || !Self::ensure_scratch(&mut self.ffn_gate, &self.stream, d_ff * 4)
+            || !Self::ensure_scratch(&mut self.ffn_up, &self.stream, d_ff * 4)
+            || !Self::ensure_scratch(&mut self.ffn_act, &self.stream, d_ff * 4)
+            || !Self::ensure_scratch(&mut self.ffn_arot, &self.stream, d_ff * 4)
+            || !Self::ensure_scratch(&mut self.ffn_wnorm, &self.stream, d * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_signs, &self.stream, d * 4)
+            || !Self::ensure_scratch(&mut self.ffn_signs_ff, &self.stream, d_ff * 4)
+        {
+            return false;
+        }
+        // FFN norm weight — SEPARATE key from `rmsfold_wnorm` (attn-norm vs
+        // post-attn-norm alternate every layer; a shared key would thrash).
+        let wn_key = (norm_weight.as_ptr() as usize, d);
+        if self.ffn_wnorm_key != Some(wn_key) {
+            let b = unsafe { std::slice::from_raw_parts(norm_weight.as_ptr() as *const u8, d * 4) };
+            if !self.ffn_wnorm.as_mut().unwrap().upload(b) {
+                return false;
+            }
+            self.ffn_wnorm_key = Some(wn_key);
+        }
+        // Gate/up-input signs (width `d`) reuse the rmsfold_signs cache — the same
+        // width-`d` sign vector qkv uses, so the key never thrashes between them.
+        let sg_key = (signs_in.as_ptr() as usize, d);
+        if self.rmsfold_signs_key != Some(sg_key) {
+            let b = unsafe { std::slice::from_raw_parts(signs_in.as_ptr() as *const u8, d * 4) };
+            if !self.rmsfold_signs.as_mut().unwrap().upload(b) {
+                return false;
+            }
+            self.rmsfold_signs_key = Some(sg_key);
+        }
+        // Down-input signs (width `d_ff`).
+        let sf_key = (signs_ff.as_ptr() as usize, d_ff);
+        if self.ffn_signs_ff_key != Some(sf_key) {
+            let b = unsafe { std::slice::from_raw_parts(signs_ff.as_ptr() as *const u8, d_ff * 4) };
+            if !self.ffn_signs_ff.as_mut().unwrap().upload(b) {
+                return false;
+            }
+            self.ffn_signs_ff_key = Some(sf_key);
+        }
+        // Upload the raw hidden row once.
+        let hb = unsafe { std::slice::from_raw_parts(hidden.as_ptr() as *const u8, d * 4) };
+        if !self.rmsfold_hidden.as_mut().unwrap().upload(hb) {
+            return false;
+        }
+        let hidden_ptr = self.rmsfold_hidden.as_ref().unwrap().ptr as *const f32;
+        let wnorm_ptr = self.ffn_wnorm.as_ref().unwrap().ptr as *const f32;
+        let hnorm_ptr = self.rmsfold_hnorm.as_ref().unwrap().ptr as *mut f32;
+        // Stage 1 — RMSNorm: hidden → hnorm (d).
+        // SAFETY: three live device buffers on `self.stream` sized d; wrapper syncs.
+        if unsafe { rmsnorm_dev_f32(&self.stream, hidden_ptr, wnorm_ptr, hnorm_ptr, 1, d, eps) }
+            .is_err()
+        {
+            return false;
+        }
+        // Stage 2 — rmsfold: hnorm → xrot (d; gate/up input, resident).
+        let hnorm_cptr = self.rmsfold_hnorm.as_ref().unwrap().ptr as *const f32;
+        let signs_ptr = self.rmsfold_signs.as_ref().unwrap().ptr as *const f32;
+        let xrot_ptr = self.rmsfold_xrot.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: live device buffers on `self.stream` sized d; wrapper syncs.
+        if unsafe { hadamard_forward(&self.stream, hnorm_cptr, signs_ptr, xrot_ptr, d, block) }
+            .is_err()
+        {
+            return false;
+        }
+        // Stage 3 — gate + up matvecs read the SAME resident xrot (d → d_ff).
+        let xrot_cptr = self.rmsfold_xrot.as_ref().unwrap().ptr as *const f32;
+        let wg_ptr = self.weights[&wg_key].ptr;
+        let wu_ptr = self.weights[&wu_key].ptr;
+        let gate_ptr = self.ffn_gate.as_ref().unwrap().ptr as *mut f32;
+        let up_ptr = self.ffn_up.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: cached weights + resident xrot + ffn scratch (≥ d_ff) on the stream.
+        if unsafe { matvec_ptq1_0_packed_f32(&self.stream, wg_ptr, xrot_cptr, gate_ptr, d_ff, d) }
+            .is_err()
+            || unsafe { matvec_ptq1_0_packed_f32(&self.stream, wu_ptr, xrot_cptr, up_ptr, d_ff, d) }
+                .is_err()
+            || consume_error_count() != 0
+        {
+            return false;
+        }
+        // Stage 4 — SiLU-gate: act = silu(gate)·up (d_ff; resident).
+        let gate_cptr = self.ffn_gate.as_ref().unwrap().ptr as *const f32;
+        let up_cptr = self.ffn_up.as_ref().unwrap().ptr as *const f32;
+        let act_ptr = self.ffn_act.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: live d_ff-sized device buffers on `self.stream`; wrapper syncs.
+        if unsafe { silu_mul_f32(&self.stream, gate_cptr, up_cptr, act_ptr, d_ff) }.is_err() {
+            return false;
+        }
+        // Stage 5 — smfold: act → arot (d_ff; down input, resident).
+        let act_cptr = self.ffn_act.as_ref().unwrap().ptr as *const f32;
+        let signs_ff_ptr = self.ffn_signs_ff.as_ref().unwrap().ptr as *const f32;
+        let arot_ptr = self.ffn_arot.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: live d_ff-sized device buffers on `self.stream`; wrapper syncs.
+        if unsafe { hadamard_forward(&self.stream, act_cptr, signs_ff_ptr, arot_ptr, d_ff, block) }
+            .is_err()
+        {
+            return false;
+        }
+        // Stage 6 — down matvec: arot → out (d_ff → d).
+        let arot_cptr = self.ffn_arot.as_ref().unwrap().ptr as *const f32;
+        let wd_ptr = self.weights[&wd_key].ptr;
+        let out_ptr = self.rmsfold_out.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: cached weight + resident arot + rmsfold_out (≥ d) on the stream.
+        if unsafe { matvec_ptq1_0_packed_f32(&self.stream, wd_ptr, arot_cptr, out_ptr, d, d_ff) }
+            .is_err()
+            || consume_error_count() != 0
+        {
+            return false;
+        }
+        let ob = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, d * 4) };
+        if !self.rmsfold_out.as_ref().unwrap().download(ob) {
+            return false;
         }
         true
     }

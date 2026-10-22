@@ -5368,6 +5368,90 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // B2 (Kindi smfold): the device-resident FFN down-proj-input rotation —
+    // `silu_mul_f32` → `hadamard_forward` — vs CPU `k::silu_mul_f32` then
+    // `k::hadamard::hadamard_forward`. Banks the SAME `fused:smfold` verdict the
+    // SYCL `probe_smfold` does. cos-dominant, loose rel (device f32 noise ~1e-5
+    // vs the 1e-3 denom floor ⇒ no false-trip).
+    {
+        let name = "fused:smfold";
+        const SK: usize = 256; // multiple of BLOCK and of 128
+        const SBLOCK: usize = 64;
+        let gate = gen_x(SK, 88);
+        let up = gen_x(SK, 89);
+        let signs: Vec<f32> = (0..SK)
+            .map(|i| {
+                if (i * 2654435761usize) & 0x10 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            })
+            .collect();
+        let mut act = vec![0f32; SK];
+        k::silu_mul_f32(&gate, &up, &mut act);
+        let mut cpu = vec![0f32; SK];
+        k::hadamard::hadamard_forward(&act, &signs, SBLOCK, &mut cpu);
+        match (
+            cu_upload_f32(&stream, &gate),
+            cu_upload_f32(&stream, &up),
+            ck::CudaDeviceBuffer::alloc(&stream, SK * 4), // act
+            cu_upload_f32(&stream, &signs),
+            ck::CudaDeviceBuffer::alloc(&stream, SK * 4), // y (rotated)
+        ) {
+            (Some(gb), Some(ub), Some(mut ab), Some(sgb), Some(mut yb)) => {
+                // SAFETY: five live device buffers on `stream` sized SK; each
+                // wrapper synchronizes before returning, so stage 1's act is
+                // readable by stage 2 and the readback doesn't race.
+                let sm = unsafe {
+                    ck::silu_mul_f32(
+                        &stream,
+                        gb.as_ptr() as *const f32,
+                        ub.as_ptr() as *const f32,
+                        ab.as_mut_ptr() as *mut f32,
+                        SK,
+                    )
+                };
+                if let Err(e) = sm {
+                    cu_emit(name, "KERNEL_ERR", &format!("silu_mul {e}"));
+                    *counts.entry("KERNEL_ERR").or_default() += 1;
+                } else {
+                    let had = unsafe {
+                        ck::hadamard_forward(
+                            &stream,
+                            ab.as_ptr() as *const f32,
+                            sgb.as_ptr() as *const f32,
+                            yb.as_mut_ptr() as *mut f32,
+                            SK,
+                            SBLOCK,
+                        )
+                    };
+                    match had {
+                        Err(e) => {
+                            cu_emit(name, "KERNEL_ERR", &format!("hadamard {e}"));
+                            *counts.entry("KERNEL_ERR").or_default() += 1;
+                        }
+                        Ok(()) => {
+                            let gpu = cu_download_f32(&yb, SK);
+                            let (cos, max_rel) = compare(&gpu, &cpu);
+                            let key: &'static str = if cos > 0.999 && max_rel < 0.05 {
+                                "OK"
+                            } else {
+                                "MISCOMPUTE"
+                            };
+                            *counts.entry(key).or_default() += 1;
+                            cu_emit(name, key, &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+                        }
+                    }
+                }
+            }
+            _ => {
+                cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
     // ---- Packed matvecs the CUDA backend implements ----
     // All 25 packed formats SYCL grades — CUDA ships + dispatches the same set,
     // so grade them all here too (was 17, then the first 7 before that). The
