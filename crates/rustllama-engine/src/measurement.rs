@@ -21,6 +21,35 @@ use crate::inference::ContiguousEngine;
 use crate::SamplingParams;
 use rustllama_models::llama_arch::KvDtype;
 
+/// Resolve `configured` into the engine's device placement, the SAME way the
+/// serve / `model bench` load paths do, then install it.
+///
+/// `configured` comes from `[inference].n_gpu_layers`, whose default is the
+/// AUTO sentinel `999` (`rustllama_config::N_GPU_LAYERS_AUTO`). That sentinel is
+/// **not a layer count** — the engine's per-tensor device plan (measured-perf
+/// heat / VRAM-fit) is only installed when AUTO is resolved through
+/// `auto_place_heat`. Handing `999` straight to `set_n_gpu_layers` left every
+/// measurement running **all-CPU** (the same AUTO-sentinel trap that made
+/// `model bench` silently measure the CPU: see the T0a note in
+/// `rustllama-cli`). On a 9B/27B model that all-CPU crawl looks like a hang.
+///
+/// An explicit non-sentinel override is honored as-is. The AUTO sentinel
+/// resolves to the measured-perf heat plan under default placement opts
+/// (`cpu_enabled`/`gpu_enabled` default on); a CPU-only / GPU-unavailable host
+/// resolves to all-CPU as before, so this is a no-op there.
+fn apply_measurement_placement(cpu: &mut ContiguousEngine, configured: u32) {
+    // Mirrors `rustllama_config::N_GPU_LAYERS_AUTO` (kept inline so the engine
+    // crate need not depend on `rustllama-config`).
+    const N_GPU_LAYERS_AUTO: u32 = 999;
+    let n = if configured == N_GPU_LAYERS_AUTO {
+        cpu.auto_place_heat(&crate::placement_auto::AutoPlacementOpts::default())
+            .n_gpu_layers
+    } else {
+        configured
+    };
+    cpu.set_n_gpu_layers(n);
+}
+
 /// Collect `repeats` timed decode runs (clearing the prefix cache before each)
 /// and return the (UNSORTED) tok/s runs + the last error seen — the shared
 /// inner loop of the tuner's decode A/B sweeps. Each run is one
@@ -916,7 +945,7 @@ pub fn measure_kv_dtype_candidates(
                 Ok(mut c) => {
                     c.set_prefix_cache(false);
                     c.set_flash_attention(cfg.flash_attention);
-                    c.set_n_gpu_layers(cfg.n_gpu_layers);
+                    apply_measurement_placement(&mut c, cfg.n_gpu_layers);
                     *engine = Some(c);
                     None
                 }
@@ -1069,7 +1098,7 @@ pub fn measure_flash_attention_candidates(
     )
     .map_err(|e| crate::EngineError::Engine(format!("load failed: {e}")))?;
     cpu.set_prefix_cache(false);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     let vocab = cpu.vocab_size() as i32;
@@ -1216,7 +1245,7 @@ pub fn measure_kv_layout_candidates(
         };
         cpu.set_prefix_cache(false);
         cpu.set_flash_attention(cfg.flash_attention);
-        cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+        apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
         let vocab = cpu.vocab_size() as i32;
         let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
@@ -1410,7 +1439,7 @@ pub fn measure_batching_candidates(
             Ok(mut cpu) => {
                 cpu.set_prefix_cache(false);
                 cpu.set_flash_attention(cfg.flash_attention);
-                cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+                apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
                 let vocab = cpu.vocab_size() as i32;
                 let warmup_t = std::time::Instant::now();
                 let _ = cpu.generate_token_ids(
@@ -1553,7 +1582,7 @@ pub fn measure_batch_size_candidates(
     .map_err(|e| crate::EngineError::Engine(format!("load failed: {e}")))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     let vocab = cpu.vocab_size() as i32;
@@ -1708,7 +1737,7 @@ pub fn measure_flash_kv_min_candidates(
     .map_err(|e| crate::EngineError::Engine(format!("load failed: {e}")))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     let vocab = cpu.vocab_size() as i32;
@@ -1854,7 +1883,7 @@ pub fn measure_prefix_snapshots_candidates(
     .map_err(|e| crate::EngineError::Engine(format!("load failed: {e}")))?;
     cpu.set_prefix_cache(true);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     let vocab = cpu.vocab_size() as i32;
@@ -2019,7 +2048,7 @@ pub fn measure_kv_page_size_candidates(
         };
         cpu.set_prefix_cache(false);
         cpu.set_flash_attention(cfg.flash_attention);
-        cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+        apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
         let vocab = cpu.vocab_size() as i32;
         let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
@@ -2140,7 +2169,7 @@ pub fn measure_flash_v3_kv_tile_candidates(
     .map_err(|e| crate::EngineError::Engine(format!("load failed: {e}")))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     let vocab = cpu.vocab_size() as i32;
@@ -2300,7 +2329,7 @@ pub fn measure_moe_placement_candidates(
     }
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     let vocab = cpu.vocab_size() as i32;
@@ -2540,7 +2569,7 @@ pub fn measure_speculative_mtp(
     .map_err(|e| format!("load failed: {e}"))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
     // Capability probe: enable the flag, then read the EFFECTIVE getter
     // (`mtp_spec && model_supports_mtp()`). No reload needed — the flag
@@ -2857,7 +2886,7 @@ pub fn measure_spec_strategy(
     .map_err(|e| format!("load failed: {e}"))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
     // Capability probes (cheap flag flips on the loaded engine, reset after): the
     // Mtp / Tree candidates only apply to a model with a NextN head.
@@ -3043,7 +3072,7 @@ pub fn measure_tree_widths(
     .map_err(|e| format!("load failed: {e}"))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
     // Capability probe: set a trivial width vector and read the EFFECTIVE getter
     // (`tree_spec.is_some() && model_supports_tree()`). No reload needed — the
@@ -3251,7 +3280,7 @@ pub fn measure_ssm_prefill_chunked(
     .map_err(|e| format!("load failed: {e}"))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
     let vocab = cpu.vocab_size() as i32;
     let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
@@ -3387,7 +3416,7 @@ pub fn measure_flash_attn_bench(
     .map_err(|e| format!("load failed: {e}"))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(true); // force the FA path for the bench
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
     let vocab = cpu.vocab_size() as i32;
     let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
@@ -3634,7 +3663,7 @@ fn measure_perf_knob_generic(
     .map_err(|e| format!("load failed: {e}"))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
     let vocab = cpu.vocab_size() as i32;
     let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
@@ -3875,7 +3904,7 @@ pub fn measure_dev_attn(
     .map_err(|e| format!("load failed: {e}"))?;
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
-    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
     let vocab = cpu.vocab_size() as i32;
     let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
@@ -4105,7 +4134,7 @@ pub fn measure_moe_vram_margin_candidates(
         any_tier |= promoted;
         cpu.set_prefix_cache(false);
         cpu.set_flash_attention(cfg.flash_attention);
-        cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+        apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
 
         let vocab = cpu.vocab_size() as i32;
         let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
