@@ -8907,15 +8907,12 @@ impl LlamaModel {
                     log_hidden("post-ssm-ffn", li, &hidden);
                 }
                 HybridLayer::FullAttention(block) => {
-                    // 1. Pre-attention RMSNorm.
-                    k::rmsnorm_f32_row(&hidden, &block.attn_norm, &mut tmp_d, cfg.rms_eps);
-
-                    // B1 (Kindi `k_rmsfold` spirit): q/k/v share this attn-norm
-                    // input AND its Hadamard rotation (the WHT depends only on
-                    // `tmp_d` + its width, not on the weight), so rotate ONCE in
-                    // place and let all three matmuls read it — instead of
-                    // re-running the WHT per projection via `hadamard_pre`.
-                    // Bit-identical; saves 2 of 3 WHTs per full-attention layer.
+                    // 1. Pre-attention RMSNorm + Hadamard + Q/K/V projections.
+                    //
+                    // q/k/v share this attn-norm input AND its Hadamard rotation
+                    // (the WHT depends only on the input + its width, not on the
+                    // weight), so the rotation runs ONCE and all three matmuls
+                    // read the result — not a per-projection re-run.
                     debug_assert!(
                         had.map_or(true, |h| {
                             let q = h.is_folded(&block.w_q.name);
@@ -8923,21 +8920,51 @@ impl LlamaModel {
                         }),
                         "hadamard: q/k/v foldedness must match for shared-input rotate-once"
                     );
-                    hadamard_rotate_inplace(had, &block.w_q, &mut tmp_d);
+                    // B2 (Kindi rmsfold): device-resident GPU rmsnorm → Hadamard
+                    // → 3 matvecs with the rotated activation kept in USM — no CPU
+                    // rotation, no host round-trip. Only when folded + Hadamard
+                    // enabled (a `RUSTLLAMA_NO_HADAMARD` run must stay on the CPU
+                    // path, which also skips the rotation). Fail-closed (verdict /
+                    // USM / shape / non-PTQ1_0) ⇒ the BYTE-IDENTICAL CPU path below
+                    // (B1: rmsnorm → rotate-once → 3 matvecs).
+                    let dev_qkv = match had {
+                        Some(h) if h.is_folded(&block.w_q.name) && !no_hadamard_enabled() => {
+                            crate::accel::try_folded_qkv_rmsfold_usm_f32(
+                                &hidden,
+                                &block.attn_norm,
+                                h.signs_for(d),
+                                h.block_size,
+                                cfg.rms_eps,
+                                &block.w_q,
+                                &block.w_k,
+                                &block.w_v,
+                                &mut qg_buf,
+                                &mut k_buf,
+                                &mut v_buf,
+                                2 * d_q,
+                                d_kv,
+                                d,
+                            )
+                        }
+                        _ => false,
+                    };
+                    if !dev_qkv {
+                        k::rmsnorm_f32_row(&hidden, &block.attn_norm, &mut tmp_d, cfg.rms_eps);
+                        hadamard_rotate_inplace(had, &block.w_q, &mut tmp_d);
+                        matvec_tensor_dispatch(&block.w_q, &tmp_d, &mut qg_buf, 2 * d_q, d);
+                        matvec_tensor_dispatch(&block.w_k, &tmp_d, &mut k_buf, d_kv, d);
+                        matvec_tensor_dispatch(&block.w_v, &tmp_d, &mut v_buf, d_kv, d);
+                    }
 
-                    // 2. Q projection — qwen35moe doubles q_proj's
-                    //    output dim to carry a per-head gate that's
-                    //    chunked off here and multiplied into the
-                    //    attention output below. See HF
+                    // 2. Deinterleave qg_buf (filled by either path) per-head into
+                    //    separate query / gate buffers. qwen35moe doubles q_proj's
+                    //    output dim to carry a per-head gate chunked off here and
+                    //    multiplied into the attention output below. See HF
                     //    Qwen3_5MoeAttention.forward:
                     //        qg = self.q_proj(hidden).view(..., n_h, head_dim * 2)
                     //        query, gate = qg.chunk(2, dim=-1)
                     //        attn_output = attn_output * sigmoid(gate)
-                    //    Per-head layout: `[h0.q, h0.g, h1.q, h1.g, …]`
-                    //    flattened. Total dim = 2 * d_q.
-                    matvec_tensor_dispatch(&block.w_q, &tmp_d, &mut qg_buf, 2 * d_q, d);
-                    // Deinterleave per-head into separate query / gate
-                    // buffers (hoisted scratch).
+                    //    Per-head layout: `[h0.q, h0.g, h1.q, h1.g, …]` flattened.
                     for h in 0..n_heads {
                         let src_base = h * 2 * head_dim;
                         q_buf[h * head_dim..(h + 1) * head_dim]
@@ -8945,8 +8972,6 @@ impl LlamaModel {
                         attn_gate_buf[h * head_dim..(h + 1) * head_dim]
                             .copy_from_slice(&qg_buf[src_base + head_dim..src_base + 2 * head_dim]);
                     }
-                    matvec_tensor_dispatch(&block.w_k, &tmp_d, &mut k_buf, d_kv, d);
-                    matvec_tensor_dispatch(&block.w_v, &tmp_d, &mut v_buf, d_kv, d);
 
                     // 3. Per-head Q/K norm (Qwen3 family).
                     if let Some(qn) = block.q_norm.as_ref() {

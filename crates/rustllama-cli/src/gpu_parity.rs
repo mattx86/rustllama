@@ -469,6 +469,10 @@ fn probe_names() -> Vec<String> {
     v.push("fused:rmsnorm_matvec".to_string());
     v.push("fused:down_residual".to_string());
     v.push("fused:out_proj_norm".to_string());
+    // B2 (Kindi rmsfold): the device-resident folded-projection chain
+    // (`rmsnorm_f32_usm` → `hadamard_forward_usm`) vs CPU `rmsnorm_f32_row` then
+    // `hadamard::hadamard_forward`. Banks `fused:rmsfold`.
+    v.push("fused:rmsfold".to_string());
     // P17: GPU Gated-DeltaNet chunked-prefill recurrence (the hybrid-model tok/s
     // ceiling) vs the CPU chunked reference. f32 end to end; banked before the
     // matvec families like the other small f32 USM kernels.
@@ -1994,6 +1998,99 @@ fn probe_rmsnorm_matvec(stream: &sk::SyclStream, name: &str, started: Instant) {
     }
 }
 
+/// B2 (Kindi rmsfold): parity for the device-resident folded-projection chain —
+/// `rmsnorm_f32_usm` → `hadamard_forward_usm` (the rotated-normed activation kept
+/// in USM, which the matvec then reads) — vs the CPU reference `rmsnorm_f32_row`
+/// then `hadamard::hadamard_forward` on identical inputs. Single row (decode
+/// shape). Bit-tolerant f32: the WHT adds reduction depth + produces near-zero
+/// (cancelling) elements, so the gate is cos-dominant with a loose rel bound.
+fn probe_rmsfold(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const K: usize = 256; // input dim — multiple of BLOCK and of 128 (PTQ1_0)
+    const BLOCK: usize = 64;
+    const EPS: f32 = 1e-5;
+    let x = gen_x(K, 86);
+    let wnorm = gen_x(K, 87);
+    // ±1 sign vector (the shape metadata-load validates for a real model).
+    let signs: Vec<f32> = (0..K)
+        .map(|i| {
+            if (i * 2654435761usize) & 0x10 == 0 {
+                1.0
+            } else {
+                -1.0
+            }
+        })
+        .collect();
+    // CPU reference: RMSNorm then the forward Hadamard rotation.
+    let mut xn = vec![0f32; K];
+    k::rmsnorm_f32_row(&x, &wnorm, &mut xn, EPS);
+    let mut cpu = vec![0f32; K];
+    k::hadamard::hadamard_forward(&xn, &signs, BLOCK, &mut cpu);
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // x
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // wnorm
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // hnorm
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // signs
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // y (rotated)
+    );
+    let (mut xb, mut wnb, mut hnb, mut sgb, mut yb) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e)) => (a, b, c, d, e),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    xb.as_mut_slice().copy_from_slice(&x);
+    wnb.as_mut_slice().copy_from_slice(&wnorm);
+    sgb.as_mut_slice().copy_from_slice(&signs);
+    hnb.as_mut_slice().fill(f32::NAN);
+    yb.as_mut_slice().fill(f32::NAN);
+    // SAFETY: five USM allocations on `stream`, sized above; each kernel waits
+    // before returning, so the hnorm written by stage 1 is readable by stage 2
+    // and the host read below doesn't race the device.
+    let rms = unsafe {
+        sk::rmsnorm_f32_usm_raw(
+            stream,
+            xb.as_ptr(),
+            wnb.as_ptr(),
+            hnb.as_mut_ptr(),
+            1,
+            K as u32,
+            EPS,
+        )
+    };
+    if let Err(e) = rms {
+        emit(name, "KERNEL_ERR", &format!("rmsnorm {e}"));
+        return;
+    }
+    let had = unsafe {
+        sk::hadamard_forward_usm_raw(
+            stream,
+            hnb.as_ptr(),
+            sgb.as_ptr(),
+            yb.as_mut_ptr(),
+            K as u32,
+            BLOCK as u32,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match had {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("hadamard {e} ms={ms}")),
+        Ok(()) => {
+            let (cos, max_rel) = compare(yb.as_slice(), &cpu);
+            let verdict = if cos > 0.999 && max_rel < 0.05 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
+        }
+    }
+}
+
 /// P6-fusions: parity for the fused FFN down-proj + residual-add f32 kernel
 /// (`rsl_down_residual_f32_usm`) vs CPU `matvec_f32` then `add_inplace_f32`,
 /// per row. Bit-tolerant (f32, ~1e-4).
@@ -2169,6 +2266,8 @@ fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instan
         "rmsnorm_matvec" => return probe_rmsnorm_matvec(stream, name, started),
         "down_residual" => return probe_down_residual(stream, name, started),
         "out_proj_norm" => return probe_out_proj_norm(stream, name, started),
+        // B2 (Kindi rmsfold): the device-resident rmsnorm→Hadamard chain.
+        "rmsfold" => return probe_rmsfold(stream, name, started),
         _ => {}
     }
     let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");

@@ -430,6 +430,14 @@ pub const VERDICT_FUSED_DOWN_RESIDUAL: &str = "fused:down_residual";
 /// `fused:out_proj_norm` probe — the exact chained kernels (packed matvec →
 /// `add_rmsnorm_f32`) vs CPU `matvec` then `add` then `rmsnorm_f32_row`.
 pub const VERDICT_FUSED_OUT_PROJ_NORM: &str = "fused:out_proj_norm";
+/// B2 (Kindi rmsfold): the Prism block-Hadamard activation rotation run ON the
+/// GPU and kept device-resident with the preceding RMSNorm, so a folded Bonsai
+/// projection does `rmsnorm → hadamard → matvec` entirely in USM — no CPU
+/// rotation, no host round-trip of the rotated activation. Backs
+/// `accel::rmsfold_fused_enabled`; graded by the `fused:rmsfold` probe (device
+/// `rmsnorm_f32_usm` → `hadamard_forward_usm` vs CPU `rmsnorm_f32_row` then
+/// `hadamard::hadamard_forward`).
+pub const VERDICT_FUSED_RMSFOLD: &str = "fused:rmsfold";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

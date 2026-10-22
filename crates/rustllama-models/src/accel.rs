@@ -6639,6 +6639,23 @@ struct UsmAttnContext {
     /// the matvec result == add_rmsnorm's `branch` input) so neither
     /// buffer aliases the other across the two kernel launches.
     matvec_hidden_f32: Option<sk::SyclSharedBuffer<'static, f32>>,
+    /// B2 (Kindi rmsfold): device-resident folded-projection scratch — the
+    /// Prism Hadamard rotation runs ON the GPU so a folded Bonsai projection's
+    /// activation stays in USM across `rmsnorm → hadamard → matvec` (no CPU
+    /// rotation, no host round-trip). `_hidden` holds the uploaded raw input
+    /// (k), `_hnorm` the RMSNorm output (k), `_xrot` the rotated activation the
+    /// matvec reads (k), `_out` the matvec result (m). `_wnorm` / `_signs`
+    /// cache the per-layer norm weight + sign vector in USM, keyed by
+    /// `(host_ptr, len)` so they upload ONCE (constant across a model's tokens),
+    /// not per projection. All sized to the largest seen; reused across calls.
+    rmsfold_hidden: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsfold_hnorm: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsfold_xrot: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsfold_out: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsfold_wnorm: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsfold_wnorm_key: Option<(usize, usize)>,
+    rmsfold_signs: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsfold_signs_key: Option<(usize, usize)>,
     /// H8: F16-packed activation scratch for the mixed-precision
     /// matvec (`try_matvec_tensor_f16in_usm_f32`). Holds the input
     /// vector converted F32→F16 (length K). Sized to the largest K
@@ -6801,6 +6818,14 @@ impl UsmAttnContext {
             matvec_out2_f32: None,
             matvec_wnorm_f32: None,
             matvec_hidden_f32: None,
+            rmsfold_hidden: None,
+            rmsfold_hnorm: None,
+            rmsfold_xrot: None,
+            rmsfold_out: None,
+            rmsfold_wnorm: None,
+            rmsfold_wnorm_key: None,
+            rmsfold_signs: None,
+            rmsfold_signs_key: None,
             matvec_x_f16in: None,
             matvec_f16_x: None,
             matvec_f16_out: None,
@@ -7229,6 +7254,15 @@ impl Drop for UsmAttnContext {
         self.matvec_out2_f32 = None;
         self.matvec_wnorm_f32 = None;
         self.matvec_hidden_f32 = None;
+        // B2 rmsfold device-resident scratch (+ cache keys).
+        self.rmsfold_hidden = None;
+        self.rmsfold_hnorm = None;
+        self.rmsfold_xrot = None;
+        self.rmsfold_out = None;
+        self.rmsfold_wnorm = None;
+        self.rmsfold_wnorm_key = None;
+        self.rmsfold_signs = None;
+        self.rmsfold_signs_key = None;
         self.matvec_x_f16in = None;
         self.matvec_f16_x = None;
         self.matvec_f16_out = None;
@@ -14683,6 +14717,191 @@ pub fn rmsnorm_matvec_fused_enabled() -> bool {
 /// then `add_inplace_f32`). No env gate.
 pub fn down_residual_fused_enabled() -> bool {
     kernel_verdict(rustllama_tuner::VERDICT_FUSED_DOWN_RESIDUAL)
+}
+
+/// B2 (Kindi rmsfold): whether the device-resident folded-projection path (GPU
+/// RMSNorm → GPU Hadamard → GPU matvec, the activation kept in USM) is
+/// verdict-enabled on this device. Fail-closed: absent / `false` ⇒ OFF, so the
+/// forward keeps the CPU RMSNorm + CPU Hadamard + GPU matvec BYTE-IDENTICAL.
+/// Banked by the SYCL `fused:rmsfold` parity probe. No env gate.
+pub fn rmsfold_fused_enabled() -> bool {
+    kernel_verdict(rustllama_tuner::VERDICT_FUSED_RMSFOLD)
+}
+
+/// B2 (Kindi rmsfold): device-resident folded Q/K/V projection for a hybrid
+/// attention layer (Bonsai PTQ1_0). The pre-attention RMSNorm + the Prism
+/// block-Hadamard rotation run ON the GPU and the rotated activation STAYS in
+/// USM while all THREE projections (`w_q`/`w_k`/`w_v`) read it — eliminating
+/// the per-projection CPU rotation AND the host round-trip the CPU path pays
+/// (today: CPU `rmsnorm_f32_row` → CPU `hadamard_forward` → upload → GPU matvec,
+/// ×3). q/k/v share one input + one rotation (the WHT depends only on the input
+/// + its width), mirroring the B1 CPU rotate-once dedup.
+///
+/// `hidden` is the raw d_model input; `norm_weight` the attn-norm weights (k);
+/// `signs` the per-width sign vector (k); `block` the Hadamard block size; the
+/// three `out_*` receive the projections (`mq` = `2·d_q` for qwen35moe's
+/// gated q, `mkv` = `d_kv`). Returns `true` iff the GPU produced all three
+/// outputs; `false` (verdict off, no USM context, CPU-resident layer, a
+/// non-PTQ1_0 / non-USM-resident weight, shape mismatch, or any kernel miss) ⇒
+/// the caller runs the BYTE-IDENTICAL CPU rmsnorm + rotate + matvec path. The
+/// `fused:rmsfold` verdict (fail-closed) is the only enable.
+///
+/// Scope: PTQ1_0 weights preloaded to USM (`preload_weights_to_usm`), SYCL
+/// active. Other formats / non-preloaded weights decline (CPU path). The down
+/// projection (`smfold`) and the CUDA / MLX backends are follow-ons.
+#[allow(clippy::too_many_arguments)]
+pub fn try_folded_qkv_rmsfold_usm_f32(
+    hidden: &[f32],
+    norm_weight: &[f32],
+    signs: &[f32],
+    block: usize,
+    eps: f32,
+    wq: &Tensor,
+    wk: &Tensor,
+    wv: &Tensor,
+    out_q: &mut [f32],
+    out_k: &mut [f32],
+    out_v: &mut [f32],
+    mq: usize,
+    mkv: usize,
+    k: usize,
+) -> bool {
+    if !rmsfold_fused_enabled() || !usm_attn_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    // PTQ1_0 only (the folded Bonsai format), weights already USM-preloaded, and
+    // the shapes the device chain assumes. Anything else ⇒ CPU path.
+    if !matches!(wq.dtype, Dtype::PTQ1_0Raw) || wk.dtype != wq.dtype || wv.dtype != wq.dtype {
+        return false;
+    }
+    if k == 0 || block == 0 || k % block != 0 || k % 128 != 0 {
+        return false;
+    }
+    if hidden.len() != k
+        || norm_weight.len() < k
+        || signs.len() < k
+        || out_q.len() != mq
+        || out_k.len() != mkv
+        || out_v.len() != mkv
+    {
+        return false;
+    }
+    let (Some(wq_usm), Some(wk_usm), Some(wv_usm)) = (
+        wq.storage.sycl_usm_ptr(),
+        wk.storage.sycl_usm_ptr(),
+        wv.storage.sycl_usm_ptr(),
+    ) else {
+        return false;
+    };
+    let wnorm_key = (norm_weight.as_ptr() as usize, k);
+    let signs_key = (signs.as_ptr() as usize, k);
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(ctx) = slot.as_mut() else {
+            log_matvec_skip_once("rmsfold: USM_ATTN slot is None (prepare_usm_context failed)");
+            return false;
+        };
+        // Grow scratch to this call's dims (output sized to the largest m).
+        if ensure_scratch_f32_grow(&ctx.stream, &mut ctx.rmsfold_hidden, k).is_err()
+            || ensure_scratch_f32_grow(&ctx.stream, &mut ctx.rmsfold_hnorm, k).is_err()
+            || ensure_scratch_f32_grow(&ctx.stream, &mut ctx.rmsfold_xrot, k).is_err()
+            || ensure_scratch_f32_grow(&ctx.stream, &mut ctx.rmsfold_out, mq.max(mkv)).is_err()
+        {
+            return false;
+        }
+        // Cache the per-layer norm weight + sign vector in USM — upload only on a
+        // (re)alloc or a host-ptr/len change (both are constant across tokens).
+        match ensure_scratch_f32_grow(&ctx.stream, &mut ctx.rmsfold_wnorm, k) {
+            Ok(realloced) => {
+                if realloced || ctx.rmsfold_wnorm_key != Some(wnorm_key) {
+                    ctx.rmsfold_wnorm.as_mut().unwrap().as_mut_slice()[..k]
+                        .copy_from_slice(&norm_weight[..k]);
+                    ctx.rmsfold_wnorm_key = Some(wnorm_key);
+                }
+            }
+            Err(_) => return false,
+        }
+        match ensure_scratch_f32_grow(&ctx.stream, &mut ctx.rmsfold_signs, k) {
+            Ok(realloced) => {
+                if realloced || ctx.rmsfold_signs_key != Some(signs_key) {
+                    ctx.rmsfold_signs.as_mut().unwrap().as_mut_slice()[..k]
+                        .copy_from_slice(&signs[..k]);
+                    ctx.rmsfold_signs_key = Some(signs_key);
+                }
+            }
+            Err(_) => return false,
+        }
+        // Upload the raw hidden row (the ONE host→USM copy per layer; the CPU
+        // path instead uploads a rotated activation per projection, i.e. ×3).
+        ctx.rmsfold_hidden.as_mut().unwrap().as_mut_slice()[..k].copy_from_slice(&hidden[..k]);
+
+        // Raw stream handle: the FFI entries below take `&stream` while we also
+        // hold `&mut` borrows of the scratch fields (same pattern as
+        // `try_rmsnorm_usm_f32`). The kernels `.wait()` before returning.
+        let stream_raw: *const sk::SyclStream = &ctx.stream;
+        // Stage 1 — GPU RMSNorm: hidden → hnorm.
+        {
+            let x_ptr = ctx.rmsfold_hidden.as_ref().unwrap().as_ptr();
+            let w_ptr = ctx.rmsfold_wnorm.as_ref().unwrap().as_ptr();
+            let y_ptr = ctx.rmsfold_hnorm.as_mut().unwrap().as_mut_ptr();
+            if unsafe {
+                sk::rmsnorm_f32_usm_raw(&*stream_raw, x_ptr, w_ptr, y_ptr, 1, k as u32, eps)
+            }
+            .is_err()
+            {
+                return false;
+            }
+        }
+        // Stage 2 — GPU Hadamard: hnorm → xrot (stays resident; no host copy).
+        {
+            let x_ptr = ctx.rmsfold_hnorm.as_ref().unwrap().as_ptr();
+            let s_ptr = ctx.rmsfold_signs.as_ref().unwrap().as_ptr();
+            let o_ptr = ctx.rmsfold_xrot.as_mut().unwrap().as_mut_ptr();
+            if unsafe {
+                sk::hadamard_forward_usm_raw(
+                    &*stream_raw,
+                    x_ptr,
+                    s_ptr,
+                    o_ptr,
+                    k as u32,
+                    block as u32,
+                )
+            }
+            .is_err()
+            {
+                return false;
+            }
+        }
+        // Stage 3 — three PTQ1_0 matvecs read the SAME resident rotated
+        // activation. `xrot_ptr` aliases `ctx.rmsfold_xrot` (read-only to the
+        // kernel) while each matvec writes `ctx.rmsfold_out` (a disjoint buffer).
+        let xrot_ptr = ctx.rmsfold_xrot.as_ref().unwrap().as_ptr();
+        for (w_usm, out, m) in [
+            (wq_usm, &mut *out_q, mq),
+            (wk_usm, &mut *out_k, mkv),
+            (wv_usm, &mut *out_v, mkv),
+        ] {
+            let lws = tuned_lws_for(rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM, m, k);
+            let out_ptr = ctx.rmsfold_out.as_mut().unwrap().as_mut_ptr();
+            if unsafe {
+                sk::matvec_ptq1_0_packed_f32_usm_raw(
+                    &*stream_raw,
+                    w_usm,
+                    xrot_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
+                )
+            }
+            .is_err()
+            {
+                return false;
+            }
+            out.copy_from_slice(&ctx.rmsfold_out.as_ref().unwrap().as_slice()[..m]);
+        }
+        true
+    })
 }
 
 /// P6-fusions: fused RMSNorm(input)+matvec dispatch for an f32 weight. Computes
