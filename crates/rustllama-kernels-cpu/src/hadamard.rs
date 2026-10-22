@@ -53,6 +53,33 @@ pub fn hadamard_forward(x: &[f32], signs: &[f32], block: usize, out: &mut [f32])
     }
 }
 
+/// In-place forward rotation `x ← R x`, per `block`-sized chunk —
+/// bit-identical to [`hadamard_forward`] (same sign-flip → WHT →
+/// `1/√block` order) but rotates `x` in place, so a caller whose
+/// activation feeds several folded projections sharing one input
+/// (q/k/v off one attn-norm) can rotate ONCE instead of re-running the
+/// WHT per projection into a scratch buffer.
+///
+/// - `x.len() == signs.len()`, a multiple of `block`; `block` a power of two.
+/// - `signs` entries are ±1.0.
+pub fn hadamard_forward_inplace(x: &mut [f32], signs: &[f32], block: usize) {
+    debug_assert_eq!(x.len(), signs.len());
+    debug_assert_eq!(x.len() % block, 0);
+    let inv_sqrt = 1.0f32 / (block as f32).sqrt();
+    for b in 0..x.len() / block {
+        let o = b * block;
+        let sb = &signs[o..o + block];
+        let xb = &mut x[o..o + block];
+        for i in 0..block {
+            xb[i] *= sb[i];
+        }
+        wht_inplace(xb);
+        for v in xb.iter_mut() {
+            *v *= inv_sqrt;
+        }
+    }
+}
+
 /// Inverse rotation `y ← Rᵀ y` in place, per `block`-sized chunk:
 /// unnormalized WHT, `1/√block`, then sign-flip. Used on the result
 /// of a `token_embd` lookup when the embedding table is registered
@@ -162,6 +189,25 @@ mod tests {
                     dense[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn forward_inplace_matches_forward() {
+        // The rotate-once dedup (q/k/v share one attn-norm input) relies on
+        // the in-place forward being BIT-identical to the out-of-place one.
+        for block in [16usize, 64, 1024] {
+            let n = block * 2;
+            let x = x_pattern(n);
+            let s = signs_pattern(n);
+            let mut out = vec![0f32; n];
+            hadamard_forward(&x, &s, block, &mut out);
+            let mut inpl = x.clone();
+            hadamard_forward_inplace(&mut inpl, &s, block);
+            assert_eq!(
+                out, inpl,
+                "block {block}: in-place forward must equal out-of-place bit-for-bit"
+            );
         }
     }
 

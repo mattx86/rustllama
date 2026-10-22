@@ -333,6 +333,22 @@ fn hadamard_pre<'a>(
     &scratch[..x.len()]
 }
 
+/// Rotate `buf` IN PLACE iff `w` is Hadamard-folded (and Hadamard is enabled);
+/// returns whether it rotated. Bit-identical to a per-projection [`hadamard_pre`]
+/// (same signs/block/order — the rotation depends only on `buf` + its width, not
+/// on `w` beyond its fold flag), but lets several folded projections that share
+/// one input (q/k/v off a single attn-norm) rotate the input ONCE instead of
+/// re-running the WHT per projection into a scratch buffer. The caller must
+/// ensure those projections agree on foldedness (they do on Bonsai — asserted).
+fn hadamard_rotate_inplace(had: Option<&HadamardState>, w: &Tensor, buf: &mut [f32]) -> bool {
+    let Some(h) = had else { return false };
+    if no_hadamard_enabled() || !h.is_folded(&w.name) {
+        return false;
+    }
+    k::hadamard::hadamard_forward_inplace(buf, h.signs_for(buf.len()), h.block_size);
+    true
+}
+
 /// `ssm_out` variant of [`hadamard_pre`]: when the model declares
 /// `gdn_v_grouped`, the fold was done in HF's GROUPED V-head order
 /// (head `h' = k·rep + r`) while the GDN runtime concatenates heads
@@ -442,8 +458,12 @@ pub(crate) fn dense_ffn_one_into(
         matvec_tensor_gate_up_fused_dispatch(w_gate, w_up, x_in, gate, up, d_ff, d);
     }
     k::silu_mul_f32(&gate_buf[..d_ff], &up_buf[..d_ff], &mut ff_buf[..d_ff]);
-    let ff_in = hadamard_pre(had, w_down, &ff_buf[..d_ff], had_buf);
-    matvec_tensor_dispatch(w_down, ff_in, out, d, d_ff);
+    // B1 (Kindi `k_smfold` spirit): the down-proj input is the SiLU-gate output
+    // in `ff_buf` — locally owned and consumed only by the matmul below — so
+    // rotate it IN PLACE instead of copying the rotation into `had_buf`.
+    // Bit-identical to the former `hadamard_pre`; drops one scratch round-trip.
+    hadamard_rotate_inplace(had, w_down, &mut ff_buf[..d_ff]);
+    matvec_tensor_dispatch(w_down, &ff_buf[..d_ff], out, d, d_ff);
 }
 
 /// Chunked dense SwiGLU FFN for the batched hybrid prefill — the
@@ -8890,6 +8910,21 @@ impl LlamaModel {
                     // 1. Pre-attention RMSNorm.
                     k::rmsnorm_f32_row(&hidden, &block.attn_norm, &mut tmp_d, cfg.rms_eps);
 
+                    // B1 (Kindi `k_rmsfold` spirit): q/k/v share this attn-norm
+                    // input AND its Hadamard rotation (the WHT depends only on
+                    // `tmp_d` + its width, not on the weight), so rotate ONCE in
+                    // place and let all three matmuls read it — instead of
+                    // re-running the WHT per projection via `hadamard_pre`.
+                    // Bit-identical; saves 2 of 3 WHTs per full-attention layer.
+                    debug_assert!(
+                        had.map_or(true, |h| {
+                            let q = h.is_folded(&block.w_q.name);
+                            q == h.is_folded(&block.w_k.name) && q == h.is_folded(&block.w_v.name)
+                        }),
+                        "hadamard: q/k/v foldedness must match for shared-input rotate-once"
+                    );
+                    hadamard_rotate_inplace(had, &block.w_q, &mut tmp_d);
+
                     // 2. Q projection — qwen35moe doubles q_proj's
                     //    output dim to carry a per-head gate that's
                     //    chunked off here and multiplied into the
@@ -8900,10 +8935,7 @@ impl LlamaModel {
                     //        attn_output = attn_output * sigmoid(gate)
                     //    Per-head layout: `[h0.q, h0.g, h1.q, h1.g, …]`
                     //    flattened. Total dim = 2 * d_q.
-                    {
-                        let x_in = hadamard_pre(had, &block.w_q, &tmp_d, &mut had_buf);
-                        matvec_tensor_dispatch(&block.w_q, x_in, &mut qg_buf, 2 * d_q, d);
-                    }
+                    matvec_tensor_dispatch(&block.w_q, &tmp_d, &mut qg_buf, 2 * d_q, d);
                     // Deinterleave per-head into separate query / gate
                     // buffers (hoisted scratch).
                     for h in 0..n_heads {
@@ -8913,14 +8945,8 @@ impl LlamaModel {
                         attn_gate_buf[h * head_dim..(h + 1) * head_dim]
                             .copy_from_slice(&qg_buf[src_base + head_dim..src_base + 2 * head_dim]);
                     }
-                    {
-                        let x_in = hadamard_pre(had, &block.w_k, &tmp_d, &mut had_buf);
-                        matvec_tensor_dispatch(&block.w_k, x_in, &mut k_buf, d_kv, d);
-                    }
-                    {
-                        let x_in = hadamard_pre(had, &block.w_v, &tmp_d, &mut had_buf);
-                        matvec_tensor_dispatch(&block.w_v, x_in, &mut v_buf, d_kv, d);
-                    }
+                    matvec_tensor_dispatch(&block.w_k, &tmp_d, &mut k_buf, d_kv, d);
+                    matvec_tensor_dispatch(&block.w_v, &tmp_d, &mut v_buf, d_kv, d);
 
                     // 3. Per-head Q/K norm (Qwen3 family).
                     if let Some(qn) = block.q_norm.as_ref() {
