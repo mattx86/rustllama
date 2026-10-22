@@ -10488,6 +10488,20 @@ impl LlamaModel {
                             );
                         }
                         {
+                            // B1 (prefill): q/k/v share this attn-norm input AND
+                            // its Hadamard rotation (the WHT depends only on the
+                            // rows + width, not the weight), so rotate ONCE and
+                            // let all three batched matvecs read it — not a
+                            // per-projection re-run (was ×3 row-batched WHTs).
+                            // Bit-identical; mirrors the decode rotate-once.
+                            debug_assert!(
+                                had.map_or(true, |h| {
+                                    let q = h.is_folded(&block.w_q.name);
+                                    q == h.is_folded(&block.w_k.name)
+                                        && q == h.is_folded(&block.w_v.name)
+                                }),
+                                "hadamard: q/k/v foldedness must match for shared-input rotate-once"
+                            );
                             let xs = hadamard_pre_rows(
                                 had,
                                 &block.w_q,
@@ -10504,16 +10518,6 @@ impl LlamaModel {
                                 d,
                                 nb,
                             );
-                        }
-                        {
-                            let xs = hadamard_pre_rows(
-                                had,
-                                &block.w_k,
-                                &hoist_norm[..nb * d],
-                                d,
-                                nb,
-                                &mut hoist_rot,
-                            );
                             matvec_tensor_batched_dispatch(
                                 &block.w_k,
                                 xs,
@@ -10521,16 +10525,6 @@ impl LlamaModel {
                                 d_kv,
                                 d,
                                 nb,
-                            );
-                        }
-                        {
-                            let xs = hadamard_pre_rows(
-                                had,
-                                &block.w_v,
-                                &hoist_norm[..nb * d],
-                                d,
-                                nb,
-                                &mut hoist_rot,
                             );
                             matvec_tensor_batched_dispatch(
                                 &block.w_v,
