@@ -850,9 +850,11 @@ struct EngineState {
     /// models. `Some` when the loaded model carries
     /// `hybrid_layers`; `None` for standard transformer + dense /
     /// MoE models. Phase 3.7b plumbing — forward routes here for
-    /// SSM layers via `forward_one_hybrid`. Prefix-cache restore
-    /// is not yet wired for hybrid models; restoring resets this
-    /// cache to its initial state.
+    /// SSM layers via `forward_one_hybrid`. Prefix-cache restore IS
+    /// wired for hybrid models (anchor-based, KV + recurrent state
+    /// captured together at a turn boundary — see
+    /// `prepare_prefix_reuse`'s hybrid branch); a non-matching prompt
+    /// resets this cache to its initial state.
     delta_net_cache: Option<rustllama_models::llama_arch::DeltaNetCache>,
 }
 

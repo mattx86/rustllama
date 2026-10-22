@@ -168,6 +168,11 @@ fn paged_stop_ids(
 /// `PagedBatchEngine`) agree on the page geometry.
 pub const DEFAULT_PAGE_SIZE: u32 = 16;
 
+/// D: minimum hybrid anchor length (tokens) worth restoring. Below this the
+/// restore copy + lookup isn't worth skipping the prefill; it also guards the
+/// `anchor_len < prompt.len()` requirement (≥1 token held back as `next_input`).
+const HYBRID_ANCHOR_MIN_TOKENS: usize = 16;
+
 /// Best-effort detection of a vision / multimodal (VLM) GGUF from what a text
 /// decoder's own file reveals. Used by the F6-A fail-closed paged VLM guard.
 ///
@@ -1272,6 +1277,9 @@ impl PagedBatchEngine {
                     &sampling,
                     Arc::clone(&self.stop_ids),
                     0,
+                    // Sync batched path: no anchor pool (D wires the async driver
+                    // path only — see `admit_request`). Full prefill as before.
+                    None,
                 )
                 .map_err(|e| ContiguousEngineError::Other(format!("hybrid slot build: {e}")))?;
                 state.adapter = adapter;
@@ -2422,6 +2430,26 @@ fn driver_loop(
     let vocab = ctx.model.cfg.vocab_size;
     let page_size = ctx.page_size as usize;
 
+    // D (Kindi recurrent-state reuse): driver-local pool of hybrid prefix
+    // ANCHORS (KV + DeltaNet recurrent state) so a shared prompt prefix across
+    // continuous-batching requests restores instead of re-prefilling the
+    // recurrent layers. Single driver thread owns it → no lock. OPT-IN +
+    // fail-safe OFF: gated by `RUSTLLAMA_PAGED_HYBRID_PREFIX_SNAPSHOTS` (pool
+    // depth; `0`/unset = disabled, byte-identical to the pre-D path), mirroring
+    // the `.rlkv` warm-restart's `RUSTLLAMA_KV_PERSIST_MB` opt-in. Snapshots hold
+    // full F32 KV + recurrent state (large), so the depth stays small.
+    let mut hybrid_prefix_pool: Option<crate::prefix_cache::PrefixCachePool> = {
+        let depth = std::env::var("RUSTLLAMA_PAGED_HYBRID_PREFIX_SNAPSHOTS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if depth > 0 && ctx.model.weights.is_hybrid() {
+            Some(crate::prefix_cache::PrefixCachePool::new(depth))
+        } else {
+            None
+        }
+    };
+
     // Placement init for THIS driver thread. It is a fresh `std::thread`, so the
     // accel dispatch thread-locals start at their process defaults rather than
     // whatever the loading thread set — the paged path previously left them
@@ -2526,7 +2554,14 @@ fn driver_loop(
                 pending.push(PendingEntry(req));
                 break;
             }
-            match admit_request(&ctx, &req.prompt, &req.sampling, &active, req.skip_emit) {
+            match admit_request(
+                &ctx,
+                &req.prompt,
+                &req.sampling,
+                &active,
+                req.skip_emit,
+                hybrid_prefix_pool.as_mut(),
+            ) {
                 Ok(state) => {
                     active.push(DriverSlot {
                         state,
@@ -2620,6 +2655,25 @@ fn driver_loop(
                 if let Ok(mut g) = ctx.last_stats.lock() {
                     *g = Some(stats);
                 }
+                // D: before dropping a completed HYBRID slot, capture its final
+                // KV + recurrent state as a pool anchor so the next turn of the
+                // same conversation (a longer prompt that extends this history)
+                // restores instead of re-prefilling. The last emitted token is
+                // still pending as `next_input` (not yet forwarded), so history
+                // leads kv by one — anchor exactly `kv.seq_len` tokens, which is
+                // what `snapshot_and_insert_hybrid` requires (ids.len==seq_len).
+                if let Some(pool) = hybrid_prefix_pool.as_mut() {
+                    if let Some(h) = slot.state.hybrid.as_ref() {
+                        let n = h.kv.seq_len.min(slot.state.history.len());
+                        if n > 0 {
+                            pool.snapshot_and_insert_hybrid(
+                                slot.state.history[..n].to_vec(),
+                                &h.kv,
+                                &h.dn,
+                            );
+                        }
+                    }
+                }
                 slot.state.cache.release_shared(&ctx.shared);
                 false
             } else {
@@ -2662,6 +2716,14 @@ fn build_hybrid_slot_state(
     sampling: &SamplingParams,
     stop_ids: Arc<std::collections::HashSet<i32>>,
     skip_emit: u32,
+    // D (Kindi recurrent-state reuse on the paged engine): a hybrid prefix
+    // ANCHOR restored from the driver's pool — `(kv, dn, anchor_len)` where the
+    // KV + recurrent state were captured at exactly `anchor_len` tokens that are
+    // a prefix of `prompt`. When `Some`, prefill only the SUFFIX
+    // `prompt[anchor_len..n-1]`; the restored state makes this bit-identical to a
+    // full prefill (same invariant the ContiguousEngine relies on). `None` ⇒
+    // fresh cache + full prefill (byte-identical to the pre-D path).
+    restored: Option<(KvCache, DeltaNetCache, usize)>,
 ) -> EngineResult<SlotState> {
     debug_assert!(!prompt.is_empty(), "build_hybrid_slot_state: empty prompt");
     let hybrid_layers = model
@@ -2669,21 +2731,34 @@ fn build_hybrid_slot_state(
         .hybrid_layers
         .as_ref()
         .expect("build_hybrid_slot_state called on a non-hybrid model — dispatch bug");
-    let mut kv = KvCache::new_with_dtype(&model.cfg, max_ctx, KvDtype::F32);
-    let mut dn = DeltaNetCache::new_for_hybrid(&model.cfg, hybrid_layers)
-        .map_err(|e| EngineError::Engine(format!("hybrid DeltaNet cache init: {e}")))?;
+    let (mut kv, mut dn, prefilled) = match restored {
+        Some((kv, dn, anchor_len)) => {
+            debug_assert_eq!(
+                kv.seq_len, anchor_len,
+                "restored anchor: kv.seq_len mismatch"
+            );
+            (kv, dn, anchor_len)
+        }
+        None => {
+            let kv = KvCache::new_with_dtype(&model.cfg, max_ctx, KvDtype::F32);
+            let dn = DeltaNetCache::new_for_hybrid(&model.cfg, hybrid_layers)
+                .map_err(|e| EngineError::Engine(format!("hybrid DeltaNet cache init: {e}")))?;
+            (kv, dn, 0usize)
+        }
+    };
     let capacity = kv.max_ctx as u32;
     let vocab = model.cfg.vocab_size;
 
-    // Prefill `prompt[..n-1]` token-by-token (contiguous-engine default path),
-    // advancing BOTH the contiguous KV and the per-slot DeltaNet state. The
-    // last prompt token is held back as `next_input` for the first decode.
+    // Prefill `prompt[prefilled..n-1]` token-by-token (contiguous-engine default
+    // path), advancing BOTH the contiguous KV and the per-slot DeltaNet state. A
+    // restored anchor skips `[0, prefilled)` (already in kv+dn). The last prompt
+    // token is held back as `next_input` for the first decode.
     let prefill_start = std::time::Instant::now();
     let n = prompt.len();
     if n > 1 {
         let mut scratch = vec![0f32; vocab];
-        for (pos, &tok) in prompt[..n - 1].iter().enumerate() {
-            model.forward_one_hybrid(tok, pos as u32, &mut kv, &mut dn, &mut scratch);
+        for pos in prefilled..(n - 1) {
+            model.forward_one_hybrid(prompt[pos], pos as u32, &mut kv, &mut dn, &mut scratch);
         }
     }
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
@@ -2723,9 +2798,10 @@ fn build_hybrid_slot_state(
         prefill_ms,
         decode_ms: 0.0,
         tokens_prefilled,
-        // No paged shared-prefix for hybrid — the recurrent state can't be
-        // prefix-shared (no per-position addressing), so nothing is reused.
-        cache_hit_tokens: 0,
+        // D: tokens served from a restored hybrid ANCHOR (0 when no reuse / pool
+        // disabled). The recurrent half has no per-position addressing, so reuse
+        // is whole-anchor restore + suffix prefill, not a page-shared prefix.
+        cache_hit_tokens: prefilled as u32,
         prefill_job: None,
         grammar,
         stop_strings,
@@ -2754,6 +2830,9 @@ fn admit_request(
     sampling: &SamplingParams,
     active: &[DriverSlot],
     skip_emit: u32,
+    // D: the driver's per-model hybrid anchor pool (`None` when disabled or a
+    // dense/MoE model). Consulted for a prefix anchor on a hybrid admit.
+    hybrid_pool: Option<&mut crate::prefix_cache::PrefixCachePool>,
 ) -> EngineResult<SlotState> {
     if prompt.is_empty() {
         return Err(EngineError::Engine(
@@ -2786,6 +2865,28 @@ fn admit_request(
     // per-slot contiguous KV + DeltaNet state, prefilled + decoded through the
     // contiguous hybrid forward. No shared-prefix / APC / page allocation.
     if ctx.model.weights.is_hybrid() {
+        // D: consult the hybrid anchor pool for the longest anchor that fully
+        // prefixes this prompt (KV + recurrent state captured together at a turn
+        // boundary). On a hit, restore both into a fresh slot cache and let
+        // `build_hybrid_slot_state` prefill ONLY the suffix — bit-identical to a
+        // full prefill (the ContiguousEngine relies on the same invariant). Need
+        // ≥1 token held back as `next_input`, so `anchor_len < prompt.len()`.
+        let restored = hybrid_pool.and_then(|pool| {
+            let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+            let (idx, anchor_len) = pool
+                .find_full_match_hybrid(&prompt_u32)
+                .filter(|&(_, len)| len >= HYBRID_ANCHOR_MIN_TOKENS && len < prompt.len())?;
+            pool.record_lookup(true);
+            let hybrid_layers = ctx.model.weights.hybrid_layers.as_ref()?;
+            let snap = pool.touch(idx);
+            let dn_snap = snap.dn.as_ref()?;
+            let mut kv = KvCache::new_with_dtype(&ctx.model.cfg, ctx.max_ctx, KvDtype::F32);
+            kv.restore_prefix(&snap.kv);
+            kv.seq_len = anchor_len;
+            let mut dn = DeltaNetCache::new_for_hybrid(&ctx.model.cfg, hybrid_layers).ok()?;
+            dn.restore(dn_snap);
+            Some((kv, dn, anchor_len))
+        });
         let mut state = build_hybrid_slot_state(
             &ctx.model,
             ctx.tokenizer.as_ref(),
@@ -2794,6 +2895,7 @@ fn admit_request(
             sampling,
             Arc::clone(&ctx.stop_ids),
             skip_emit,
+            restored,
         )?;
         state.adapter = adapter;
         return Ok(state);
