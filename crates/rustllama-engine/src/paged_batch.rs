@@ -495,6 +495,14 @@ pub struct PagedBatchEngine {
     /// can resolve a request's adapter name. Empty (the default) ⇒ byte-
     /// identical to the pre-LoRA path.
     lora: Arc<std::sync::RwLock<rustllama_models::lora::LoraRegistry>>,
+    /// D: engine-level hybrid anchor pool for the SYNC batch path
+    /// ([`Self::generate_batched_token_ids`]) — persists KV + recurrent-state
+    /// anchors ACROSS `&self` batch calls (the async driver's pool is instead
+    /// loop-local to `driver_loop`). Behind a `Mutex` for interior mutability;
+    /// locked only at admit + completion, never in the decode hot loop. `None`
+    /// unless the `RUSTLLAMA_PAGED_HYBRID_PREFIX_SNAPSHOTS` opt-in is set AND the
+    /// model is hybrid — OFF by default ⇒ byte-identical to the pre-D sync path.
+    sync_hybrid_pool: Option<std::sync::Mutex<crate::prefix_cache::PrefixCachePool>>,
 }
 
 impl PagedBatchEngine {
@@ -1061,6 +1069,22 @@ impl PagedBatchEngine {
         );
 
         let recommended_sampling = crate::recommended_sampling(&model.cfg.arch, path);
+        // D: the SYNC batch path's hybrid anchor pool (the async driver uses a
+        // loop-local one). Same `RUSTLLAMA_PAGED_HYBRID_PREFIX_SNAPSHOTS` opt-in +
+        // hybrid-only gate ⇒ OFF by default = byte-identical to the pre-D sync path.
+        let sync_hybrid_pool = {
+            let depth = std::env::var("RUSTLLAMA_PAGED_HYBRID_PREFIX_SNAPSHOTS")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if depth > 0 && model.weights.is_hybrid() {
+                Some(std::sync::Mutex::new(
+                    crate::prefix_cache::PrefixCachePool::new(depth),
+                ))
+            } else {
+                None
+            }
+        };
         Ok(Self {
             model,
             tokenizer,
@@ -1078,6 +1102,7 @@ impl PagedBatchEngine {
             preemptions,
             cascade_engagements,
             lora,
+            sync_hybrid_pool,
         })
     }
 
@@ -1269,6 +1294,16 @@ impl PagedBatchEngine {
             // prefilled through the contiguous hybrid forward — bit-identical
             // to `ContiguousEngine`. Build it and move to the next request.
             if self.model.weights.is_hybrid() {
+                // D: consult the engine-level hybrid anchor pool (persists across
+                // `&self` batch calls) for a prefix anchor, then prefill only the
+                // suffix — the sync-batch twin of the async `admit_request` path.
+                // Lock is taken once here (not in the decode loop); `None` pool
+                // (opt-in unset) ⇒ full prefill, byte-identical to the pre-D path.
+                let restored = self.sync_hybrid_pool.as_ref().and_then(|m| {
+                    m.lock().ok().and_then(|mut p| {
+                        try_restore_hybrid_anchor(&mut p, &self.model, self.max_ctx, &prompt)
+                    })
+                });
                 let mut state = build_hybrid_slot_state(
                     &self.model,
                     self.tokenizer.as_ref(),
@@ -1277,9 +1312,7 @@ impl PagedBatchEngine {
                     &sampling,
                     Arc::clone(&self.stop_ids),
                     0,
-                    // Sync batched path: no anchor pool (D wires the async driver
-                    // path only — see `admit_request`). Full prefill as before.
-                    None,
+                    restored,
                 )
                 .map_err(|e| ContiguousEngineError::Other(format!("hybrid slot build: {e}")))?;
                 state.adapter = adapter;
@@ -1610,6 +1643,17 @@ impl PagedBatchEngine {
                 let hit_cap = slots[i].next_pos >= slots[i].effective_capacity_tokens();
                 if hit_max || hit_eos || hit_cap || hit_stop {
                     slots[i].done = true;
+                    // D: capture this finished hybrid slot's KV + recurrent state
+                    // as a pool anchor so a later batch call that extends this
+                    // conversation restores instead of re-prefilling. `active_indices`
+                    // excludes done slots, so this runs exactly ONCE per slot.
+                    if let Some(h) = slots[i].hybrid.as_ref() {
+                        if let Some(m) = self.sync_hybrid_pool.as_ref() {
+                            if let Ok(mut p) = m.lock() {
+                                insert_hybrid_anchor(&mut p, &slots[i].history, &h.kv, &h.dn);
+                            }
+                        }
+                    }
                     // No-op for a hybrid slot (empty placeholder paged cache).
                     slots[i].cache.release_shared(&self.shared);
                 }
@@ -2657,21 +2701,11 @@ fn driver_loop(
                 }
                 // D: before dropping a completed HYBRID slot, capture its final
                 // KV + recurrent state as a pool anchor so the next turn of the
-                // same conversation (a longer prompt that extends this history)
-                // restores instead of re-prefilling. The last emitted token is
-                // still pending as `next_input` (not yet forwarded), so history
-                // leads kv by one — anchor exactly `kv.seq_len` tokens, which is
-                // what `snapshot_and_insert_hybrid` requires (ids.len==seq_len).
+                // same conversation restores instead of re-prefilling (see
+                // [`insert_hybrid_anchor`] — shared with the sync batch).
                 if let Some(pool) = hybrid_prefix_pool.as_mut() {
                     if let Some(h) = slot.state.hybrid.as_ref() {
-                        let n = h.kv.seq_len.min(slot.state.history.len());
-                        if n > 0 {
-                            pool.snapshot_and_insert_hybrid(
-                                slot.state.history[..n].to_vec(),
-                                &h.kv,
-                                &h.dn,
-                            );
-                        }
+                        insert_hybrid_anchor(pool, &slot.state.history, &h.kv, &h.dn);
                     }
                 }
                 slot.state.cache.release_shared(&ctx.shared);
@@ -2815,6 +2849,54 @@ fn build_hybrid_slot_state(
     })
 }
 
+/// D: restore the longest pooled hybrid ANCHOR that fully prefixes `prompt`
+/// (KV + recurrent state captured together at a turn boundary) as
+/// `(kv, dn, anchor_len)`, ready to seed a slot that then prefills ONLY the
+/// suffix — bit-identical to a full prefill (the ContiguousEngine relies on the
+/// same invariant). `None` ⇒ no usable anchor (⇒ full prefill). Needs ≥1 token
+/// held back as `next_input`, so `anchor_len < prompt.len()`. Shared by the
+/// async driver ([`admit_request`]) and the sync batch
+/// ([`PagedBatchEngine::generate_batched_token_ids`]) so both reuse identically.
+fn try_restore_hybrid_anchor(
+    pool: &mut crate::prefix_cache::PrefixCachePool,
+    model: &LlamaModel,
+    max_ctx: usize,
+    prompt: &[i32],
+) -> Option<(KvCache, DeltaNetCache, usize)> {
+    let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+    let (idx, anchor_len) = pool
+        .find_full_match_hybrid(&prompt_u32)
+        .filter(|&(_, len)| len >= HYBRID_ANCHOR_MIN_TOKENS && len < prompt.len())?;
+    pool.record_lookup(true);
+    let hybrid_layers = model.weights.hybrid_layers.as_ref()?;
+    let snap = pool.touch(idx);
+    let dn_snap = snap.dn.as_ref()?;
+    let mut kv = KvCache::new_with_dtype(&model.cfg, max_ctx, KvDtype::F32);
+    kv.restore_prefix(&snap.kv);
+    kv.seq_len = anchor_len;
+    let mut dn = DeltaNetCache::new_for_hybrid(&model.cfg, hybrid_layers).ok()?;
+    dn.restore(dn_snap);
+    Some((kv, dn, anchor_len))
+}
+
+/// D: capture a completed hybrid slot's final KV + recurrent state as a pool
+/// anchor so a later turn that extends this history restores instead of
+/// re-prefilling. The last emitted token is still pending as `next_input` (not
+/// yet forwarded), so `history` leads `kv` by one — anchor exactly `kv.seq_len`
+/// tokens, which `snapshot_and_insert_hybrid` requires (`ids.len == seq_len`).
+/// Shared by the async driver retain pass and the sync batch.
+fn insert_hybrid_anchor(
+    pool: &mut crate::prefix_cache::PrefixCachePool,
+    history: &[u32],
+    kv: &KvCache,
+    dn: &DeltaNetCache,
+) {
+    let n = kv.seq_len.min(history.len());
+    if n > 0 {
+        pool.snapshot_and_insert_hybrid(history[..n].to_vec(), kv, dn);
+    }
+}
+
 /// Prefill + slot-state-build for one admitted request. Returns
 /// the slot's initial decoder state (positioned at `prompt.len()`,
 /// ready for the first fused decode tick to produce token #0 of
@@ -2866,27 +2948,10 @@ fn admit_request(
     // contiguous hybrid forward. No shared-prefix / APC / page allocation.
     if ctx.model.weights.is_hybrid() {
         // D: consult the hybrid anchor pool for the longest anchor that fully
-        // prefixes this prompt (KV + recurrent state captured together at a turn
-        // boundary). On a hit, restore both into a fresh slot cache and let
-        // `build_hybrid_slot_state` prefill ONLY the suffix — bit-identical to a
-        // full prefill (the ContiguousEngine relies on the same invariant). Need
-        // ≥1 token held back as `next_input`, so `anchor_len < prompt.len()`.
-        let restored = hybrid_pool.and_then(|pool| {
-            let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
-            let (idx, anchor_len) = pool
-                .find_full_match_hybrid(&prompt_u32)
-                .filter(|&(_, len)| len >= HYBRID_ANCHOR_MIN_TOKENS && len < prompt.len())?;
-            pool.record_lookup(true);
-            let hybrid_layers = ctx.model.weights.hybrid_layers.as_ref()?;
-            let snap = pool.touch(idx);
-            let dn_snap = snap.dn.as_ref()?;
-            let mut kv = KvCache::new_with_dtype(&ctx.model.cfg, ctx.max_ctx, KvDtype::F32);
-            kv.restore_prefix(&snap.kv);
-            kv.seq_len = anchor_len;
-            let mut dn = DeltaNetCache::new_for_hybrid(&ctx.model.cfg, hybrid_layers).ok()?;
-            dn.restore(dn_snap);
-            Some((kv, dn, anchor_len))
-        });
+        // prefixes this prompt; on a hit, restore + prefill only the suffix
+        // (see [`try_restore_hybrid_anchor`] — shared with the sync batch).
+        let restored = hybrid_pool
+            .and_then(|pool| try_restore_hybrid_anchor(pool, &ctx.model, ctx.max_ctx, prompt));
         let mut state = build_hybrid_slot_state(
             &ctx.model,
             ctx.tokenizer.as_ref(),
