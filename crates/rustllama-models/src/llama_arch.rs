@@ -8887,20 +8887,56 @@ impl LlamaModel {
                             w_gate,
                             w_up,
                             w_down,
-                        } => dense_ffn_one_into(
-                            w_gate,
-                            w_up,
-                            w_down,
-                            &tmp_d,
-                            d,
-                            d_ff,
-                            &mut layer_out,
-                            &mut gate_buf,
-                            &mut up_buf,
-                            &mut ff_buf,
-                            had,
-                            &mut had_buf,
-                        ),
+                        } => {
+                            // B2 (Kindi rmsfold+smfold): device-resident dense FFN
+                            // — GPU rmsnorm → Hadamard → gate/up matvec → silu →
+                            // Hadamard → down matvec, the activation kept in USM
+                            // (no CPU rotation, no host round-trip). Only when all
+                            // three projections are folded + Hadamard enabled;
+                            // fail-closed (verdict off / no USM / non-PTQ1_0&PQ2_0)
+                            // ⇒ the BYTE-IDENTICAL CPU `dense_ffn_one_into`, fed the
+                            // already-normed `tmp_d`.
+                            let dev_ffn = match had {
+                                Some(h)
+                                    if h.is_folded(&w_gate.name)
+                                        && h.is_folded(&w_up.name)
+                                        && h.is_folded(&w_down.name)
+                                        && !no_hadamard_enabled() =>
+                                {
+                                    crate::accel::try_folded_ffn_rmsfold_smfold_usm_f32(
+                                        &hidden,
+                                        &block.post_attention_norm,
+                                        h.signs_for(d),
+                                        h.signs_for(d_ff),
+                                        h.block_size,
+                                        cfg.rms_eps,
+                                        w_gate,
+                                        w_up,
+                                        w_down,
+                                        &mut layer_out,
+                                        d,
+                                        d_ff,
+                                    )
+                                }
+                                _ => false,
+                            };
+                            if !dev_ffn {
+                                dense_ffn_one_into(
+                                    w_gate,
+                                    w_up,
+                                    w_down,
+                                    &tmp_d,
+                                    d,
+                                    d_ff,
+                                    &mut layer_out,
+                                    &mut gate_buf,
+                                    &mut up_buf,
+                                    &mut ff_buf,
+                                    had,
+                                    &mut had_buf,
+                                );
+                            }
+                        }
                     }
                     log_hidden("ssm-moe-out", li, &layer_out);
                     k::add_inplace_f32(&mut hidden, &layer_out);
@@ -9613,20 +9649,56 @@ impl LlamaModel {
                             w_gate,
                             w_up,
                             w_down,
-                        } => dense_ffn_one_into(
-                            w_gate,
-                            w_up,
-                            w_down,
-                            &tmp_d,
-                            d,
-                            d_ff,
-                            &mut layer_out,
-                            &mut gate_buf,
-                            &mut up_buf,
-                            &mut ff_buf,
-                            had,
-                            &mut had_buf,
-                        ),
+                        } => {
+                            // B2 (Kindi rmsfold+smfold): device-resident dense FFN
+                            // — GPU rmsnorm → Hadamard → gate/up matvec → silu →
+                            // Hadamard → down matvec, the activation kept in USM
+                            // (no CPU rotation, no host round-trip). Only when all
+                            // three projections are folded + Hadamard enabled;
+                            // fail-closed (verdict off / no USM / non-PTQ1_0&PQ2_0)
+                            // ⇒ the BYTE-IDENTICAL CPU `dense_ffn_one_into`, fed the
+                            // already-normed `tmp_d`.
+                            let dev_ffn = match had {
+                                Some(h)
+                                    if h.is_folded(&w_gate.name)
+                                        && h.is_folded(&w_up.name)
+                                        && h.is_folded(&w_down.name)
+                                        && !no_hadamard_enabled() =>
+                                {
+                                    crate::accel::try_folded_ffn_rmsfold_smfold_usm_f32(
+                                        &hidden,
+                                        &block.post_attention_norm,
+                                        h.signs_for(d),
+                                        h.signs_for(d_ff),
+                                        h.block_size,
+                                        cfg.rms_eps,
+                                        w_gate,
+                                        w_up,
+                                        w_down,
+                                        &mut layer_out,
+                                        d,
+                                        d_ff,
+                                    )
+                                }
+                                _ => false,
+                            };
+                            if !dev_ffn {
+                                dense_ffn_one_into(
+                                    w_gate,
+                                    w_up,
+                                    w_down,
+                                    &tmp_d,
+                                    d,
+                                    d_ff,
+                                    &mut layer_out,
+                                    &mut gate_buf,
+                                    &mut up_buf,
+                                    &mut ff_buf,
+                                    had,
+                                    &mut had_buf,
+                                );
+                            }
+                        }
                     }
                     log_hidden("attn-moe-out", li, &layer_out);
                     k::add_inplace_f32(&mut hidden, &layer_out);

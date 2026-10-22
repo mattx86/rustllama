@@ -439,6 +439,16 @@ pub const VERDICT_FUSED_OUT_PROJ_NORM: &str = "fused:out_proj_norm";
 /// `hadamard::hadamard_forward`).
 pub const VERDICT_FUSED_RMSFOLD: &str = "fused:rmsfold";
 
+/// B2 (Kindi smfold): the dense-FFN down-projection's Hadamard rotation run ON
+/// the GPU and kept device-resident with the preceding SiLU-gate, so a folded
+/// Bonsai FFN does `rmsnorm → hadamard(gate/up) → gate/up matvec → silu_mul →
+/// hadamard(down) → down matvec` entirely in USM. The FFN device path needs BOTH
+/// this and [`VERDICT_FUSED_RMSFOLD`] (the gate/up-input rotation). Backs
+/// `accel::smfold_fused_enabled`; graded by the `fused:smfold` probe (device
+/// `silu_mul_usm` → `hadamard_forward_usm` vs CPU `silu_mul_f32` then
+/// `hadamard::hadamard_forward`).
+pub const VERDICT_FUSED_SMFOLD: &str = "fused:smfold";
+
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the
 /// device lacks the capability) — callers treat that as "off".

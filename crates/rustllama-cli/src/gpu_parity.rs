@@ -473,6 +473,10 @@ fn probe_names() -> Vec<String> {
     // (`rmsnorm_f32_usm` → `hadamard_forward_usm`) vs CPU `rmsnorm_f32_row` then
     // `hadamard::hadamard_forward`. Banks `fused:rmsfold`.
     v.push("fused:rmsfold".to_string());
+    // B2 (Kindi smfold): the device-resident FFN down-rotation chain
+    // (`silu_mul_usm` → `hadamard_forward_usm`) vs CPU `silu_mul_f32` then
+    // `hadamard::hadamard_forward`. Banks `fused:smfold`.
+    v.push("fused:smfold".to_string());
     // P17: GPU Gated-DeltaNet chunked-prefill recurrence (the hybrid-model tok/s
     // ceiling) vs the CPU chunked reference. f32 end to end; banked before the
     // matvec families like the other small f32 USM kernels.
@@ -2091,6 +2095,89 @@ fn probe_rmsfold(stream: &sk::SyclStream, name: &str, started: Instant) {
     }
 }
 
+/// B2 (Kindi smfold): parity for the device-resident FFN DOWN-rotation chain —
+/// `silu_mul_usm` → `hadamard_forward_usm` (the SiLU-gate output rotated + kept
+/// in USM for the down matvec) — vs the CPU reference `k::silu_mul_f32` then
+/// `hadamard::hadamard_forward` on identical inputs. Single row (decode shape).
+/// Bit-tolerant f32 like `probe_rmsfold` (device reduce noise ~1e-5 against the
+/// 1e-3 denom floor ⇒ cos-dominant). Banks `fused:smfold`.
+fn probe_smfold(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const K: usize = 256; // d_ff — multiple of BLOCK and of 128
+    const BLOCK: usize = 64;
+    let g = gen_x(K, 88);
+    let u = gen_x(K, 89);
+    let signs: Vec<f32> = (0..K)
+        .map(|i| {
+            if (i * 2654435761usize) & 0x10 == 0 {
+                1.0
+            } else {
+                -1.0
+            }
+        })
+        .collect();
+    // CPU reference: SiLU-gate then the forward Hadamard rotation.
+    let mut act = vec![0f32; K];
+    k::silu_mul_f32(&g, &u, &mut act);
+    let mut cpu = vec![0f32; K];
+    k::hadamard::hadamard_forward(&act, &signs, BLOCK, &mut cpu);
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // gate
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // up
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // act (silu output)
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // signs
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K), // y (rotated)
+    );
+    let (mut gb, mut ub, mut ab, mut sgb, mut yb) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e)) => (a, b, c, d, e),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    gb.as_mut_slice().copy_from_slice(&g);
+    ub.as_mut_slice().copy_from_slice(&u);
+    sgb.as_mut_slice().copy_from_slice(&signs);
+    ab.as_mut_slice().fill(f32::NAN);
+    yb.as_mut_slice().fill(f32::NAN);
+    // SAFETY: five USM allocations on `stream`, sized above; each kernel waits
+    // before returning, so stage 1's `act` is readable by stage 2 and the host
+    // read below doesn't race the device.
+    let silu = unsafe {
+        sk::silu_mul_f32_usm_raw(stream, gb.as_ptr(), ub.as_ptr(), ab.as_mut_ptr(), K as u32)
+    };
+    if let Err(e) = silu {
+        emit(name, "KERNEL_ERR", &format!("silu_mul {e}"));
+        return;
+    }
+    let had = unsafe {
+        sk::hadamard_forward_usm_raw(
+            stream,
+            ab.as_ptr(),
+            sgb.as_ptr(),
+            yb.as_mut_ptr(),
+            K as u32,
+            BLOCK as u32,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match had {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("hadamard {e} ms={ms}")),
+        Ok(()) => {
+            let (cos, max_rel) = compare(yb.as_slice(), &cpu);
+            let verdict = if cos > 0.999 && max_rel < 0.05 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
+        }
+    }
+}
+
 /// P6-fusions: parity for the fused FFN down-proj + residual-add f32 kernel
 /// (`rsl_down_residual_f32_usm`) vs CPU `matvec_f32` then `add_inplace_f32`,
 /// per row. Bit-tolerant (f32, ~1e-4).
@@ -2268,6 +2355,7 @@ fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instan
         "out_proj_norm" => return probe_out_proj_norm(stream, name, started),
         // B2 (Kindi rmsfold): the device-resident rmsnorm→Hadamard chain.
         "rmsfold" => return probe_rmsfold(stream, name, started),
+        "smfold" => return probe_smfold(stream, name, started),
         _ => {}
     }
     let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
