@@ -4719,16 +4719,40 @@ fn cu_tc_grade(
         }
     }
     let (wn, wm) = if m > 0 { (wi / m, wi % m) } else { (0, 0) };
-    cu_emit(
-        name,
-        key,
-        &format!(
-            "cos={cos:.6} worst_abs={worst_abs:.4} tol_frac={tol_frac:.3} abs_tol={abs_tol:.4} \
-             fail@row{wm}/col{wn} ref={:.4} gpu={:.4}",
-            cpu.get(wi).copied().unwrap_or(0.0),
-            gpu.get(wi).copied().unwrap_or(0.0)
-        ),
+    // On a MISCOMPUTE, break the failures down so ONE pod run localizes the
+    // TV-layout bug instead of a blind coin-flip. The m16n8 tile produces rows
+    // in two halves — [tile*16 .. +8) and [tile*16+8 .. +16) (the `g` and `g+8`
+    // fragment rows). A per-block-scale / compressed-A layout bug that drops
+    // rowA1 shows up as failures CLUSTERED in the hi half (`hi8 >> lo8`) → the
+    // row-pair fix; a wrong scale-byte order or column map spreads across both;
+    // a metadata/fragment-wide bug fails ~every row (`bad_rows ≈ M`).
+    let mut detail = format!(
+        "cos={cos:.6} worst_abs={worst_abs:.4} tol_frac={tol_frac:.3} abs_tol={abs_tol:.4} \
+         fail@row{wm}/col{wn} ref={:.4} gpu={:.4}",
+        cpu.get(wi).copied().unwrap_or(0.0),
+        gpu.get(wi).copied().unwrap_or(0.0)
     );
+    if key == "MISCOMPUTE" && m > 0 {
+        let (mut lo8, mut hi8) = (0usize, 0usize);
+        let mut row_bad = vec![false; m];
+        for i in 0..gpu.len().min(cpu.len()) {
+            let allowed = abs_tol + TC_REL_TOL * (cpu[i] as f64).abs();
+            if (gpu[i] as f64 - cpu[i] as f64).abs() > allowed {
+                let mrow = i % m; // out[n*M + m] ⇒ row = i mod M
+                if mrow % 16 < 8 {
+                    lo8 += 1;
+                } else {
+                    hi8 += 1;
+                }
+                row_bad[mrow] = true;
+            }
+        }
+        let bad_rows = row_bad.iter().filter(|&&b| b).count();
+        detail.push_str(&format!(
+            " | fails lo8={lo8} hi8={hi8} bad_rows={bad_rows}/{m}"
+        ));
+    }
+    cu_emit(name, key, &detail);
 }
 
 /// Blackwell FP4 tensor-core GEMM parity probe. Builds N f32 activation rows,
