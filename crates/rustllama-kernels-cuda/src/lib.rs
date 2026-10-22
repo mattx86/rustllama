@@ -3960,6 +3960,21 @@ pub struct CudaMatvecCache {
     tick: u64,
     layer_keys: HashMap<u32, Vec<usize>>, // layer tag -> its resident weight keys
     layer_last_used: HashMap<u32, u64>,   // layer tag -> last-touched tick
+    // B2 (Kindi rmsfold): device-resident folded-qkv scratch — GPU RMSNorm → GPU
+    // Hadamard → 3 PTQ1_0 matvecs with the rotated activation kept resident on
+    // THIS stream (ordered; no cross-stream race) reading the cached weights.
+    // `_hidden`/`_hnorm`/`_xrot` are the k-sized activation stages, `_out` the
+    // m-sized projection output; `_wnorm`/`_signs` cache the per-layer norm
+    // weight + sign vector keyed by (host_ptr, len) so they upload once (constant
+    // across a model's tokens). Declared before `stream` so they free first.
+    rmsfold_hidden: Option<RawDevBuf>,
+    rmsfold_hnorm: Option<RawDevBuf>,
+    rmsfold_xrot: Option<RawDevBuf>,
+    rmsfold_out: Option<RawDevBuf>,
+    rmsfold_wnorm: Option<RawDevBuf>,
+    rmsfold_wnorm_key: Option<(usize, usize)>,
+    rmsfold_signs: Option<RawDevBuf>,
+    rmsfold_signs_key: Option<(usize, usize)>,
     // Phase 2: a second CUDA stream for PREFETCH — the next layer's weights
     // upload here (async) while the current layer computes on `stream`. Declared
     // before `stream` but after `weights` so prefetch buffers (in `weights`,
@@ -4011,6 +4026,14 @@ impl CudaMatvecCache {
             weights: HashMap::new(),
             x_scratch: None,
             out_scratch: None,
+            rmsfold_hidden: None,
+            rmsfold_hnorm: None,
+            rmsfold_xrot: None,
+            rmsfold_out: None,
+            rmsfold_wnorm: None,
+            rmsfold_wnorm_key: None,
+            rmsfold_signs: None,
+            rmsfold_signs_key: None,
             ff_scratch: None,
             ptr_scratch: None,
             wt_scratch: None,
@@ -4179,6 +4202,17 @@ impl CudaMatvecCache {
     pub fn clear(&mut self) {
         self.weights.clear();
         self.used_bytes = 0;
+        // B2 rmsfold: the device scratch + the host-addr cache keys are per-model
+        // (keyed like `weights`), so a reload must drop them — otherwise a reused
+        // host address could skip the re-upload of a DIFFERENT model's norm/signs.
+        self.rmsfold_hidden = None;
+        self.rmsfold_hnorm = None;
+        self.rmsfold_xrot = None;
+        self.rmsfold_out = None;
+        self.rmsfold_wnorm = None;
+        self.rmsfold_wnorm_key = None;
+        self.rmsfold_signs = None;
+        self.rmsfold_signs_key = None;
         // Streaming residency bookkeeping is per-model (keyed by host addr like
         // `weights`), so it must reset on reload too.
         self.layer_keys.clear();
@@ -4391,6 +4425,153 @@ impl CudaMatvecCache {
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
         self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// B2 (Kindi rmsfold): device-resident folded Q/K/V projection — the
+    /// pre-attention RMSNorm + the Prism block-Hadamard rotation run ON the
+    /// device and the rotated activation STAYS resident while all THREE PTQ1_0
+    /// projections (`wq`/`wk`/`wv`) read it, ALL on this cache's stream (ordered
+    /// — no cross-stream race) with the weights served from the resident weight
+    /// cache. Mirrors the SYCL `try_folded_qkv_rmsfold_usm_f32` chain: it
+    /// eliminates the per-projection CPU rotation AND the host round-trip the CPU
+    /// path pays (CPU rmsnorm → CPU hadamard → upload → GPU matvec, ×3). q/k/v
+    /// share one input + one rotation (the WHT depends only on the input + its
+    /// width). `norm_weight` / `signs` cache device-side keyed by (host_ptr, len)
+    /// so a layer's constants upload once, not per token.
+    ///
+    /// Returns false (caller runs the BYTE-IDENTICAL CPU path) on any bad shape /
+    /// budget / kernel failure, leaving the outputs untouched. PTQ1_0 only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_ptq1_0_qkv_rmsfold(
+        &mut self,
+        hidden: &[f32],
+        norm_weight: &[f32],
+        signs: &[f32],
+        block: usize,
+        eps: f32,
+        wq_key: usize,
+        wq_bytes: &[u8],
+        wk_key: usize,
+        wk_bytes: &[u8],
+        wv_key: usize,
+        wv_bytes: &[u8],
+        out_q: &mut [f32],
+        out_k: &mut [f32],
+        out_v: &mut [f32],
+        mq: usize,
+        mkv: usize,
+        k: usize,
+    ) -> bool {
+        let align = CudaPackedKind::Ptq1_0.k_alignment();
+        if mq == 0
+            || mkv == 0
+            || k == 0
+            || block == 0
+            || k % block != 0
+            || k % align != 0
+            || hidden.len() != k
+            || norm_weight.len() < k
+            || signs.len() < k
+            || out_q.len() != mq
+            || out_k.len() != mkv
+            || out_v.len() != mkv
+        {
+            return false;
+        }
+        let rb = CudaPackedKind::Ptq1_0.row_bytes(k);
+        if wq_bytes.len() < mq * rb || wk_bytes.len() < mkv * rb || wv_bytes.len() < mkv * rb {
+            return false;
+        }
+        // Weights resident (upload + cache on first use, keyed by host addr).
+        if !self.ensure_weight(wq_key, wq_bytes)
+            || !self.ensure_weight(wk_key, wk_bytes)
+            || !self.ensure_weight(wv_key, wv_bytes)
+        {
+            return false;
+        }
+        // Activation stages (k) + output (max m) + the cached norm/signs (k).
+        let out_cap = mq.max(mkv) * 4;
+        if !Self::ensure_scratch(&mut self.rmsfold_hidden, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_hnorm, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_xrot, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_out, &self.stream, out_cap)
+            || !Self::ensure_scratch(&mut self.rmsfold_wnorm, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.rmsfold_signs, &self.stream, k * 4)
+        {
+            return false;
+        }
+        // Cache the per-layer norm weight + sign vector — upload only when the
+        // (host_ptr, len) key changes (constant across a model's tokens). A grow
+        // only happens on a wider layer, itself a key change, so the key check
+        // alone suffices (no realloc signal needed).
+        let wn_key = (norm_weight.as_ptr() as usize, k);
+        if self.rmsfold_wnorm_key != Some(wn_key) {
+            let b = unsafe { std::slice::from_raw_parts(norm_weight.as_ptr() as *const u8, k * 4) };
+            if !self.rmsfold_wnorm.as_mut().unwrap().upload(b) {
+                return false;
+            }
+            self.rmsfold_wnorm_key = Some(wn_key);
+        }
+        let sg_key = (signs.as_ptr() as usize, k);
+        if self.rmsfold_signs_key != Some(sg_key) {
+            let b = unsafe { std::slice::from_raw_parts(signs.as_ptr() as *const u8, k * 4) };
+            if !self.rmsfold_signs.as_mut().unwrap().upload(b) {
+                return false;
+            }
+            self.rmsfold_signs_key = Some(sg_key);
+        }
+        // Upload the raw hidden row (the ONE H2D per layer; the CPU path uploads a
+        // rotated activation per projection, ×3).
+        let hb = unsafe { std::slice::from_raw_parts(hidden.as_ptr() as *const u8, k * 4) };
+        if !self.rmsfold_hidden.as_mut().unwrap().upload(hb) {
+            return false;
+        }
+        // Stage 1 — GPU RMSNorm: hidden → hnorm.
+        let hidden_ptr = self.rmsfold_hidden.as_ref().unwrap().ptr as *const f32;
+        let wnorm_ptr = self.rmsfold_wnorm.as_ref().unwrap().ptr as *const f32;
+        let hnorm_ptr = self.rmsfold_hnorm.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: three live device buffers on `self.stream` sized k; the wrapper
+        // synchronizes before returning.
+        if unsafe { rmsnorm_dev_f32(&self.stream, hidden_ptr, wnorm_ptr, hnorm_ptr, 1, k, eps) }
+            .is_err()
+        {
+            return false;
+        }
+        // Stage 2 — GPU Hadamard: hnorm → xrot (resident; no host copy).
+        let hnorm_cptr = self.rmsfold_hnorm.as_ref().unwrap().ptr as *const f32;
+        let signs_ptr = self.rmsfold_signs.as_ref().unwrap().ptr as *const f32;
+        let xrot_ptr = self.rmsfold_xrot.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: live device buffers on `self.stream` sized k; wrapper syncs.
+        if unsafe { hadamard_forward(&self.stream, hnorm_cptr, signs_ptr, xrot_ptr, k, block) }
+            .is_err()
+        {
+            return false;
+        }
+        // Stage 3 — three PTQ1_0 matvecs read the SAME resident rotated activation
+        // (q/k/v), each writing the shared `rmsfold_out` then downloading to its
+        // host output before the next overwrites it (ordered on one stream).
+        let xrot_cptr = self.rmsfold_xrot.as_ref().unwrap().ptr as *const f32;
+        for (w_key, out, m) in [
+            (wq_key, &mut *out_q, mq),
+            (wk_key, &mut *out_k, mkv),
+            (wv_key, &mut *out_v, mkv),
+        ] {
+            let w_ptr = self.weights[&w_key].ptr;
+            let out_ptr = self.rmsfold_out.as_ref().unwrap().ptr as *mut f32;
+            // SAFETY: w (cached), xrot (resident), out (scratch ≥ m) live on
+            // `self.stream`; the wrapper synchronizes before returning.
+            if unsafe { matvec_ptq1_0_packed_f32(&self.stream, w_ptr, xrot_cptr, out_ptr, m, k) }
+                .is_err()
+                || consume_error_count() != 0
+            {
+                return false;
+            }
+            let ob = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
+            if !self.rmsfold_out.as_ref().unwrap().download(ob) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Device-resident single-row packed matvec — the MoE tiered-expert fast

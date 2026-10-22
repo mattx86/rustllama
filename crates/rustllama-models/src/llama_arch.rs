@@ -8929,7 +8929,7 @@ impl LlamaModel {
                     // (B1: rmsnorm → rotate-once → 3 matvecs).
                     let dev_qkv = match had {
                         Some(h) if h.is_folded(&block.w_q.name) && !no_hadamard_enabled() => {
-                            crate::accel::try_folded_qkv_rmsfold_usm_f32(
+                            crate::accel::try_folded_qkv_rmsfold(
                                 &hidden,
                                 &block.attn_norm,
                                 h.signs_for(d),

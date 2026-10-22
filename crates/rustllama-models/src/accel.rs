@@ -14904,6 +14904,128 @@ pub fn try_folded_qkv_rmsfold_usm_f32(
     })
 }
 
+/// B2 (Kindi rmsfold) — CUDA sibling of [`try_folded_qkv_rmsfold_usm_f32`]: the
+/// device-resident folded Q/K/V chain (GPU RMSNorm → GPU Hadamard → 3 PTQ1_0
+/// matvecs, the rotated activation kept resident) runs inside the CUDA matvec
+/// cache so it rides the cache's ONE stream + its resident weight cache — no
+/// cross-stream race, no per-call weight re-upload. Weights are host-addr-keyed
+/// exactly like [`try_matvec_packed_cuda`]. Returns false ⇒ CPU path.
+#[allow(clippy::too_many_arguments)]
+fn try_folded_qkv_rmsfold_cuda(
+    hidden: &[f32],
+    norm_weight: &[f32],
+    signs: &[f32],
+    block: usize,
+    eps: f32,
+    wq: &Tensor,
+    wk: &Tensor,
+    wv: &Tensor,
+    out_q: &mut [f32],
+    out_k: &mut [f32],
+    out_v: &mut [f32],
+    mq: usize,
+    mkv: usize,
+    k: usize,
+) -> bool {
+    if !rmsfold_fused_enabled() || !cuda_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    // PTQ1_0 only (the folded Bonsai format). Anything else ⇒ CPU path.
+    if !matches!(wq.dtype, Dtype::PTQ1_0Raw) || wk.dtype != wq.dtype || wv.dtype != wq.dtype {
+        return false;
+    }
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    // Host-addr weight keys mirror `try_matvec_packed_cuda`'s `weight_key`, so the
+    // qkv weights share the cache's resident entries with the ordinary matvec path.
+    let wq_b = as_bytes(wq);
+    let wk_b = as_bytes(wk);
+    let wv_b = as_bytes(wv);
+    guard.matvec_ptq1_0_qkv_rmsfold(
+        hidden,
+        norm_weight,
+        signs,
+        block,
+        eps,
+        wq_b.as_ptr() as usize,
+        wq_b,
+        wk_b.as_ptr() as usize,
+        wk_b,
+        wv_b.as_ptr() as usize,
+        wv_b,
+        out_q,
+        out_k,
+        out_v,
+        mq,
+        mkv,
+        k,
+    )
+}
+
+/// B2 (Kindi rmsfold) backend dispatcher: the device-resident folded Q/K/V
+/// projection, routed to CUDA when a usable NVIDIA GPU is active, else the SYCL
+/// USM path. (MLX/Metal is a later arm.) Each backend is independently
+/// fail-closed behind the `fused:rmsfold` verdict; a `false` from the active
+/// backend ⇒ the caller runs the BYTE-IDENTICAL CPU rmsnorm + rotate + matvec
+/// path. The forward calls ONLY this dispatcher.
+#[allow(clippy::too_many_arguments)]
+pub fn try_folded_qkv_rmsfold(
+    hidden: &[f32],
+    norm_weight: &[f32],
+    signs: &[f32],
+    block: usize,
+    eps: f32,
+    wq: &Tensor,
+    wk: &Tensor,
+    wv: &Tensor,
+    out_q: &mut [f32],
+    out_k: &mut [f32],
+    out_v: &mut [f32],
+    mq: usize,
+    mkv: usize,
+    k: usize,
+) -> bool {
+    if cuda_active() {
+        try_folded_qkv_rmsfold_cuda(
+            hidden,
+            norm_weight,
+            signs,
+            block,
+            eps,
+            wq,
+            wk,
+            wv,
+            out_q,
+            out_k,
+            out_v,
+            mq,
+            mkv,
+            k,
+        )
+    } else {
+        try_folded_qkv_rmsfold_usm_f32(
+            hidden,
+            norm_weight,
+            signs,
+            block,
+            eps,
+            wq,
+            wk,
+            wv,
+            out_q,
+            out_k,
+            out_v,
+            mq,
+            mkv,
+            k,
+        )
+    }
+}
+
 /// P6-fusions: fused RMSNorm(input)+matvec dispatch for an f32 weight. Computes
 /// `y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·w_norm[i]) · w_mat[o,i]` on the USM
 /// stream in one kernel — no host round-trip of the normalized activation.
