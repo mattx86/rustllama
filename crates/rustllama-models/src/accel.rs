@@ -15006,6 +15006,23 @@ pub fn try_folded_qkv_rmsfold(
             mkv,
             k,
         )
+    } else if mlx_active() {
+        try_folded_qkv_rmsfold_mlx(
+            hidden,
+            norm_weight,
+            signs,
+            block,
+            eps,
+            wq,
+            wk,
+            wv,
+            out_q,
+            out_k,
+            out_v,
+            mq,
+            mkv,
+            k,
+        )
     } else {
         try_folded_qkv_rmsfold_usm_f32(
             hidden,
@@ -15024,6 +15041,73 @@ pub fn try_folded_qkv_rmsfold(
             k,
         )
     }
+}
+
+/// B2 (Kindi rmsfold) — MLX/Metal sibling of [`try_folded_qkv_rmsfold_cuda`]: the
+/// Prism block-Hadamard rotation + the pre-attention RMSNorm run on the Apple
+/// GPU and the rotated activation stays in an MLX device buffer while all three
+/// folded projections (`wq`/`wk`/`wv`) read it. Reuses the existing MLX device
+/// RMSNorm (`rmsnorm_dev_f32`) + `hadamard_forward` + `matvec_ptq1_0_packed_f32`
+/// via [`mk::MlxMatvecCache::matvec_ptq1_0_qkv_rmsfold`]. Returns `true` iff the
+/// GPU produced all three outputs; `false` (verdict off, no MLX device, non-
+/// PTQ1_0, shape mismatch, or any kernel miss) ⇒ the caller runs the BYTE-
+/// IDENTICAL CPU rmsnorm + rotate + matvec path. (MLX is UNIFIED memory, so the
+/// host round-trip this eliminates is cheap — the win is marginal here, but the
+/// path keeps 3-backend parity + fail-closed behavior identical to CUDA/SYCL.)
+#[allow(clippy::too_many_arguments)]
+fn try_folded_qkv_rmsfold_mlx(
+    hidden: &[f32],
+    norm_weight: &[f32],
+    signs: &[f32],
+    block: usize,
+    eps: f32,
+    wq: &Tensor,
+    wk: &Tensor,
+    wv: &Tensor,
+    out_q: &mut [f32],
+    out_k: &mut [f32],
+    out_v: &mut [f32],
+    mq: usize,
+    mkv: usize,
+    k: usize,
+) -> bool {
+    if !rmsfold_fused_enabled() || !mlx_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    // PTQ1_0 only (the folded Bonsai format). Anything else ⇒ CPU path.
+    if !matches!(wq.dtype, Dtype::PTQ1_0Raw) || wk.dtype != wq.dtype || wv.dtype != wq.dtype {
+        return false;
+    }
+    let Some(cache) = mlx_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    // Host-addr weight keys mirror the ordinary MLX matvec path, so the qkv
+    // weights share the cache's resident entries.
+    let wq_b = as_bytes(wq);
+    let wk_b = as_bytes(wk);
+    let wv_b = as_bytes(wv);
+    guard.matvec_ptq1_0_qkv_rmsfold(
+        hidden,
+        norm_weight,
+        signs,
+        block,
+        eps,
+        wq_b.as_ptr() as usize,
+        wq_b,
+        wk_b.as_ptr() as usize,
+        wk_b,
+        wv_b.as_ptr() as usize,
+        wv_b,
+        out_q,
+        out_k,
+        out_v,
+        mq,
+        mkv,
+        k,
+    )
 }
 
 /// P6-fusions: fused RMSNorm(input)+matvec dispatch for an f32 weight. Computes

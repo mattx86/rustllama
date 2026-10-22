@@ -9392,6 +9392,95 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
     // created. Emits rope:f32 / silu_mul:f32 / embedding:f32 / attn:decode /
     // attn:prefill. WRITE-BLIND (authored off-Apple) — first real check is here.
     if let Some(fs) = mk::MlxStream::create(0) {
+        // B2 (Kindi rmsfold): device-resident folded-projection chain
+        // `mk::rmsnorm_dev_f32` → `mk::hadamard_forward` (the rotated-normed
+        // activation kept resident, which the 3 qkv matvecs read) vs the CPU
+        // reference `rmsnorm_f32_row` then `hadamard::hadamard_forward`. Single
+        // row (decode shape). Banks the SAME `fused:rmsfold` verdict SYCL/CUDA
+        // do (collect_metal_verdicts records it; on a Mac the SYCL+CUDA probes
+        // SKIP → None → filtered, so only this Some persists). cos-dominant,
+        // loose rel — the WHT reduction + its near-zero cancelling elements.
+        {
+            let name = "fused:rmsfold";
+            const RK: usize = 256; // multiple of BLOCK and of 128 (PTQ1_0 alignment)
+            const RBLOCK: usize = 64;
+            const REPS: f32 = 1e-5;
+            let x = gen_x(RK, 86);
+            let wnorm = gen_x(RK, 87);
+            let signs: Vec<f32> = (0..RK)
+                .map(|i| {
+                    if (i * 2654435761usize) & 0x10 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
+                .collect();
+            let mut xn = vec![0f32; RK];
+            k::rmsnorm_f32_row(&x, &wnorm, &mut xn, REPS);
+            let mut cpu = vec![0f32; RK];
+            k::hadamard::hadamard_forward(&xn, &signs, RBLOCK, &mut cpu);
+            match (
+                mk_upload_f32(&fs, &x),
+                mk_upload_f32(&fs, &wnorm),
+                mk::MlxDeviceBuffer::alloc(&fs, RK * 4), // hnorm
+                mk_upload_f32(&fs, &signs),
+                mk::MlxDeviceBuffer::alloc(&fs, RK * 4), // y (rotated)
+            ) {
+                (Some(xb), Some(wnb), Some(mut hnb), Some(sgb), Some(mut yb)) => {
+                    // SAFETY: five live device buffers on `fs` sized RK; each
+                    // wrapper synchronizes before returning, so stage 1's hnorm is
+                    // readable by stage 2 and the readback doesn't race.
+                    let rms = unsafe {
+                        mk::rmsnorm_dev_f32(
+                            &fs,
+                            xb.as_ptr() as *const f32,
+                            wnb.as_ptr() as *const f32,
+                            hnb.as_mut_ptr() as *mut f32,
+                            1,
+                            RK,
+                            REPS,
+                        )
+                    };
+                    if let Err(e) = rms {
+                        cu_emit(name, "KERNEL_ERR", &format!("rmsnorm {e}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    } else {
+                        let had = unsafe {
+                            mk::hadamard_forward(
+                                &fs,
+                                hnb.as_ptr() as *const f32,
+                                sgb.as_ptr() as *const f32,
+                                yb.as_mut_ptr() as *mut f32,
+                                RK,
+                                RBLOCK,
+                            )
+                        };
+                        match had {
+                            Err(e) => {
+                                cu_emit(name, "KERNEL_ERR", &format!("hadamard {e}"));
+                                *counts.entry("KERNEL_ERR").or_default() += 1;
+                            }
+                            Ok(()) => {
+                                let gpu = mk_download_f32(&yb, RK);
+                                let (cos, max_rel) = compare(&gpu, &cpu);
+                                let key: &'static str = if cos > 0.999 && max_rel < 0.05 {
+                                    "OK"
+                                } else {
+                                    "MISCOMPUTE"
+                                };
+                                *counts.entry(key).or_default() += 1;
+                                cu_emit(name, key, &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+                    *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+            }
+        }
         // RoPE
         {
             let n_heads = 8usize;

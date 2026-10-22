@@ -105,6 +105,13 @@ int rsl_mlx_hadamard_forward(rsl_mlx_stream *s, const float *x_dev,
                              const float *signs_dev, float *out_dev,
                              int n_elems, int block);
 
+/* B2 (Kindi rmsfold): device-resident RMSNorm on device pointers —
+ * y[r,i] = x[r,i]*rsqrt(mean(x_row^2)+eps)*w[i]. Reuses the rmsnorm kernel but
+ * on caller buffers (no alloc/copy) so the result stays resident. Returns 0. */
+int rsl_mlx_rmsnorm_dev(rsl_mlx_stream *s, const float *x_dev,
+                        const float *w_dev, float *y_dev,
+                        int n_rows, int d, float eps);
+
 /* Packed-quant matvecs (device pointers; byte-exact ports of the CPU
  * reference impls, matched by doctor parity harnesses). Single: `x`=[K],
  * `out`=[M]; batched: `x`=[N,K], `out`=[N,M]. Return 0 on success. K must

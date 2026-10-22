@@ -41,6 +41,7 @@ EXPORTS
     rsl_mlx_matvec_ptq1_0_packed_f32
     rsl_mlx_matvec_ptq1_0_packed_f32_batched
     rsl_mlx_hadamard_forward
+    rsl_mlx_rmsnorm_dev
 
     ; Packed-quant matvecs (single + batched), one entry pair per quant.
     ; Mirrors the CudaPackedKind / MlxPackedKind variant set.

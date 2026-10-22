@@ -890,6 +890,36 @@ extern "C" int rsl_mlx_hadamard_forward(rsl_mlx_stream *s, const float *x,
 #endif
 }
 
+// B2 (Kindi rmsfold): device-resident RMSNorm on device pointers — dispatches
+// the SAME rsl_mlx_rmsnorm_f32_kernel as the host-slice rsl_mlx_rmsnorm_f32, but
+// on caller-owned device buffers (no internal alloc/copy), so the result stays
+// resident for the Hadamard + matvec that follow. One 32-lane threadgroup (==
+// one SIMD-group) per row; lanes stride d and simd_sum the sum of squares.
+extern "C" int rsl_mlx_rmsnorm_dev(rsl_mlx_stream *s, const float *x_dev,
+    const float *w_dev, float *y_dev, int n_rows, int d, float eps) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !x_dev || !w_dev || !y_dev || n_rows <= 0 || d <= 0) return -1;
+    size_t ox = 0, ow = 0, oy = 0;
+    id<MTLBuffer> bx = mlx_resolve(x_dev, &ox);
+    id<MTLBuffer> bw = mlx_resolve(w_dev, &ow);
+    id<MTLBuffer> by = mlx_resolve(y_dev, &oy);
+    if (bx == nil || bw == nil || by == nil) { g_rsl_mlx_errors++; return -1; }
+    int dd = d;
+    float ee = eps;
+    MTLSize grid = MTLSizeMake((NSUInteger)n_rows, 1, 1);
+    MTLSize tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, @"rsl_mlx_rmsnorm_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:bw offset:ow atIndex:1];
+        [enc setBuffer:by offset:oy atIndex:2];
+        [enc setBytes:&dd length:sizeof(int) atIndex:3];
+        [enc setBytes:&ee length:sizeof(float) atIndex:4];
+    });
+#else
+    (void)s;(void)x_dev;(void)w_dev;(void)y_dev;(void)n_rows;(void)d;(void)eps; return -1;
+#endif
+}
+
 // Packed-quant matvecs (single + batched). TODO(phase1): one Metal kernel
 // per quant; the on-device dequant math ports byte-exact from the CPU
 // reference (rustllama-kernels-cpu) and the SYCL/CUDA kernels. The
