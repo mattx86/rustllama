@@ -64,6 +64,16 @@ extern "C" int rsl_cuda_consume_error_count(void) {
     return n;
 }
 
+// Drain (and discard) the per-thread CUDA runtime last-error without touching
+// the kernel-error latch. A device-management probe that queries an out-of-range
+// ordinal (e.g. cudaGetDeviceProperties / cudaSetDevice on a disabled or absent
+// GPU during enumeration) leaves cudaErrorInvalidDevice latched in
+// cudaGetLastError on THAT thread; the next unrelated kernel's rsl_cuda_check
+// then consumes it and reports "invalid device ordinal" against the wrong kernel
+// (seen on the paged engine's device-resident prefill-attention worker thread).
+// Call this at the entry of a path that must not inherit a stale latch.
+extern "C" void rsl_cuda_clear_error(void) { cudaGetLastError(); }
+
 extern "C" int rsl_cuda_device_count(void) {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess) return 0;
@@ -76,7 +86,12 @@ extern "C" int rsl_cuda_device_info(int idx, char *name, int name_cap,
                                     unsigned char *uuid /* 16 bytes or null */) {
     cudaDeviceProp p;
     if (uuid) std::memset(uuid, 0, 16);
-    if (cudaGetDeviceProperties(&p, idx) != cudaSuccess) return -1;
+    if (cudaGetDeviceProperties(&p, idx) != cudaSuccess) {
+        // An out-of-range probe latches cudaErrorInvalidDevice on this thread;
+        // consume it so it can't surface misattributed at a later kernel's check.
+        cudaGetLastError();
+        return -1;
+    }
     if (name && name_cap > 0) {
         std::strncpy(name, p.name, (size_t)name_cap - 1);
         name[name_cap - 1] = '\0';
@@ -472,9 +487,15 @@ extern "C" void rsl_cuda_free(rsl_cuda_stream *s, void *dev_ptr) {
 // device-global (no stream), so the Rust-side free closure captures only the
 // `device` index — no stream-lifetime juggling (unlike the USM free path).
 extern "C" void *rsl_cuda_malloc_managed(int device, unsigned long long n_bytes) {
-    if (cudaSetDevice(device) != cudaSuccess) return nullptr;
+    if (cudaSetDevice(device) != cudaSuccess) {
+        cudaGetLastError(); // consume a bad-ordinal latch (see rsl_cuda_clear_error)
+        return nullptr;
+    }
     void *p = nullptr;
-    if (cudaMallocManaged(&p, (size_t)n_bytes) != cudaSuccess) return nullptr;
+    if (cudaMallocManaged(&p, (size_t)n_bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
     return p;
 }
 
@@ -499,7 +520,10 @@ extern "C" void rsl_cuda_free_managed(int device, void *ptr) {
 extern "C" int rsl_cuda_prefetch_managed(int device, const void *ptr,
                                          unsigned long long n_bytes) {
     if (!ptr || n_bytes == 0) return -1;
-    if (cudaSetDevice(device) != cudaSuccess) return -1;
+    if (cudaSetDevice(device) != cudaSuccess) {
+        cudaGetLastError(); // consume a bad-ordinal latch (see rsl_cuda_clear_error)
+        return -1;
+    }
 #if CUDART_VERSION >= 12020
     cudaMemLocation loc;
     loc.type = cudaMemLocationTypeDevice;
@@ -514,7 +538,10 @@ extern "C" int rsl_cuda_prefetch_managed(int device, const void *ptr,
 // Block until all prior work on `device` (incl. the async managed prefetches
 // above, issued on the NULL stream) completes. One call at the end of promotion.
 extern "C" int rsl_cuda_device_sync(int device) {
-    if (cudaSetDevice(device) != cudaSuccess) return -1;
+    if (cudaSetDevice(device) != cudaSuccess) {
+        cudaGetLastError(); // consume a bad-ordinal latch (see rsl_cuda_clear_error)
+        return -1;
+    }
     return cudaDeviceSynchronize() == cudaSuccess ? 0 : -1;
 }
 

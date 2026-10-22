@@ -1330,6 +1330,7 @@ extern "C" {
     ) -> c_int;
 
     fn rsl_cuda_consume_error_count() -> c_int;
+    fn rsl_cuda_clear_error();
 }
 
 /// Whether this binary compiled the Blackwell SM12x tensor-core GEMM path
@@ -1894,6 +1895,16 @@ impl<'s> Drop for CudaDeviceBuffer<'s> {
 pub fn consume_error_count() -> i32 {
     // SAFETY: FFI; no arguments.
     unsafe { rsl_cuda_consume_error_count() }
+}
+
+/// Drain + discard the per-thread CUDA runtime last-error WITHOUT touching the
+/// kernel-error latch. Call at the entry of a device path that must not inherit
+/// a stale `cudaErrorInvalidDevice` left latched by an out-of-range enumeration
+/// probe on the same thread (see `rsl_cuda_clear_error`), so that path's own
+/// post-launch check reports only its own result.
+pub fn clear_last_error() {
+    // SAFETY: FFI; no arguments.
+    unsafe { rsl_cuda_clear_error() };
 }
 
 // ---- CUDA graph capture helpers (Feature 1b) -----------------------------

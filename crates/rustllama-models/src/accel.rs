@@ -18909,6 +18909,11 @@ pub fn try_flash_attn_prefill_cuda_f32(
     let mirror_bytes = need_kv * 4;
     let q_bytes = need_q * 4;
     let out_bytes = need_q * 4;
+    // Drain any stale per-thread CUDA last-error before this path's launches so a
+    // bad-ordinal latch from an earlier enumeration probe on this (paged) worker
+    // thread can't surface misattributed at our post-launch check → a spurious
+    // "invalid device ordinal" + a needless fallback. (Fail-soft either way.)
+    ck::clear_last_error();
     CUDA_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
         // Prefill runs before any decode, so the context is normally None
@@ -19089,6 +19094,9 @@ fn try_flash_attn_prefill_cuda_quant(
     let q_bytes = need_q * 4;
     let out_bytes = need_q * 4;
     let scales_bytes = need_scales * 4;
+    // See the f32 twin: drain a stale bad-ordinal latch so it isn't misattributed
+    // to this path's post-launch check (fail-soft either way).
+    ck::clear_last_error();
     CUDA_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {

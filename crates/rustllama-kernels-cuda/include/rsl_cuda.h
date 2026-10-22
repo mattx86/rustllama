@@ -347,6 +347,11 @@ int rsl_cuda_argmax_f32(rsl_cuda_stream *s, const float *logits, int vocab,
  * CPU on a kernel failure). Returns the count since the last consume. */
 int rsl_cuda_consume_error_count(void);
 
+/* Drain + discard this thread's CUDA runtime last-error WITHOUT touching the
+ * kernel latch — clears a stale cudaErrorInvalidDevice left by an out-of-range
+ * enumeration probe so it isn't misattributed to a later kernel's check. */
+void rsl_cuda_clear_error(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -4447,16 +4447,31 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 fn run_parent_rows() -> anyhow::Result<Vec<(String, String, String)>> {
     let exe = std::env::current_exe()?;
     let names = probe_names();
+    // Fast path: no SYCL device visible at all (a CUDA-only or CPU-only box).
+    // Every probe would just spawn a child that fails `create_stream(0)` and
+    // emits `SKIP no-sycl-device` — N subprocess spawns + N near-identical SKIP
+    // lines of pure noise. Short-circuit: synthesize the SKIP rows (banked as
+    // `None` capability-absent, identical to the per-probe result) and print ONE
+    // line. (`collect_xmx_verdict` / `collect_sampler_gpu_verdict` already
+    // short-circuit silently the same way.)
+    let backend = sk::current_backend_name(0);
+    if backend.is_none() {
+        println!(
+            "SYCL kernel parity: no SYCL device visible — skipping all {} SYCL \
+             probes (capability-absent; banked as unset).",
+            names.len()
+        );
+        return Ok(names
+            .into_iter()
+            .map(|n| (n, "SKIP".to_string(), "no-sycl-device".to_string()))
+            .collect());
+    }
     println!(
         "SYCL kernel parity harness — {} probes, one subprocess each \
          (a probe that crashes or hangs the device only takes its child down)",
         names.len()
     );
-    if let Some(b) = sk::current_backend_name(0) {
-        println!("SYCL backend: {b}");
-    } else {
-        println!("SYCL backend: none visible (mock build or no device) — expect SKIPs");
-    }
+    println!("SYCL backend: {}", backend.unwrap());
     println!();
     let mut rows: Vec<(String, String, String)> = Vec::new();
     for name in &names {
@@ -4660,6 +4675,62 @@ fn cu_grade(
     cu_emit(name, key, &format!("cos={cos:.6} max_rel={max_rel:.4}"));
 }
 
+/// Grade a Blackwell / MX tensor-core GEMM output (`out[n*M + m]`, col-major in
+/// M) with the numpy-`allclose` abs-floor instead of `compare()`'s bare
+/// `max_rel`. A lossy W4A4 / W8A8 TC GEMM has near-zero reference elements where
+/// `|g-c| / (|c| + 1e-3)` false-trips (cos high, but one ref≈0 element reads
+/// rel≈1) — the SAME artifact the whole-layer graph grade avoids, and exactly
+/// what flagged `mxfp8_tc` / `mxfp6_tc` (cos=0.986) as MISCOMPUTE on real sm_120.
+/// `abs_tol` scales to 2% of the output peak so a GROSS layout bug (nvfp4/mxfp4
+/// cos≈0.5, sp24 cos≈0.12) still fails while quant noise on a near-zero element
+/// passes; `rel_tol` stays loose (the CPU ref is W4A16, the kernel W4A4).
+///
+/// Also LOCALIZES the worst element → (output row m, token col n): for a scale /
+/// fragment TV-layout bug this shows WHICH rows are wrong (e.g. only rows 8..15
+/// ⇒ the FP4 row-pair-order coin-flip the header flags SPARK-VALIDATE), turning
+/// a blind kernel fix into a one-pass on-device localization.
+fn cu_tc_grade(
+    name: &str,
+    gpu: &[f32],
+    cpu: &[f32],
+    m: usize,
+    counts: &mut std::collections::BTreeMap<&'static str, usize>,
+) {
+    let max_abs_cpu = cpu.iter().fold(0f64, |a, &c| a.max((c as f64).abs()));
+    let abs_tol = (0.02 * max_abs_cpu).max(5e-3);
+    const TC_REL_TOL: f64 = 0.60;
+    let (cos, within, worst_abs, tol_frac) = allclose_grade(gpu, cpu, abs_tol, TC_REL_TOL);
+    let key: &'static str = if cos > 0.85 && within {
+        "OK"
+    } else {
+        "MISCOMPUTE"
+    };
+    *counts.entry(key).or_default() += 1;
+    // Worst gate-tripping element (largest tol-fraction), mapped back to the
+    // (row, col) of the N×M output so clustered-row failures are legible.
+    let mut wi = 0usize;
+    let mut wfrac = 0f64;
+    for i in 0..gpu.len().min(cpu.len()) {
+        let allowed = abs_tol + TC_REL_TOL * (cpu[i] as f64).abs();
+        let frac = (gpu[i] as f64 - cpu[i] as f64).abs() / allowed;
+        if frac > wfrac {
+            wfrac = frac;
+            wi = i;
+        }
+    }
+    let (wn, wm) = if m > 0 { (wi / m, wi % m) } else { (0, 0) };
+    cu_emit(
+        name,
+        key,
+        &format!(
+            "cos={cos:.6} worst_abs={worst_abs:.4} tol_frac={tol_frac:.3} abs_tol={abs_tol:.4} \
+             fail@row{wm}/col{wn} ref={:.4} gpu={:.4}",
+            cpu.get(wi).copied().unwrap_or(0.0),
+            gpu.get(wi).copied().unwrap_or(0.0)
+        ),
+    );
+}
+
 /// Blackwell FP4 tensor-core GEMM parity probe. Builds N f32 activation rows,
 /// computes the batched CPU reference `out[n*M + m]` via the scalar FP4 matvec
 /// (`cpu_row` is the per-row W×x kernel), runs the TC GEMM, and grades with a
@@ -4731,7 +4802,7 @@ fn cu_tc_gemm_probe(
             cu_emit(name, "KERNEL_ERR", &format!("{e}"));
             *counts.entry("KERNEL_ERR").or_default() += 1;
         }
-        Ok(()) => cu_grade(name, &cu_download_f32(&ob, n * m), &cpu, 0.85, 0.60, counts),
+        Ok(()) => cu_tc_grade(name, &cu_download_f32(&ob, n * m), &cpu, m, counts),
     }
 }
 
@@ -6402,12 +6473,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     cu_emit("gemm:fp8_sp24(2:4)", "KERNEL_ERR", &format!("{e}"));
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
-                Ok(()) => cu_grade(
+                Ok(()) => cu_tc_grade(
                     "gemm:fp8_sp24(2:4)",
                     &cu_download_f32(&ob, n * m),
                     &cpu_sp,
-                    0.85,
-                    0.60,
+                    m,
                     &mut counts,
                 ),
             }
@@ -8367,19 +8437,36 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     *counts.entry("SKIP").or_default() += 1;
                 } else {
                     // Grade the residual hidden DELTA (so the shared input can't
-                    // mask an FFN miscompute) + the post-attn norm jointly.
+                    // mask an FFN miscompute). The delta already covers the WHOLE
+                    // layer — o-projection (attention) AND the SwiGLU ffn_out both
+                    // land in `hidden`, and a wrong post-attn norm would corrupt
+                    // ffn_out → the delta. So the delta is complete coverage here.
+                    //
+                    // HARNESS FIX: the post-attn norm `h_norm2` is graded ONLY when
+                    // the FFN ran on the HOST. With the FFN fused in-graph (this
+                    // probe always passes `dense_ffn = Some`), the device chain
+                    // CONSUMES h_norm2 on-device and never downloads it (see
+                    // `decode_attn_block_f32_graph_impl`: the `if dense_ffn.is_none()`
+                    // D2H), so `hnorm2_dev` stays at its initial zeros. Appending it
+                    // graded a buffer the path deliberately leaves unwritten →
+                    // `fail@norm[..] gpu=0.0000` — a HARNESS artifact, not a capture
+                    // bug (the real output, the delta, matched: cos≈1.0 because the
+                    // delta dominates magnitude). Grade h_norm2 only when it's real.
+                    let ffn_fused = true; // this probe captures the FFN in-graph
                     let mut gpu: Vec<f32> = hidden_dev
                         .iter()
                         .zip(&hidden0)
                         .map(|(h, h0)| h - h0)
                         .collect();
-                    gpu.extend_from_slice(&hnorm2_dev);
                     let mut cpu: Vec<f32> = hidden_final
                         .iter()
                         .zip(&hidden0)
                         .map(|(h, h0)| h - h0)
                         .collect();
-                    cpu.extend_from_slice(&hnorm2_ref);
+                    if !ffn_fused {
+                        gpu.extend_from_slice(&hnorm2_dev);
+                        cpu.extend_from_slice(&hnorm2_ref);
+                    }
                     // numpy-allclose grade: a whole-layer output has near-zero
                     // elements, so bare `max_rel` false-positives (cos=1.0 but
                     // one ref≈0 element reads rel≈0.999). Keep the cos bar +
