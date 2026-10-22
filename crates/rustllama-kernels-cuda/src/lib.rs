@@ -2008,6 +2008,24 @@ pub unsafe fn matvec_ptq1_0_packed_f32(
     }
 }
 
+/// Device-ptr folded-matvec picker for the rmsfold/smfold chain: PTQ1_0 or its
+/// 2-bit PQ2_0 sibling (the only two folded Prism formats). SAFETY: as the two
+/// `matvec_*_packed_f32` it forwards to.
+pub unsafe fn matvec_folded_dev(
+    stream: &CudaStream,
+    kind: CudaPackedKind,
+    w_bytes: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    match kind {
+        CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(stream, w_bytes, x, out, m, k),
+        _ => matvec_ptq1_0_packed_f32(stream, w_bytes, x, out, m, k),
+    }
+}
+
 /// Batched PTQ1_0 matvec over N rows. `x` = [N,K], `out` = [N,M] device ptrs.
 ///
 /// SAFETY: as [`matvec_ptq1_0_packed_f32`], with x/out sized for N rows.
@@ -4476,6 +4494,10 @@ impl CudaMatvecCache {
     #[allow(clippy::too_many_arguments)]
     pub fn matvec_ptq1_0_qkv_rmsfold(
         &mut self,
+        // `kind` is the folded weight format — `Ptq1_0` or its 2-bit sibling
+        // `Pq2_0` (both Prism, k%128, one f16 scale per 128). rmsnorm/hadamard
+        // are dtype-agnostic; only the per-projection matvec + row-bytes differ.
+        kind: CudaPackedKind,
         hidden: &[f32],
         norm_weight: &[f32],
         signs: &[f32],
@@ -4494,7 +4516,10 @@ impl CudaMatvecCache {
         mkv: usize,
         k: usize,
     ) -> bool {
-        let align = CudaPackedKind::Ptq1_0.k_alignment();
+        if !matches!(kind, CudaPackedKind::Ptq1_0 | CudaPackedKind::Pq2_0) {
+            return false;
+        }
+        let align = kind.k_alignment();
         if mq == 0
             || mkv == 0
             || k == 0
@@ -4510,7 +4535,7 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let rb = CudaPackedKind::Ptq1_0.row_bytes(k);
+        let rb = kind.row_bytes(k);
         if wq_bytes.len() < mq * rb || wk_bytes.len() < mkv * rb || wv_bytes.len() < mkv * rb {
             return false;
         }
@@ -4591,8 +4616,9 @@ impl CudaMatvecCache {
             let w_ptr = self.weights[&w_key].ptr;
             let out_ptr = self.rmsfold_out.as_ref().unwrap().ptr as *mut f32;
             // SAFETY: w (cached), xrot (resident), out (scratch ≥ m) live on
-            // `self.stream`; the wrapper synchronizes before returning.
-            if unsafe { matvec_ptq1_0_packed_f32(&self.stream, w_ptr, xrot_cptr, out_ptr, m, k) }
+            // `self.stream`; the wrapper synchronizes before returning. The picker
+            // routes by `kind` (PTQ1_0 vs its 2-bit PQ2_0 sibling).
+            if unsafe { matvec_folded_dev(&self.stream, kind, w_ptr, xrot_cptr, out_ptr, m, k) }
                 .is_err()
                 || consume_error_count() != 0
             {
@@ -4618,6 +4644,8 @@ impl CudaMatvecCache {
     #[allow(clippy::too_many_arguments)]
     pub fn matvec_ptq1_0_ffn_rmsfold_smfold(
         &mut self,
+        // Folded weight format — `Ptq1_0` or the 2-bit `Pq2_0` (see the qkv twin).
+        kind: CudaPackedKind,
         hidden: &[f32],
         norm_weight: &[f32],
         signs_in: &[f32],
@@ -4634,7 +4662,10 @@ impl CudaMatvecCache {
         d: usize,
         d_ff: usize,
     ) -> bool {
-        let align = CudaPackedKind::Ptq1_0.k_alignment();
+        if !matches!(kind, CudaPackedKind::Ptq1_0 | CudaPackedKind::Pq2_0) {
+            return false;
+        }
+        let align = kind.k_alignment();
         if d == 0
             || d_ff == 0
             || block == 0
@@ -4650,8 +4681,8 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let rb = CudaPackedKind::Ptq1_0.row_bytes(d);
-        let rb_ff = CudaPackedKind::Ptq1_0.row_bytes(d_ff);
+        let rb = kind.row_bytes(d);
+        let rb_ff = kind.row_bytes(d_ff);
         // gate/up: [d_ff × d]; down: [d × d_ff].
         if wg_bytes.len() < d_ff * rb || wu_bytes.len() < d_ff * rb || wd_bytes.len() < d * rb_ff {
             return false;
@@ -4737,10 +4768,11 @@ impl CudaMatvecCache {
         let wu_ptr = self.weights[&wu_key].ptr;
         let gate_ptr = self.ffn_gate.as_ref().unwrap().ptr as *mut f32;
         let up_ptr = self.ffn_up.as_ref().unwrap().ptr as *mut f32;
-        // SAFETY: cached weights + resident xrot + ffn scratch (≥ d_ff) on the stream.
-        if unsafe { matvec_ptq1_0_packed_f32(&self.stream, wg_ptr, xrot_cptr, gate_ptr, d_ff, d) }
+        // SAFETY: cached weights + resident xrot + ffn scratch (≥ d_ff) on the
+        // stream. The picker routes by `kind` (PTQ1_0 / PQ2_0).
+        if unsafe { matvec_folded_dev(&self.stream, kind, wg_ptr, xrot_cptr, gate_ptr, d_ff, d) }
             .is_err()
-            || unsafe { matvec_ptq1_0_packed_f32(&self.stream, wu_ptr, xrot_cptr, up_ptr, d_ff, d) }
+            || unsafe { matvec_folded_dev(&self.stream, kind, wu_ptr, xrot_cptr, up_ptr, d_ff, d) }
                 .is_err()
             || consume_error_count() != 0
         {
@@ -4769,7 +4801,8 @@ impl CudaMatvecCache {
         let wd_ptr = self.weights[&wd_key].ptr;
         let out_ptr = self.rmsfold_out.as_ref().unwrap().ptr as *mut f32;
         // SAFETY: cached weight + resident arot + rmsfold_out (≥ d) on the stream.
-        if unsafe { matvec_ptq1_0_packed_f32(&self.stream, wd_ptr, arot_cptr, out_ptr, d, d_ff) }
+        // Picker routes by `kind` (PTQ1_0 / PQ2_0).
+        if unsafe { matvec_folded_dev(&self.stream, kind, wd_ptr, arot_cptr, out_ptr, d, d_ff) }
             .is_err()
             || consume_error_count() != 0
         {

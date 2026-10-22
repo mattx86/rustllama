@@ -15195,9 +15195,16 @@ fn try_folded_ffn_rmsfold_smfold_cuda(
     {
         return false;
     }
-    // PTQ1_0 only on CUDA (no device-ptr PQ2_0 matvec); all three the same dtype.
+    // Folded Bonsai formats PTQ1_0 or PQ2_0 (both have a CUDA device-ptr matvec);
+    // gate/up/down must agree on dtype. Anything else ⇒ CPU path.
     let dt = w_gate.dtype;
-    if !matches!(dt, Dtype::PTQ1_0Raw) || w_up.dtype != dt || w_down.dtype != dt {
+    let Some(kind) = dtype_to_cuda_kind(dt) else {
+        return false;
+    };
+    if !matches!(kind, ck::CudaPackedKind::Ptq1_0 | ck::CudaPackedKind::Pq2_0)
+        || w_up.dtype != dt
+        || w_down.dtype != dt
+    {
         return false;
     }
     let Some(cache) = cuda_cache() else {
@@ -15210,6 +15217,7 @@ fn try_folded_ffn_rmsfold_smfold_cuda(
     let wu_b = as_bytes(w_up);
     let wd_b = as_bytes(w_down);
     guard.matvec_ptq1_0_ffn_rmsfold_smfold(
+        kind,
         hidden,
         norm_weight,
         signs_in,
@@ -15261,10 +15269,16 @@ fn try_folded_ffn_rmsfold_smfold_mlx(
     {
         return false;
     }
-    // PTQ1_0 only on MLX (the cache method calls the PTQ1_0 matvec); all three
-    // the same dtype. PQ2_0 ⇒ CPU path (see the doc above).
+    // Folded Bonsai formats PTQ1_0 or PQ2_0 (both have an MLX device-ptr matvec);
+    // gate/up/down must agree on dtype. Anything else ⇒ CPU path.
     let dt = w_gate.dtype;
-    if !matches!(dt, Dtype::PTQ1_0Raw) || w_up.dtype != dt || w_down.dtype != dt {
+    let Some(kind) = dtype_to_mlx_kind(dt) else {
+        return false;
+    };
+    if !matches!(kind, mk::MlxPackedKind::Ptq1_0 | mk::MlxPackedKind::Pq2_0)
+        || w_up.dtype != dt
+        || w_down.dtype != dt
+    {
         return false;
     }
     let Some(cache) = mlx_cache() else {
@@ -15277,6 +15291,7 @@ fn try_folded_ffn_rmsfold_smfold_mlx(
     let wu_b = as_bytes(w_up);
     let wd_b = as_bytes(w_down);
     guard.matvec_ptq1_0_ffn_rmsfold_smfold(
+        kind,
         hidden,
         norm_weight,
         signs_in,
@@ -15389,8 +15404,15 @@ fn try_folded_qkv_rmsfold_cuda(
     if !rmsfold_fused_enabled() || !cuda_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    // PTQ1_0 only (the folded Bonsai format). Anything else ⇒ CPU path.
-    if !matches!(wq.dtype, Dtype::PTQ1_0Raw) || wk.dtype != wq.dtype || wv.dtype != wq.dtype {
+    // Folded Bonsai formats PTQ1_0 or PQ2_0 (both have a CUDA device-ptr matvec);
+    // q/k/v must agree on dtype. Anything else ⇒ CPU path.
+    let Some(kind) = dtype_to_cuda_kind(wq.dtype) else {
+        return false;
+    };
+    if !matches!(kind, ck::CudaPackedKind::Ptq1_0 | ck::CudaPackedKind::Pq2_0)
+        || wk.dtype != wq.dtype
+        || wv.dtype != wq.dtype
+    {
         return false;
     }
     let Some(cache) = cuda_cache() else {
@@ -15405,6 +15427,7 @@ fn try_folded_qkv_rmsfold_cuda(
     let wk_b = as_bytes(wk);
     let wv_b = as_bytes(wv);
     guard.matvec_ptq1_0_qkv_rmsfold(
+        kind,
         hidden,
         norm_weight,
         signs,
@@ -15533,8 +15556,15 @@ fn try_folded_qkv_rmsfold_mlx(
     if !rmsfold_fused_enabled() || !mlx_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    // PTQ1_0 only (the folded Bonsai format). Anything else ⇒ CPU path.
-    if !matches!(wq.dtype, Dtype::PTQ1_0Raw) || wk.dtype != wq.dtype || wv.dtype != wq.dtype {
+    // Folded Bonsai formats PTQ1_0 or PQ2_0 (both have an MLX device-ptr matvec);
+    // q/k/v must agree on dtype. Anything else ⇒ CPU path.
+    let Some(kind) = dtype_to_mlx_kind(wq.dtype) else {
+        return false;
+    };
+    if !matches!(kind, mk::MlxPackedKind::Ptq1_0 | mk::MlxPackedKind::Pq2_0)
+        || wk.dtype != wq.dtype
+        || wv.dtype != wq.dtype
+    {
         return false;
     }
     let Some(cache) = mlx_cache() else {
@@ -15549,6 +15579,7 @@ fn try_folded_qkv_rmsfold_mlx(
     let wk_b = as_bytes(wk);
     let wv_b = as_bytes(wv);
     guard.matvec_ptq1_0_qkv_rmsfold(
+        kind,
         hidden,
         norm_weight,
         signs,
