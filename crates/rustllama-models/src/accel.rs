@@ -15228,9 +15228,76 @@ fn try_folded_ffn_rmsfold_smfold_cuda(
     )
 }
 
+/// B2 (Kindi rmsfold+smfold) — MLX/Metal sibling of
+/// [`try_folded_ffn_rmsfold_smfold_cuda`]: the device-resident dense FFN on the
+/// MLX stream (GPU RMSNorm → Hadamard → gate/up matvec → SiLU-gate → Hadamard →
+/// down matvec, the activation kept resident). Fail-closed behind BOTH
+/// `fused:rmsfold` + `fused:smfold`; any miss ⇒ `false` ⇒ CPU `dense_ffn_one_into`.
+///
+/// PTQ1_0 only — like the CUDA sibling: the MLX FFN cache method calls the
+/// PTQ1_0 matvec, so a PQ2_0 Bonsai FFN falls to the byte-identical CPU path.
+/// (MLX DOES have a device-ptr `matvec_pq2_0_packed_f32`, so relaxing to PQ2_0
+/// is a small follow-up — add a per-dtype matvec picker to the MLX cache's
+/// qkv/ffn methods, mirroring the SYCL `matvec_folded_usm`.)
+#[allow(clippy::too_many_arguments)]
+fn try_folded_ffn_rmsfold_smfold_mlx(
+    hidden: &[f32],
+    norm_weight: &[f32],
+    signs_in: &[f32],
+    signs_ff: &[f32],
+    block: usize,
+    eps: f32,
+    w_gate: &Tensor,
+    w_up: &Tensor,
+    w_down: &Tensor,
+    out: &mut [f32],
+    d: usize,
+    d_ff: usize,
+) -> bool {
+    if !rmsfold_fused_enabled()
+        || !smfold_fused_enabled()
+        || !mlx_active()
+        || !gpu_active_for_current_layer()
+    {
+        return false;
+    }
+    // PTQ1_0 only on MLX (the cache method calls the PTQ1_0 matvec); all three
+    // the same dtype. PQ2_0 ⇒ CPU path (see the doc above).
+    let dt = w_gate.dtype;
+    if !matches!(dt, Dtype::PTQ1_0Raw) || w_up.dtype != dt || w_down.dtype != dt {
+        return false;
+    }
+    let Some(cache) = mlx_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    let wg_b = as_bytes(w_gate);
+    let wu_b = as_bytes(w_up);
+    let wd_b = as_bytes(w_down);
+    guard.matvec_ptq1_0_ffn_rmsfold_smfold(
+        hidden,
+        norm_weight,
+        signs_in,
+        signs_ff,
+        block,
+        eps,
+        wg_b.as_ptr() as usize,
+        wg_b,
+        wu_b.as_ptr() as usize,
+        wu_b,
+        wd_b.as_ptr() as usize,
+        wd_b,
+        out,
+        d,
+        d_ff,
+    )
+}
+
 /// B2 (Kindi rmsfold+smfold) backend dispatcher for the device-resident dense
-/// FFN: CUDA when a usable NVIDIA GPU is active, else the SYCL USM path (MLX a
-/// later arm). Each backend is independently fail-closed behind BOTH the
+/// FFN: CUDA when a usable NVIDIA GPU is active, else MLX on Apple, else the SYCL
+/// USM path. Each backend is independently fail-closed behind BOTH the
 /// `fused:rmsfold` + `fused:smfold` verdicts; a `false` ⇒ the caller runs the
 /// BYTE-IDENTICAL CPU `dense_ffn_one_into`. The forward calls ONLY this dispatcher.
 #[allow(clippy::too_many_arguments)]
@@ -15250,6 +15317,21 @@ pub fn try_folded_ffn_rmsfold_smfold(
 ) -> bool {
     if cuda_active() {
         try_folded_ffn_rmsfold_smfold_cuda(
+            hidden,
+            norm_weight,
+            signs_in,
+            signs_ff,
+            block,
+            eps,
+            w_gate,
+            w_up,
+            w_down,
+            out,
+            d,
+            d_ff,
+        )
+    } else if mlx_active() {
+        try_folded_ffn_rmsfold_smfold_mlx(
             hidden,
             norm_weight,
             signs_in,

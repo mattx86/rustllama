@@ -9653,6 +9653,88 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 }
             }
         }
+        // B2 (Kindi smfold): the FFN down-input chain `mk::silu_mul_f32` →
+        // `mk::hadamard_forward` (the SiLU-gate product rotated, resident, which
+        // the down matvec reads) vs CPU `silu_mul_f32` then `hadamard::
+        // hadamard_forward`. Banks the SAME `fused:smfold` verdict SYCL/CUDA do.
+        {
+            let name = "fused:smfold";
+            const SK: usize = 256; // d_ff stand-in: multiple of BLOCK + 128
+            const SBLOCK: usize = 64;
+            let gate = gen_x(SK, 88);
+            let up = gen_x(SK, 89);
+            let signs: Vec<f32> = (0..SK)
+                .map(|i| {
+                    if (i * 2654435761usize) & 0x10 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
+                .collect();
+            let mut act = vec![0f32; SK];
+            k::silu_mul_f32(&gate, &up, &mut act);
+            let mut cpu = vec![0f32; SK];
+            k::hadamard::hadamard_forward(&act, &signs, SBLOCK, &mut cpu);
+            match (
+                mk_upload_f32(&fs, &gate),
+                mk_upload_f32(&fs, &up),
+                mk::MlxDeviceBuffer::alloc(&fs, SK * 4), // act (silu product)
+                mk_upload_f32(&fs, &signs),
+                mk::MlxDeviceBuffer::alloc(&fs, SK * 4), // y (rotated down input)
+            ) {
+                (Some(gb), Some(ub), Some(mut ab), Some(sgb), Some(mut yb)) => {
+                    // SAFETY: five live device buffers on `fs` sized SK; each
+                    // wrapper synchronizes before returning, so the silu product is
+                    // readable by the Hadamard and the readback doesn't race.
+                    let silu = unsafe {
+                        mk::silu_mul_f32(
+                            &fs,
+                            gb.as_ptr() as *const f32,
+                            ub.as_ptr() as *const f32,
+                            ab.as_mut_ptr() as *mut f32,
+                            SK,
+                        )
+                    };
+                    if let Err(e) = silu {
+                        cu_emit(name, "KERNEL_ERR", &format!("silu_mul {e}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    } else {
+                        let had = unsafe {
+                            mk::hadamard_forward(
+                                &fs,
+                                ab.as_ptr() as *const f32,
+                                sgb.as_ptr() as *const f32,
+                                yb.as_mut_ptr() as *mut f32,
+                                SK,
+                                SBLOCK,
+                            )
+                        };
+                        match had {
+                            Err(e) => {
+                                cu_emit(name, "KERNEL_ERR", &format!("hadamard {e}"));
+                                *counts.entry("KERNEL_ERR").or_default() += 1;
+                            }
+                            Ok(()) => {
+                                let gpu = mk_download_f32(&yb, SK);
+                                let (cos, max_rel) = compare(&gpu, &cpu);
+                                let key: &'static str = if cos > 0.999 && max_rel < 0.05 {
+                                    "OK"
+                                } else {
+                                    "MISCOMPUTE"
+                                };
+                                *counts.entry(key).or_default() += 1;
+                                cu_emit(name, key, &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+                    *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+            }
+        }
         // RoPE
         {
             let n_heads = 8usize;
