@@ -2657,6 +2657,12 @@ pub fn nextn_compose_logits_f32(
     head: &NextNHead,
     lm_head: &Tensor,
     rms_eps: f32,
+    // NextN draft head: on a FOLDED (Prism/Bonsai) model the `eh_proj` + `lm_head`
+    // matmuls need the Hadamard activation rotation their folded weights require
+    // (the main forward rotates before `lm_head`; this draft path historically did
+    // not → the qwen35 NextN drafter was garbage on folded models). `is_folded`-
+    // gated: `None` or an unfolded weight ⇒ no rotation ⇒ byte-identical.
+    had: Option<&HadamardState>,
     logits_out: &mut [f32],
 ) {
     let d = hidden.len();
@@ -2675,6 +2681,7 @@ pub fn nextn_compose_logits_f32(
     concat[d..].copy_from_slice(&h_norm_buf);
 
     let mut projected = vec![0.0f32; d];
+    hadamard_rotate_inplace(had, &head.eh_proj, &mut concat);
     matvec_tensor_dispatch(&head.eh_proj, &concat, &mut projected, d, 2 * d);
 
     let mut shared_norm = vec![0.0f32; d];
@@ -2685,6 +2692,7 @@ pub fn nextn_compose_logits_f32(
         rms_eps,
     );
 
+    hadamard_rotate_inplace(had, lm_head, &mut shared_norm);
     matvec_tensor_dispatch(lm_head, &shared_norm, logits_out, vocab, d);
 }
 
@@ -11424,6 +11432,7 @@ impl LlamaModel {
             head,
             lm_head,
             cfg.rms_eps,
+            self.weights.hadamard.as_ref(),
             nextn_logits_out,
         );
     }
@@ -11520,6 +11529,7 @@ impl LlamaModel {
                 head,
                 lm_head,
                 cfg.rms_eps,
+                self.weights.hadamard.as_ref(),
                 &mut row,
             );
             vec![row]
@@ -11736,6 +11746,27 @@ impl LlamaModel {
         let mut h_norm = vec![0f32; d];
         k::rmsnorm_f32_row(hidden_in, &block.attn_norm, &mut h_norm, cfg.rms_eps);
 
+        // NextN/MTP draft head: a FOLDED (Prism/Bonsai) MTP block needs the
+        // Hadamard activation rotation its folded weights require — the main
+        // forward applies it, but this draft sidecar historically did NOT, so on
+        // a folded model the draft projections were garbage (≈0% speculative
+        // acceptance). Rotate each folded matmul's input, `is_folded`-gated: a
+        // no-op (byte-identical) for a non-folded DeepSeek-style MTP head, the
+        // correct rotation for a folded one. q/k/v share this attn-norm input, so
+        // rotate it ONCE (dedup) — keyed on the fused qkv tensor when present.
+        let had = self.weights.hadamard.as_ref();
+        if block.w_qkv_fused.is_none() {
+            debug_assert!(
+                had.map_or(true, |h| {
+                    let q = h.is_folded(&block.w_q.name);
+                    q == h.is_folded(&block.w_k.name) && q == h.is_folded(&block.w_v.name)
+                }),
+                "hadamard: MTP q/k/v foldedness must match for shared-input rotate-once"
+            );
+        }
+        let qkv_w = block.w_qkv_fused.as_ref().unwrap_or(&block.w_q);
+        hadamard_rotate_inplace(had, qkv_w, &mut h_norm);
+
         let mut q_buf = vec![0f32; d_q];
         let mut k_buf = vec![0f32; d_kv];
         let mut v_buf = vec![0f32; d_kv];
@@ -11785,6 +11816,7 @@ impl LlamaModel {
         }
 
         let mut attn_proj = vec![0f32; d];
+        hadamard_rotate_inplace(had, &block.w_o, &mut attn_out);
         matvec_tensor_dispatch(&block.w_o, &attn_out, &mut attn_proj, d, d_q);
 
         let mut hidden_mtp: Vec<f32> = hidden_in.to_vec();
@@ -11797,9 +11829,17 @@ impl LlamaModel {
         let mut up_buf = vec![0f32; d_ff];
         let mut ffn_buf = vec![0f32; d_ff];
         let mut ffn_out = vec![0f32; d];
+        // gate/up share the post-attn-norm input — rotate it ONCE (is_folded-gated).
+        debug_assert!(
+            had.map_or(true, |h| h.is_folded(&block.w_gate.name)
+                == h.is_folded(&block.w_up.name)),
+            "hadamard: MTP gate/up foldedness must match for shared-input rotate-once"
+        );
+        hadamard_rotate_inplace(had, &block.w_gate, &mut h_norm_ffn);
         matvec_tensor_dispatch(&block.w_gate, &h_norm_ffn, &mut gate_buf, d_ff, d);
         matvec_tensor_dispatch(&block.w_up, &h_norm_ffn, &mut up_buf, d_ff, d);
         k::silu_mul_f32(&gate_buf, &up_buf, &mut ffn_buf);
+        hadamard_rotate_inplace(had, &block.w_down, &mut ffn_buf);
         matvec_tensor_dispatch(&block.w_down, &ffn_buf, &mut ffn_out, d, d_ff);
         k::add_inplace_f32(&mut hidden_mtp, &ffn_out);
 
@@ -11815,6 +11855,7 @@ impl LlamaModel {
             .as_ref()
             .or(self.weights.output.as_ref())
             .unwrap_or(&self.weights.token_embd);
+        hadamard_rotate_inplace(had, lm_head, &mut final_norm);
         matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
         self.finalize_logits(logits_out);
     }

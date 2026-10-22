@@ -84,6 +84,7 @@ fn nextn_compose_logits_matches_python_reference() {
         &head,
         &lm_head,
         rms_eps,
+        None, // no Hadamard folding in the numpy reference fixture
         &mut logits,
     );
 
