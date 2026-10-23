@@ -2261,6 +2261,13 @@ fn usable_cuda_devices() -> Vec<u32> {
         .collect()
 }
 
+/// How many usable (enabled, non-disabled) CUDA devices this host has. `>= 2`
+/// means a multi-GPU PP/TP choice exists; the measured-autotune `tune --multi-gpu`
+/// stage SKIPs below that (single-device is the only mode). `0` off NVIDIA.
+pub fn usable_cuda_device_count() -> usize {
+    usable_cuda_devices().len()
+}
+
 /// Column-parallel multi-GPU tensor-parallel packed matvec. Returns `false`
 /// (leaving `out` possibly partial — the caller then overwrites it on the
 /// single-device path) when fewer than 2 devices are usable or any band fails.

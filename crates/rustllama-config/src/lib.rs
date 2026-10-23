@@ -1514,6 +1514,13 @@ pub struct TuningConfig {
     /// the heat planner / tuner owns the routed-expert tier decision.
     #[serde(default = "default_true_serde")]
     pub auto_apply_moe_placement: bool,
+    /// Apply the measured multi-GPU mode winner (`tune --multi-gpu` → the tuner
+    /// cache's `multi_gpu_mode`: single-device / pipeline / tensor) at load when
+    /// `[inference].multi_gpu` is left unset. With no cache entry (or this flag
+    /// off), multi-GPU stays on its auto default (TP engages where its self-checks
+    /// pass; no pipeline split). Only ever bites on a >= 2-GPU host.
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_multi_gpu: bool,
     /// Apply the per-model decision-probability calibration
     /// (fitted by the tune sweep's decision-calibration stage) to the
     /// `/v1/decide/*` endpoints.
@@ -1571,6 +1578,7 @@ impl Default for TuningConfig {
             auto_apply_kv_page_size: true,
             auto_apply_flash_v3_kv_tile: true,
             auto_apply_moe_placement: true,
+            auto_apply_multi_gpu: true,
             auto_apply_decision_calibration: true,
             auto_apply_cacheblend: true,
             auto_apply_perf_knobs: true,

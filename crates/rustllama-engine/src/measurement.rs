@@ -537,6 +537,149 @@ pub fn measure_per_device_perf(
     })
 }
 
+/// One multi-GPU mode's measured decode throughput.
+#[derive(Debug, Clone)]
+pub struct MultiGpuModeResult {
+    pub mode: String, // "off" | "pp" | "tp"
+    pub median_tps: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// Result of the measured-autotune multi-GPU sweep.
+#[derive(Debug, Clone)]
+pub struct MultiGpuMeasurementReport {
+    pub candidates: Vec<MultiGpuModeResult>,
+    /// Fastest mode, or `None` when skipped / every run failed.
+    pub winner: Option<String>,
+    pub winner_tps: f64,
+    /// The single-device (`"off"`) baseline, for the speedup readout.
+    pub baseline_tps: f64,
+    /// Set (and `winner == None`) when there was no multi-GPU choice to measure.
+    pub skipped: Option<String>,
+}
+
+/// Measured autotune: time a representative decode under each multi-GPU mode
+/// (single-device `"off"`, pipeline `"pp"`, tensor `"tp"`) and pick the fastest for
+/// this (system, model). Each mode is driven by `RUSTLLAMA_MULTI_GPU` (read at load
+/// by the placement planner + the TP dispatch), so every mode gets a FRESH load
+/// with its own placement, then a warmup + `repeats` timed decode runs (median
+/// tok/s). SKIPs — no winner — on < 2 usable CUDA GPUs, where single-device is the
+/// only mode. WRITE-BLIND: only a >= 2-GPU host observes a real difference between
+/// the modes; on one GPU every mode collapses to single-device. Run AFTER the
+/// per-device-perf stage has banked (pp/tp placement reads it); `tune --all`
+/// orders it so.
+pub fn measure_multi_gpu_candidates(
+    model_path: &Path,
+    ctx_size: usize,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+    cfg: &MeasurementConfig,
+) -> crate::Result<MultiGpuMeasurementReport> {
+    if rustllama_models::accel::usable_cuda_device_count() < 2 {
+        return Ok(MultiGpuMeasurementReport {
+            candidates: Vec::new(),
+            winner: None,
+            winner_tps: 0.0,
+            baseline_tps: 0.0,
+            skipped: Some(
+                "fewer than 2 usable CUDA GPUs — single-device is the only mode".to_string(),
+            ),
+        });
+    }
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: decode_tokens,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    let saved_env = std::env::var("RUSTLLAMA_MULTI_GPU").ok();
+    let mut candidates: Vec<MultiGpuModeResult> = Vec::new();
+    for mode in ["off", "pp", "tp"] {
+        // The mode is read at load by `auto_place_heat` (pipeline branch) + the TP
+        // dispatch arms, so each mode needs its own fresh load + placement.
+        std::env::set_var("RUSTLLAMA_MULTI_GPU", mode);
+        let run = (|| -> std::result::Result<f64, String> {
+            let mut eng = ContiguousEngine::load_with_options_and_layout(
+                model_path,
+                ctx_size,
+                true,
+                cfg.kv_dtype,
+                &cfg.kv_cache_layout,
+            )
+            .map_err(|e| format!("load failed: {e}"))?;
+            eng.set_prefix_cache(false);
+            eng.set_flash_attention(cfg.flash_attention);
+            // Install this mode's placement plan (reads RUSTLLAMA_MULTI_GPU). An
+            // error (e.g. no banked per-device perf) leaves the single-device plan,
+            // so the mode still benches — just without its multi-GPU split.
+            let _ = eng.auto_place_heat(&crate::placement_auto::AutoPlacementOpts::default());
+            let vocab = eng.vocab_size() as i32;
+            let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
+                .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+                .collect();
+            // One untimed warmup (JIT / upload / page-in).
+            eng.generate_token_ids(&prompt_ids, decode_tokens, &sampling)
+                .map_err(|e| format!("warmup failed: {e}"))?;
+            let (mut runs, last_err) =
+                collect_decode_tok_s(&mut eng, &prompt_ids, decode_tokens, repeats, &sampling);
+            if runs.is_empty() {
+                return Err(last_err.unwrap_or_else(|| "every measurement run failed".into()));
+            }
+            runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            Ok(runs[runs.len() / 2])
+        })();
+        match run {
+            Ok(tps) => candidates.push(MultiGpuModeResult {
+                mode: mode.to_string(),
+                median_tps: Some(tps),
+                error: None,
+            }),
+            Err(e) => candidates.push(MultiGpuModeResult {
+                mode: mode.to_string(),
+                median_tps: None,
+                error: Some(e),
+            }),
+        }
+    }
+    // Restore the caller's environment.
+    match saved_env {
+        Some(v) => std::env::set_var("RUSTLLAMA_MULTI_GPU", v),
+        None => std::env::remove_var("RUSTLLAMA_MULTI_GPU"),
+    }
+
+    let baseline_tps = candidates
+        .iter()
+        .find(|c| c.mode == "off")
+        .and_then(|c| c.median_tps)
+        .unwrap_or(0.0);
+    let mut winner: Option<String> = None;
+    let mut winner_tps = 0.0f64;
+    for c in &candidates {
+        if let Some(t) = c.median_tps {
+            if t > winner_tps {
+                winner_tps = t;
+                winner = Some(c.mode.clone());
+            }
+        }
+    }
+    Ok(MultiGpuMeasurementReport {
+        candidates,
+        winner,
+        winner_tps,
+        baseline_tps,
+        skipped: None,
+    })
+}
+
 /// The slug + label of the GPU the engine actually dispatches to (CUDA
 /// device 0 first, else the active SYCL device), or `None` when no GPU is
 /// usable. Uses the SAME slug scheme as `system_fingerprint`, so the score

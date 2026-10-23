@@ -511,6 +511,13 @@ pub enum Command {
         /// `[tuning].auto_apply_moe_placement`).
         #[arg(long)]
         moe_placement: bool,
+        /// Multi-GPU mode sweep: A/B single-device (`off`), pipeline (`pp`), and
+        /// tensor (`tp`) parallelism by measured decode tok/s and persist the
+        /// fastest under `multi_gpu_mode`; auto-applied on next load when
+        /// `[inference].multi_gpu` is unset and `[tuning].auto_apply_multi_gpu`.
+        /// SKIPs on a single-GPU host (no multi-GPU choice to make).
+        #[arg(long)]
+        multi_gpu: bool,
         /// MTP / NextN self-speculation A/B sweep: measure decode tok/s
         /// with MTP self-speculative decode off vs on and pick the
         /// faster arm. Hybrid + NextN-head models only; a non-capable
@@ -1410,6 +1417,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             flash_v3_kv_tile_candidates,
             flash_bench,
             moe_placement,
+            multi_gpu,
             speculative_mtp,
             speculative_mtp_repeats,
             tree_widths,
@@ -1516,6 +1524,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 flash_v3_kv_tile,
                 flash_bench,
                 moe_placement,
+                multi_gpu,
                 speculative_mtp,
                 tree_widths,
                 spec_strategy,
@@ -1541,7 +1550,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --flash-bench / \
-                     --moe-placement / --speculative-mtp / --tree-widths / \
+                     --moe-placement / --multi-gpu / --speculative-mtp / --tree-widths / \
                      --spec-strategy / \
                      --ssm-prefill-chunked / --parallel-matvec-crossover / \
                      --matvec-min-flops / --ssm-chunk / \
@@ -1645,6 +1654,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if moe_placement {
                 return cmd_tune_moe_placement(
+                    &config_path,
+                    model,
+                    prompt_tokens,
+                    decode_tokens,
+                    repeats,
+                );
+            }
+            if multi_gpu {
+                return cmd_tune_multi_gpu(
                     &config_path,
                     model,
                     prompt_tokens,
@@ -2485,6 +2503,13 @@ fn promote_memory_env_from_config(
             let m = mode.trim().to_ascii_lowercase();
             std::env::set_var("RUSTLLAMA_MULTI_GPU", &m);
             tracing::info!(multi_gpu = %m, "multi-GPU mode applied from config");
+        }
+    } else if tuning.auto_apply_multi_gpu && std::env::var_os("RUSTLLAMA_MULTI_GPU").is_none() {
+        // Measured autotune: config left it unset, so apply the `tune --multi-gpu`
+        // winner from the tuner cache (if any). Only ever present on a >= 2-GPU host.
+        if let Some(m) = multi_gpu_mode_from_cache() {
+            std::env::set_var("RUSTLLAMA_MULTI_GPU", &m);
+            tracing::info!(multi_gpu = %m, "multi-GPU mode applied from tuner cache (measured autotune)");
         }
     }
     // CPU compute tier (disable-list + on/off + VRAM-only mode) — also env.
@@ -9020,6 +9045,10 @@ fn cmd_tune_all(
         .as_ref()
         .map(|t| !t.per_device_perf.is_empty())
         .unwrap_or(false);
+    let has_multi_gpu = cached
+        .as_ref()
+        .and_then(|t| t.multi_gpu_mode.clone())
+        .is_some();
     // Kernel verdicts are cached ONLY if present AND stamped by the
     // CURRENT build — a different build may have changed the kernels (e.g.
     // a Blackwell GEMM fix), so re-validate on a build change. This is
@@ -9193,6 +9222,35 @@ fn cmd_tune_all(
             &[],
         ) {
             tracing::warn!(error = %e, "stage 1d (dev-attn perf) failed; continuing");
+        }
+    }
+
+    println!();
+    println!("Stage 1e/10: multi-gpu mode (A/B single / pipeline / tensor — fastest decode; SKIPs on <2 GPUs)");
+    println!("--------");
+    if skip(has_multi_gpu) {
+        println!("(skipped: multi-GPU mode already cached)");
+    } else {
+        // Measured autotune: reload under each mode + bench. SKIPs internally on a
+        // single-GPU host (the common case). Runs AFTER stage 1b so pp/tp placement
+        // reads the banked per-device perf. Subprocess for a clean GPU context.
+        let args_1e = vec![
+            "--prompt-tokens".to_string(),
+            measure_prompt_tokens.to_string(),
+            "--decode-tokens".to_string(),
+            measure_decode_tokens.to_string(),
+            "--repeats".to_string(),
+            measure_repeats.to_string(),
+        ];
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--multi-gpu",
+            thorough,
+            "1e (multi-gpu mode)",
+            &args_1e,
+        ) {
+            tracing::warn!(error = %e, "stage 1e (multi-gpu mode) failed; continuing");
         }
     }
 
@@ -10091,6 +10149,110 @@ pub fn moe_placement_from_cache_or_default_to(
     Some((placement, t.moe_gpu_split_permille.unwrap_or(0)))
 }
 
+/// `rustllama tune --multi-gpu`: measured autotune — A/B single-device, pipeline,
+/// and tensor parallelism by decode tok/s and persist the fastest under
+/// `multi_gpu_mode`. SKIPs (persists nothing) on a single-GPU host.
+fn cmd_tune_multi_gpu(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_multi_gpu_candidates, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    if repeats == 0 {
+        anyhow::bail!("--repeats must be >= 1");
+    }
+    let k = cfg.inference.resolved_kv_dtype();
+    let m_cfg = MeasurementConfig {
+        kv_dtype: parse_kv_dtype(k)?,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+    let ctx_size =
+        (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
+
+    println!("rustllama tune --multi-gpu");
+    println!("  model         = {}", model_path.display());
+    println!("  ctx_size      = {ctx_size}");
+    println!("  prompt_tokens = {prompt_tokens}");
+    println!("  decode_tokens = {decode_tokens}");
+    println!("  repeats       = {repeats} (median per mode)");
+    println!();
+
+    let report = measure_multi_gpu_candidates(
+        &model_path,
+        ctx_size,
+        prompt_tokens,
+        decode_tokens,
+        repeats,
+        &m_cfg,
+    )?;
+    if let Some(reason) = &report.skipped {
+        println!("  SKIP: {reason}");
+        println!("  nothing persisted (single-device is the only mode here).");
+        return Ok(());
+    }
+    println!("  {:>6}  {:>11}  notes", "mode", "median tps");
+    for c in &report.candidates {
+        match c.median_tps {
+            Some(m) => println!("  {:>6}  {m:>11.2}", c.mode),
+            None => println!(
+                "  {:>6}  {:>11}  {}",
+                c.mode,
+                "-",
+                c.error.as_deref().unwrap_or("failed")
+            ),
+        }
+    }
+    println!();
+    match &report.winner {
+        Some(mode) => {
+            println!(
+                "  winner: {mode} at {:.2} tok/s (single-device baseline {:.2} tok/s)",
+                report.winner_tps, report.baseline_tps
+            );
+            persist_multi_gpu_winner(mode)?;
+            println!(
+                "  applied automatically on next load when [inference].multi_gpu is \
+                 unset and [tuning].auto_apply_multi_gpu = true"
+            );
+        }
+        None => println!("  no mode produced a successful run; nothing persisted"),
+    }
+    Ok(())
+}
+
+/// Bank the measured multi-GPU mode winner into the tuner cache's
+/// `multi_gpu_mode`, keyed by this (system, model).
+pub fn persist_multi_gpu_winner(mode: &str) -> anyhow::Result<()> {
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping multi_gpu_mode persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    tuning.multi_gpu_mode = Some(mode.to_string());
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    println!(
+        "saved multi_gpu_mode winner to {}",
+        cache_path_for(&cache_dir, &key).display()
+    );
+    Ok(())
+}
+
 pub fn persist_moe_placement_winner(placement: &str, split_permille: u32) -> anyhow::Result<()> {
     let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
         tracing::warn!("no tuner cache dir resolvable; skipping moe_placement persistence");
@@ -10122,6 +10284,19 @@ pub fn persist_moe_placement_winner_to(
         .map(|d| format!("{}", d.as_secs()));
     save_cache(cache_dir, &tuning)?;
     Ok(cache_path_for(cache_dir, key))
+}
+
+/// The measured multi-GPU mode winner (`tune --multi-gpu`) from the tuner cache
+/// for this (system, model), or `None` when unmeasured / no cache dir. Consumed by
+/// `promote_memory_env_from_config` when `[inference].multi_gpu` is unset AND
+/// `[tuning].auto_apply_multi_gpu`.
+fn multi_gpu_mode_from_cache() -> Option<String> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let (key, _device) = rustllama_tuner::cache_context();
+    rustllama_tuner::load_cache(&cache_dir, &key)
+        .ok()
+        .flatten()?
+        .multi_gpu_mode
 }
 
 /// Consumer-side hook for kv_page_size — read the cached winner

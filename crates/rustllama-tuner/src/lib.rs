@@ -771,6 +771,13 @@ pub struct TuningResult {
     /// `[tuning].auto_apply_moe_placement`. `None` = no entry.
     #[serde(default)]
     pub moe_placement: Option<String>,
+    /// Measured multi-GPU mode winner from `rustllama tune --multi-gpu` — the
+    /// fastest of single-device (`"off"`), pipeline (`"pp"`), tensor (`"tp"`) at a
+    /// representative decode on THIS (system, model). Consumed at load when
+    /// `[inference].multi_gpu` is unset AND `[tuning].auto_apply_multi_gpu`. `None` =
+    /// no entry (never measured, or <2 GPUs so there was no choice).
+    #[serde(default)]
+    pub multi_gpu_mode: Option<String>,
     /// Winning CPU/GPU co-execution split for the routed-expert loop
     /// (q★-style), in permille of the top-K picks dispatched to the
     /// GPU while the rest run on CPU concurrently. `0` = co-execution
@@ -943,6 +950,7 @@ impl TuningResult {
             flash_v3_kv_tile: None,
             flash_v3_kv_tile_by_bucket: None,
             moe_placement: None,
+            multi_gpu_mode: None,
             moe_gpu_split_permille: None,
             speculative_mtp: None,
             winner_tree_widths: None,
