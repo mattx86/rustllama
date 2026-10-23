@@ -12523,12 +12523,36 @@ impl LlamaModel {
             // only path stays per-layer (`true, true`) since its host FFN needs
             // host hidden each layer.
             let cross_layer = dense_ffn_arg.is_some();
+            // PP-2b — pipeline stage device for this layer (CUDA-only; `None` off a
+            // multi-device pipeline split). At a STAGE BOUNDARY (device change) the
+            // cross-stage `hidden` round-trips host: the previous stage's last layer
+            // downloads it and this stage's first layer re-uploads it on the new
+            // GPU; WITHIN a stage residency is kept exactly as the single-device
+            // path. `None` (the common case) ⇒ `stage_device = 0`, byte-identical.
+            let stage_dev_opt = crate::accel::pipeline_layer_cuda_device(layer_idx);
+            let pipeline_stage = stage_dev_opt.is_some();
+            let stage_device = stage_dev_opt.unwrap_or(0);
+            let prev_stage_dev = if layer_idx == 0 {
+                None
+            } else {
+                crate::accel::pipeline_layer_cuda_device(layer_idx - 1)
+            };
+            let next_stage_dev = crate::accel::pipeline_layer_cuda_device(layer_idx + 1);
+            let is_stage_first = pipeline_stage && stage_dev_opt != prev_stage_dev;
+            let is_stage_last = pipeline_stage && stage_dev_opt != next_stage_dev;
+            // A new stage's first layer must re-upload `hidden` (it is not resident
+            // on the new device yet), regardless of the previous layer's residency.
+            if is_stage_first {
+                hidden_dev_resident = false;
+            }
             let upload_hidden = if cross_layer {
                 !hidden_dev_resident
             } else {
                 true
             };
-            let download_hidden = !cross_layer;
+            // The last layer of a stage must bring `hidden` back to host so the next
+            // stage can upload it on its own GPU.
+            let download_hidden = !cross_layer || is_stage_last;
             // Feature 1a (SYCL sibling of the #2 CUDA block): set when the SYCL
             // device-resident block handled this layer. It is attention-only and
             // per-layer (no cross-layer hidden residency), so it must NOT set
@@ -12654,6 +12678,8 @@ impl LlamaModel {
                             dev_softcap,
                             upload_hidden,
                             download_hidden,
+                            stage_device,
+                            pipeline_stage,
                         );
                         attn_ran = a_eager;
                         ffn_ran = f_eager;
@@ -12767,12 +12793,16 @@ impl LlamaModel {
                 // it was downloaded, so host is authoritative. The SYCL + MLX
                 // blocks are always per-layer, so they never keep hidden
                 // resident.
-                hidden_dev_resident = cross_layer && !device_attn_is_sycl && !device_attn_is_mlx;
+                // PP-2b: a stage's LAST layer downloaded `hidden` to host for the
+                // next stage, so it is no longer resident.
+                hidden_dev_resident =
+                    cross_layer && !device_attn_is_sycl && !device_attn_is_mlx && !is_stage_last;
             } else if hidden_dev_resident {
                 // The device path declined this layer but the slab holds the
                 // current hidden (a prior dense layer left it resident); refresh
-                // the host copy before the host attention/FFN path runs.
-                crate::accel::fetch_resident_hidden_cuda_f32(&mut hidden, d);
+                // the host copy before the host attention/FFN path runs. Under a
+                // pipeline split the resident copy is on this stage's device.
+                crate::accel::fetch_resident_hidden_cuda_f32(&mut hidden, d, stage_device);
                 hidden_dev_resident = false;
             }
             if !device_attn {
@@ -13959,8 +13989,11 @@ impl LlamaModel {
         // #2 Phase 2: drain the cross-layer-resident hidden back to the host once
         // the layer loop is done (the dense device path kept it on device across
         // layers), so the final norm + LM head below read the current state.
+        // PP-2b: under a pipeline split the last layer is always a stage boundary,
+        // so it already downloaded `hidden` (`hidden_dev_resident == false` here) —
+        // this drain is reached only on the single-device path (device 0).
         if hidden_dev_resident {
-            crate::accel::fetch_resident_hidden_cuda_f32(&mut hidden, d);
+            crate::accel::fetch_resident_hidden_cuda_f32(&mut hidden, d, 0);
         }
 
         // ---- output norm + LM head ----

@@ -2060,6 +2060,22 @@ pub fn pipeline_active() -> bool {
     PIPELINE_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// PP-2b — the CUDA device index running pipeline-stage layer `layer_idx`, or
+/// `None` when no multi-device pipeline plan is active OR this layer's stage isn't
+/// a CUDA device (the pipeline stage split is CUDA today). The decode forward reads
+/// this to run a stage's device-resident attention block on THAT GPU and to detect
+/// stage boundaries (device change ⇒ host round-trip of `hidden`). `None` ⇒ the
+/// single-device / host path (default-device residency), byte-identical on 1 GPU.
+pub fn pipeline_layer_cuda_device(layer_idx: usize) -> Option<u32> {
+    if !pipeline_active() {
+        return None;
+    }
+    match multi_gpu_plan()?.layer_device(layer_idx) {
+        Some(t) if t.backend == GpuBackend::Cuda => Some(t.device_index),
+        _ => None,
+    }
+}
+
 /// Snapshot the installed plan (cheap `Arc` clone) for the dispatch branch.
 /// Returns `None` (without taking the lock) in the common no-plan case.
 #[inline]
@@ -11151,8 +11167,20 @@ pub fn try_decode_attn_block_cuda_f32(
     // ⇒ leave it resident for the next layer. Per-layer default is `(true, true)`.
     upload_hidden: bool,
     download_hidden: bool,
+    // PP-2b — the CUDA device this layer runs on. `0` = the default device,
+    // BYTE-IDENTICAL to the pre-PP-2b path (`cuda_cache_for(0)` delegates to
+    // `cuda_cache()`). Under a pipeline split, a stage's layers pass their stage's
+    // device so the block runs device-resident on THAT GPU (per-device KV mirror +
+    // hidden residency live in that device's `CudaMatvecCache`).
+    stage_device: u32,
+    // PP-2b — set only on the pipeline-stage path, which BYPASSES the perf-only
+    // `dev_attn_enabled()` gate: the block is bit-exact (that gate is purely a
+    // perf A/B), and under a pipeline split we run it for cross-stage residency,
+    // not because it measured faster. `false` on the normal single-device path
+    // (the gate is honored → unchanged).
+    pipeline: bool,
 ) -> (bool, bool) {
-    if !dev_attn_enabled() || !cuda_active() || has_qkv_bias {
+    if (!pipeline && !dev_attn_enabled()) || !cuda_active() || has_qkv_bias {
         return (false, false);
     }
     let (Some(kq), Some(kk), Some(kv), Some(ko)) = (
@@ -11193,7 +11221,8 @@ pub fn try_decode_attn_block_cuda_f32(
         ))
     });
     let ffn_requested = ffn_dev.is_some();
-    let Some(cache) = cuda_cache() else {
+    // PP-2b: route to the stage's device cache (`cuda_cache_for(0)` == `cuda_cache()`).
+    let Some(cache) = cuda_cache_for(stage_device) else {
         return (false, false);
     };
     let Ok(mut g) = cache.lock() else {
@@ -12302,11 +12331,14 @@ pub fn try_decode_attn_block_mlx_f32(
 /// to the host path mid-stream (so the stale host `hidden` is refreshed first).
 /// Returns false (caller keeps the host `hidden` it has) when CUDA is inactive,
 /// the cache is unavailable, or the copy failed.
-pub fn fetch_resident_hidden_cuda_f32(hidden: &mut [f32], d_model: usize) -> bool {
+pub fn fetch_resident_hidden_cuda_f32(hidden: &mut [f32], d_model: usize, device: u32) -> bool {
     if !cuda_active() {
         return false;
     }
-    let Some(cache) = cuda_cache() else {
+    // PP-2b: fetch from the stage's device cache (`cuda_cache_for(0)` == the
+    // default `cuda_cache()`), since under a pipeline split the resident `hidden`
+    // lives on that stage's GPU, not necessarily device 0.
+    let Some(cache) = cuda_cache_for(device) else {
         return false;
     };
     let Ok(g) = cache.lock() else {
