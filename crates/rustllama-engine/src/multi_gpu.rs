@@ -343,17 +343,54 @@ fn layer_index_of(name: &str) -> Option<usize> {
     rest[..end].parse::<usize>().ok()
 }
 
-/// PP-1 — stage-based pipeline placement: split the transformer layers into
+/// PP-3 — greedy contiguous stage fill: assign each layer to a GPU stage,
+/// charging the layer's weight bytes PLUS its per-layer KV-mirror reserve against
+/// the stage's budget, advancing to the next GPU when the current one is full (the
+/// LAST GPU absorbs any remainder). Returns the per-layer stage index + whether the
+/// model overflowed even the last stage. PURE (no device queries) so the stage-split
+/// arithmetic unit-tests without multi-GPU HW. `per_layer_kv_bytes == 0` reproduces
+/// the pre-PP-3 weights-only fill exactly.
+fn fill_stages(
+    layer_bytes: &[u64],
+    gpu_budgets: &[u64],
+    per_layer_kv_bytes: u64,
+) -> (Vec<usize>, bool) {
+    let mut stage_of: Vec<usize> = Vec::with_capacity(layer_bytes.len());
+    let mut dev_i = 0usize;
+    let mut used: u64 = 0;
+    let mut overflow = false;
+    for &lb in layer_bytes {
+        // Each layer costs its weights AND the KV its attention will keep resident
+        // on this stage's GPU — so a stage boundary reserves VRAM for both.
+        let cost = lb.saturating_add(per_layer_kv_bytes);
+        while dev_i + 1 < gpu_budgets.len() && used.saturating_add(cost) > gpu_budgets[dev_i] {
+            dev_i += 1;
+            used = 0;
+        }
+        used = used.saturating_add(cost);
+        if dev_i + 1 == gpu_budgets.len() && used > gpu_budgets[dev_i] {
+            overflow = true;
+        }
+        stage_of.push(dev_i);
+    }
+    (stage_of, overflow)
+}
+
+/// PP-1/PP-3 — stage-based pipeline placement: split the transformer layers into
 /// CONTIGUOUS ranges, one range ("stage") per GPU, by per-device VRAM budget, so a
 /// model that doesn't fit one GPU runs across N. Fills both `by_layer` (per-layer
 /// device, for the forward's P2P handoff) and `assignments` (per-tensor, for the
-/// matvec dispatch). Returns `None` on <2 usable GPUs (the single-GPU path is
-/// unchanged) or when perf tiers are unavailable. `placement_error` when the model
-/// overflows even all GPUs (caller refuses). WRITE-BLIND (needs real multi-GPU HW).
+/// matvec dispatch). `per_layer_kv_bytes` (PP-3, caller-computed from ctx *
+/// n_kv_heads * head_dim * kv_dtype) reserves each stage's KV-mirror headroom on
+/// its own GPU so the split is VRAM-correct; `0` = the pre-PP-3 weights-only fill.
+/// Returns `None` on <2 usable GPUs (the single-GPU path is unchanged) or when perf
+/// tiers are unavailable. `placement_error` when the model overflows even all GPUs
+/// (caller refuses). WRITE-BLIND (needs real multi-GPU HW).
 pub fn plan_pipeline_stages(
     weights: &LlamaWeights,
     per_device_perf: &HashMap<String, f32>,
     opts: &AutoPlacementOpts,
+    per_layer_kv_bytes: u64,
 ) -> Option<HeatPlan> {
     let tiers = build_tiers(per_device_perf, opts, false)?;
     // GPU tiers in the order build_tiers emits them (CUDA by index, then SYCL) —
@@ -383,24 +420,15 @@ pub fn plan_pipeline_stages(
         return None;
     }
 
-    // Greedy contiguous fill: accumulate layers onto the current GPU until its
-    // budget is exceeded, then advance; the LAST GPU takes whatever remains.
-    let mut by_layer: Vec<DeviceTarget> = Vec::with_capacity(n_layers);
-    let mut dev_i = 0usize;
-    let mut used: u64 = 0;
-    let mut overflow = false;
-    for l in 0..n_layers {
-        let lb = *layer_bytes.get(&l).unwrap_or(&0);
-        while dev_i + 1 < gpu_tiers.len() && used + lb > gpu_tiers[dev_i].1 {
-            dev_i += 1;
-            used = 0;
-        }
-        used += lb;
-        if dev_i + 1 == gpu_tiers.len() && used > gpu_tiers[dev_i].1 {
-            overflow = true;
-        }
-        by_layer.push(gpu_tiers[dev_i].0);
-    }
+    // Greedy contiguous fill (PP-3: weights + per-stage KV reserve). Dense
+    // per-layer weight bytes (a missing layer ⇒ 0) + the per-device budgets feed
+    // the pure `fill_stages` helper; map its stage indices back to devices.
+    let layer_bytes_vec: Vec<u64> = (0..n_layers)
+        .map(|l| *layer_bytes.get(&l).unwrap_or(&0))
+        .collect();
+    let gpu_budgets: Vec<u64> = gpu_tiers.iter().map(|(_, b)| *b).collect();
+    let (stage_of, overflow) = fill_stages(&layer_bytes_vec, &gpu_budgets, per_layer_kv_bytes);
+    let by_layer: Vec<DeviceTarget> = stage_of.iter().map(|&s| gpu_tiers[s].0).collect();
 
     let mut assignments: HashMap<String, TierKind> = HashMap::new();
     for ti in &tensors {
@@ -1058,5 +1086,49 @@ mod tests {
             "hottest attn tensor should be on the faster GPU (idx 1)"
         );
         assert_eq!(plan.attn_device.unwrap().device_index, 1);
+    }
+
+    #[test]
+    fn pp3_fill_stages_weights_only_matches_legacy_greedy() {
+        // 4 layers of 100 B each, two GPUs with a 250 B budget. Weights-only
+        // (per_layer_kv_bytes = 0) reproduces the pre-PP-3 fill: GPU0 takes
+        // layers 0..=1 (200 B <= 250), GPU1 takes 2..=3.
+        let (stage_of, overflow) = fill_stages(&[100, 100, 100, 100], &[250, 250], 0);
+        assert_eq!(stage_of, vec![0, 0, 1, 1]);
+        assert!(!overflow);
+    }
+
+    #[test]
+    fn pp3_kv_reserve_shifts_stage_boundary_earlier() {
+        // 4×100 B weights, GPU0 budget 250 B, GPU1 budget 600 B (big enough to hold
+        // the remainder so this test isolates the boundary shift, not overflow).
+        // Weights-only (kv=0): GPU0 fits layers 0..=1 (200 B) ⇒ boundary after L1.
+        let (weights_only, of0) = fill_stages(&[100, 100, 100, 100], &[250, 600], 0);
+        assert_eq!(weights_only, vec![0, 0, 1, 1]);
+        assert!(!of0);
+        // With a 60 B KV reserve per layer, cost = 160 B, so GPU0 fits only ONE
+        // layer (160 <= 250, 320 > 250 ⇒ advance). The KV reserve pulls the split
+        // earlier — from after L1 to after L0.
+        let (kv_aware, of1) = fill_stages(&[100, 100, 100, 100], &[250, 600], 60);
+        assert_eq!(
+            kv_aware,
+            vec![0, 1, 1, 1],
+            "KV reserve pulls the split earlier"
+        );
+        assert!(
+            !of1,
+            "3 remaining layers × 160 B = 480 B fit GPU1's 600 B budget"
+        );
+    }
+
+    #[test]
+    fn pp3_last_stage_absorbs_remainder_and_flags_overflow() {
+        // The last GPU takes whatever remains even past its budget, and the
+        // overflow flag fires so the caller can refuse. 3 layers × 160 B all land
+        // on the single remaining stage once GPU0 is full; GPU1's 200 B budget is
+        // exceeded ⇒ overflow.
+        let (stage_of, overflow) = fill_stages(&[100, 100, 100], &[250, 200], 60);
+        assert_eq!(stage_of, vec![0, 1, 1]);
+        assert!(overflow, "GPU1 over budget ⇒ overflow flagged");
     }
 }

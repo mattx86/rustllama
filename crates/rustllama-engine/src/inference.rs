@@ -4904,10 +4904,22 @@ impl ContiguousEngine {
             .map(|v| v.eq_ignore_ascii_case("pp"))
             .unwrap_or(false)
         {
+            // PP-3: per-layer KV-mirror reserve (K+V × n_kv_heads × ctx × head_dim ×
+            // kv_dtype bytes/elem) so each stage leaves VRAM headroom on its own GPU
+            // for the KV its layers keep resident — the same geometry the MoE tier's
+            // KV-mirror margin uses, divided to a single layer.
+            let per_layer_kv_bytes: u64 = {
+                let bpe = (self.kv_dtype().approx_bits_per_element() / 8.0) as f64;
+                (2.0 * self.model.cfg.n_kv_heads as f64
+                    * self.max_ctx as f64
+                    * self.model.cfg.head_dim as f64
+                    * bpe) as u64
+            };
             if let Some(hp) = crate::multi_gpu::plan_pipeline_stages(
                 &self.model.weights,
                 &per_device_perf,
                 &effective,
+                per_layer_kv_bytes,
             ) {
                 let total = hp.by_layer.len() as u32;
                 let d = crate::placement_auto::AutoPlacementDecision {
