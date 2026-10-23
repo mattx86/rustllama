@@ -2478,6 +2478,154 @@ pub fn tp_row_self_check() -> Option<(bool, f32)> {
     tp_row_parity(&[0, 0])
 }
 
+/// TP-3 — HEAD-parallel PREFILL attention: split the Q-heads (and GQA-matched
+/// KV-heads) into `groups` contiguous head-groups, run flash-prefill per group, and
+/// CONCATENATE the per-group outputs. Each head attends only within itself, so the
+/// split + concat equals the whole attention bit-for-bit (an all-gather recombine,
+/// NO reduce). KV-heads are contiguous (head-major `[n_kv_heads, max_ctx,
+/// head_dim]`) so each group's K/V is a byte-slice; Q/out are head-STRIDED within
+/// each token (`[n_new, n_heads, head_dim]`), so each group's Q is gathered + its
+/// out scattered per token. All groups run on device 0 here (the self-check); the
+/// real per-device head shard lands with the device-resident attention path (PP-2b)
+/// + TP-1 `all_gather`. Returns false on a mis-aligned split or any kernel miss.
+#[allow(clippy::too_many_arguments)]
+fn attn_head_split_prefill(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    window: u32,
+    softcap: f32,
+    groups: usize,
+) -> bool {
+    if groups < 2 || n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_new == 0 {
+        return false;
+    }
+    // The split must land on KV-head AND Q-head boundaries so each group keeps the
+    // model's GQA ratio (q_heads/kv_heads) intact — else a group's local head→kv
+    // mapping would differ from the whole and the result would diverge.
+    if n_heads % n_kv_heads != 0 || n_kv_heads % groups != 0 || n_heads % groups != 0 {
+        return false;
+    }
+    let kvh_g = n_kv_heads / groups; // kv-heads per group (contiguous slice)
+    let qh_g = n_heads / groups; // q-heads per group
+    let need_kv_g = kvh_g * max_ctx * head_dim;
+    for g in 0..groups {
+        // K/V: contiguous head-major block for this group's kv-heads.
+        let kv_off = g * need_kv_g;
+        let k_g = &k[kv_off..kv_off + need_kv_g];
+        let v_g = &v[kv_off..kv_off + need_kv_g];
+        // Q gather: this group's qh_g heads sit at head offset g*qh_g within each
+        // token's n_heads block.
+        let mut q_g = vec![0f32; n_new * qh_g * head_dim];
+        for (t, row) in q_g.chunks_mut(qh_g * head_dim).enumerate() {
+            let so = (t * n_heads + g * qh_g) * head_dim;
+            row.copy_from_slice(&q[so..so + qh_g * head_dim]);
+        }
+        let mut out_g = vec![0f32; n_new * qh_g * head_dim];
+        if !try_flash_attn_prefill_cuda_f32(
+            &q_g,
+            k_g,
+            v_g,
+            &mut out_g,
+            qh_g,
+            kvh_g,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
+        ) {
+            return false;
+        }
+        // Scatter this group's output back to its head offset per token.
+        for (t, row) in out_g.chunks(qh_g * head_dim).enumerate() {
+            let dst_off = (t * n_heads + g * qh_g) * head_dim;
+            out[dst_off..dst_off + qh_g * head_dim].copy_from_slice(row);
+        }
+    }
+    true
+}
+
+/// TP-3 write-blind parity self-check (CUDA): head-parallel PREFILL attention.
+/// Splits the Q-heads (and GQA-matched KV-heads) into 2 groups, runs flash-prefill
+/// per group (both on device 0 here), concatenates (the all-gather recombine), and
+/// grades vs the WHOLE single-call flash-prefill. Each head is independent, so the
+/// split is bit-exact — this validates the head-split extraction + concat ALGEBRA
+/// + plumbing on one GPU; the real cross-device head shard is confirmed on 2+ GPU
+/// HW. `None` off CUDA. Read by `doctor --cuda-parity attn:head_parallel`.
+pub fn attn_head_parallel_self_check() -> Option<(bool, f32)> {
+    if !cuda_active() {
+        return None;
+    }
+    // The flash kernel is gated by `gpu_active_for_current_layer()`; pin layer 0 so
+    // the probe runs regardless of any layer TLS a prior probe left on this thread
+    // (n_gpu_layers defaults to u32::MAX, so layer 0 is GPU-active).
+    set_current_layer_idx(0);
+    // Small GQA attention: 8 Q-heads, 4 KV-heads (gqa=2), head_dim 64, 16 tokens.
+    let (n_heads, n_kv_heads, head_dim) = (8usize, 4usize, 64usize);
+    let (max_ctx, kv_len_base, n_new) = (32usize, 0usize, 16usize);
+    let need_q = n_new * n_heads * head_dim;
+    let need_kv = n_kv_heads * max_ctx * head_dim;
+    let q: Vec<f32> = (0..need_q)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+        .collect();
+    let k: Vec<f32> = (0..need_kv)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.03)
+        .collect();
+    let v: Vec<f32> = (0..need_kv)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.02)
+        .collect();
+    let mut whole = vec![0f32; need_q];
+    if !try_flash_attn_prefill_cuda_f32(
+        &q,
+        &k,
+        &v,
+        &mut whole,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        0,
+        0.0,
+    ) {
+        return None;
+    }
+    let mut split = vec![0f32; need_q];
+    if !attn_head_split_prefill(
+        &q,
+        &k,
+        &v,
+        &mut split,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        0,
+        0.0,
+        2,
+    ) {
+        return None;
+    }
+    let worst = whole
+        .iter()
+        .zip(&split)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    Some((worst <= 1e-4, worst))
+}
+
 /// Single-row packed matvec on a SPECIFIC CUDA device (Phase 4 cross-GPU
 /// routing). Mirrors [`try_matvec_packed_cuda`] but targets `device_index`'s
 /// own resident cache. `false` on any miss so the caller falls through.

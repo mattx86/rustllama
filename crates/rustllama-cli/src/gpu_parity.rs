@@ -9507,6 +9507,33 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- TP-3: head-parallel attention. The Q-heads (+ GQA-matched KV-heads) are
+    // split into groups, flash-prefill runs per group, and the concatenated outputs
+    // are graded vs the WHOLE single-call attention. Each head is independent, so
+    // the split is bit-exact; on one GPU the groups run on device 0 → validates the
+    // head-split + concat ALGEBRA. Real cross-device head shard on multi-GPU HW.
+    // WRITE-BLIND.
+    {
+        let name = rustllama_tuner::VERDICT_ATTN_HEAD_PARALLEL;
+        match rustllama_models::accel::attn_head_parallel_self_check() {
+            None => {
+                cu_emit(name, "SKIP", "no-cuda-device");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+            Some((passed, worst)) => {
+                let key: &'static str = if passed { "OK" } else { "MISCOMPUTE" };
+                *counts.entry(key).or_default() += 1;
+                cu_emit(
+                    name,
+                    key,
+                    &format!(
+                        "worst_abs={worst:.5} (8/4-head → 2 groups vs whole; cross-device shard on multi-GPU HW)"
+                    ),
+                );
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

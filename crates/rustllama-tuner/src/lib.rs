@@ -439,6 +439,15 @@ pub const VERDICT_COLLECTIVE_ALL_GATHER: &str = "collective:all_gather";
 /// cross-device split is confirmed on 2+ GPU HW. The complement of the column
 /// split (output-row partition); the standard TP choice for O- / down-proj.
 pub const VERDICT_MATVEC_TP_ROW: &str = "matvec:tp_row";
+/// TP-3 (multi-GPU) — head-parallel attention recombines correctly. Graded by
+/// `doctor --cuda-parity attn:head_parallel`: the Q-heads (and GQA-matched
+/// KV-heads) are split into groups, flash-prefill runs per group, and the
+/// concatenated per-head outputs are checked against the WHOLE single-call flash
+/// attention. Each head attends only within itself, so the split + concat (an
+/// all-gather recombine, no reduce) is bit-exact; on a single-GPU box the groups
+/// run on device 0, validating the head-split + concat ALGEBRA + plumbing — the
+/// real cross-device head shard is confirmed on 2+ GPU HW.
+pub const VERDICT_ATTN_HEAD_PARALLEL: &str = "attn:head_parallel";
 
 // --- P6-fusions: the three forward-path fusion verdicts ----------------
 //
