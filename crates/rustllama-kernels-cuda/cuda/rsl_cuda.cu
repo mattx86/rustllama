@@ -1469,6 +1469,117 @@ extern "C" int rsl_cuda_gemm_q8_0_f32(rsl_cuda_stream *s, const void *w,
 }
 
 // ============================================================
+// C1 — resident-state single-token Gated-DeltaNet recurrence step (decode).
+// ONE block per V-head; blockDim.x == head_v_dim (== head_qk_dim for the target
+// qwen35 hybrids; the host wrapper declines when QK != VD). State S[h] is
+// [head_qk_dim x head_v_dim] row-major and RESIDENT in device memory ACROSS
+// tokens (the caller owns `state_dev`; this kernel reads + updates it in place,
+// with NO per-token H2D/D2H of S — the recurrence is memory-bound on S at
+// ~2 MiB/head, so running it at device bandwidth with S resident is the win vs
+// the CPU per-head path). Mirrors the CPU fused 2-pass `delta_rule_step` (D1):
+//   Pass A: S *= exp(g); v_tilde = S_decayed^T @ k ; v_tilde = (v - v_tilde)*beta
+//   Pass B: S += outer(k, v_tilde); out = q^T @ S_updated
+// plus the per-head pre-ops the CPU Ssm arm does (l2norm q, l2norm k,
+// q *= 1/sqrt(QK)) and the post gated_rmsnorm (out = rmsnorm(out)*ssm_norm *
+// silu(gate)). Thread j owns output column j of S, so Pass A/B parallelize over
+// j with each thread sweeping the contraction dim i; k[i]/q[i] broadcast from
+// shared; l2norm/rmsnorm use a block reduction (QK==VD ⇒ one thread per element).
+// Uses exact sqrtf (not rsqrtf) to track the CPU reference within f32 tolerance.
+__device__ __forceinline__ float rsl_dn_blk_sum(float v, float *red) {
+    int t = threadIdx.x;
+    red[t] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        __syncthreads();
+    }
+    float r = red[0];
+    __syncthreads();
+    return r;
+}
+
+__global__ void delta_net_step_f32_kernel(
+    const float *qkv_conv, const float *gate, const float *decay, const float *beta,
+    const float *ssm_norm, float *state, float *out, int n_v_heads, int n_qk_heads,
+    int QK, int VD, int q_block, int k_block, float rms_eps) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    int j = threadIdx.x; // 0..VD-1 ; blockDim.x == VD == QK
+    extern __shared__ float sh[];
+    float *qsh = sh;        // QK
+    float *ksh = qsh + QK;  // QK
+    float *red = ksh + QK;  // VD (reduction scratch)
+
+    int kh = h % n_qk_heads;
+    const float *qsrc = qkv_conv + (size_t)kh * QK;
+    const float *ksrc = qkv_conv + (size_t)q_block + (size_t)kh * QK;
+    const float *vsrc = qkv_conv + (size_t)q_block + (size_t)k_block + (size_t)h * VD;
+    float *Sh = state + (size_t)h * QK * VD;
+
+    float qj = qsrc[j];
+    float kj = ksrc[j];
+    // l2norm(q), l2norm(k) (eps 1e-6, matching the CPU l2norm_f32_inplace), then
+    // q *= 1/sqrt(QK) (the llama.cpp delta-net q pre-scale).
+    float qn = rsl_dn_blk_sum(qj * qj, red);
+    float kn = rsl_dn_blk_sum(kj * kj, red);
+    float q_scale = 1.0f / sqrtf((float)QK);
+    qj = qj * (1.0f / sqrtf(qn + 1e-6f)) * q_scale;
+    kj = kj * (1.0f / sqrtf(kn + 1e-6f));
+    qsh[j] = qj;
+    ksh[j] = kj;
+    __syncthreads();
+
+    float dexp = expf(decay[h]);
+    float b = beta[h];
+    float vj = vsrc[j];
+
+    // Pass A: decay each row in place, accumulate v_tilde[j] = S_decayed^T @ k.
+    float vt = 0.0f;
+    for (int i = 0; i < QK; ++i) {
+        float s = Sh[(size_t)i * VD + j] * dexp;
+        Sh[(size_t)i * VD + j] = s;
+        vt += s * ksh[i];
+    }
+    vt = (vj - vt) * b;
+
+    // Pass B: rank-1 update S[i][j] += k[i]*v_tilde[j], accumulate out[j] = q^T @ S.
+    float oacc = 0.0f;
+    for (int i = 0; i < QK; ++i) {
+        float s = Sh[(size_t)i * VD + j] + ksh[i] * vt;
+        Sh[(size_t)i * VD + j] = s;
+        oacc += qsh[i] * s;
+    }
+
+    // gated_rmsnorm(out) = out * (1/sqrt(mean(out^2)+eps)) * ssm_norm * silu(gate).
+    float ms = rsl_dn_blk_sum(oacc * oacc, red) / (float)VD;
+    float normed = oacc * (1.0f / sqrtf(ms + rms_eps)) * ssm_norm[j];
+    float gj = gate[(size_t)h * VD + j];
+    float sg = gj / (1.0f + expf(-gj)); // silu
+    out[(size_t)h * VD + j] = normed * sg;
+}
+
+// Thin launch wrapper: ALL pointers are DEVICE pointers (the Rust CudaDeltaNetCache
+// keeps `state_dev` resident across tokens and uploads the small per-token I/O into
+// its own device scratch, so this does no H2D/D2H). Declines (nonzero) when
+// QK != VD or VD out of range, so the caller falls back to the CPU recurrence.
+extern "C" int rsl_cuda_delta_net_step_f32(
+    rsl_cuda_stream *s, const float *qkv_conv_dev, const float *gate_dev,
+    const float *decay_dev, const float *beta_dev, const float *ssm_norm_dev,
+    float *state_dev, float *out_dev, int n_v_heads, int n_qk_heads, int QK, int VD,
+    int q_block, int k_block, float rms_eps) {
+    if (!s || !qkv_conv_dev || !gate_dev || !decay_dev || !beta_dev || !ssm_norm_dev ||
+        !state_dev || !out_dev || n_v_heads <= 0 || n_qk_heads <= 0 || QK != VD ||
+        VD <= 0 || VD > 1024 || (n_v_heads % n_qk_heads) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    size_t shmem = (size_t)(2 * QK + VD) * sizeof(float);
+    delta_net_step_f32_kernel<<<(unsigned)n_v_heads, (unsigned)VD, shmem, s->stream>>>(
+        qkv_conv_dev, gate_dev, decay_dev, beta_dev, ssm_norm_dev, state_dev, out_dev,
+        n_v_heads, n_qk_heads, QK, VD, q_block, k_block, rms_eps);
+    return rsl_cuda_check("rsl_cuda_delta_net_step_f32");
+}
+
+// ============================================================
 // Q4_K prefill GEMM — Phase 2: int8 TENSOR CORES (W8A8). Same 64x64/BK=32 tiling
 // as the f32 GEMM, but the inner product is the s8 tensor-core MMA
 // (nvcuda::wmma 16x16x16, legal on sm_72+ — the whole release arch list). LOSSY:

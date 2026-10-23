@@ -804,6 +804,22 @@ fn build_delta_net_cache(
     ))
 }
 
+/// C1: snapshot the DeltaNet recurrent state, first draining any resident GPU
+/// state back to host so the snapshot captures the CURRENT state (the resident
+/// GPU decode step leaves host behind on the hot path). Used at every save point
+/// — speculative/beam replay bases AND prefix-anchor inserts — so a rollback or a
+/// reused anchor never restores a stale pre-GPU-step state. No-op off CUDA / when
+/// the GPU DeltaNet step is disabled.
+#[inline]
+fn dn_snapshot_synced(
+    dn: &mut Option<rustllama_models::llama_arch::DeltaNetCache>,
+) -> Option<rustllama_models::llama_arch::DeltaNetSnapshot> {
+    dn.as_mut().map(|d| {
+        d.sync_from_device();
+        d.snapshot()
+    })
+}
+
 /// Per-layer KV keep-mask for sparse contiguous allocation (memory
 /// reclaim): hybrid models keep only the full-attention layers the
 /// main forward actually runs — DeltaNet layers never write KV, and
@@ -985,8 +1001,12 @@ impl EngineState {
             // current conversation stays warm if a different thread's
             // request lands in between.
             if self.last_ids.len() >= PREFIX_REUSE_MIN_TOKENS && kv.seq_len == self.last_ids.len() {
-                if let Some(dn) = self.delta_net_cache.as_ref() {
+                if self.delta_net_cache.is_some() {
+                    // C1: drain the resident GPU DeltaNet state to host so the
+                    // captured anchor holds the CURRENT state, not a stale copy.
+                    self.delta_net_cache.as_mut().unwrap().sync_from_device();
                     let ids = self.last_ids.clone();
+                    let dn = self.delta_net_cache.as_ref().unwrap();
                     self.pool.snapshot_and_insert_hybrid(ids, kv, dn);
                 }
             }
@@ -1095,12 +1115,16 @@ impl EngineState {
                 if kv.has_ring_layers() || kv.mla.is_some() {
                     return;
                 }
-                match self.delta_net_cache.as_ref() {
-                    // Hybrid: a turn end is a semantic anchor —
-                    // capture KV + recurrent state together (Phase 5)
-                    // so later requests can restore to this boundary.
-                    Some(dn) => self.pool.snapshot_and_insert_hybrid(ids, kv, dn),
-                    None => self.pool.snapshot_and_insert(ids, kv),
+                // Hybrid: a turn end is a semantic anchor — capture KV +
+                // recurrent state together (Phase 5) so later requests can
+                // restore to this boundary. C1: drain the resident GPU DeltaNet
+                // state to host first so the anchor is current.
+                if self.delta_net_cache.is_some() {
+                    self.delta_net_cache.as_mut().unwrap().sync_from_device();
+                    let dn = self.delta_net_cache.as_ref().unwrap();
+                    self.pool.snapshot_and_insert_hybrid(ids, kv, dn);
+                } else {
+                    self.pool.snapshot_and_insert(ids, kv);
                 }
             }
         }
@@ -6719,6 +6743,17 @@ fn run_chunked_prefill(
     mut should_stop: impl FnMut() -> bool,
 ) -> usize {
     let chunk = chunk_size.max(1);
+    // C1: a new prefill (re)writes the host recurrent state, so any resident GPU
+    // DeltaNet state carried over from a prior sequence on the shared device cache
+    // is stale — mark it so the first decode step re-uploads from host. Cheap
+    // no-op for dense models / off CUDA (the synced flags are empty / unused).
+    if model.weights.is_hybrid() {
+        // C1: the ContiguousEngine is single-sequence → allow the resident GPU
+        // DeltaNet step; the new prefill rewrote host state, so invalidate the
+        // resident device copy (the first decode step re-uploads).
+        rustllama_models::accel::dn_resident_set_active(true);
+        rustllama_models::accel::delta_net_invalidate_device();
+    }
     let mut idx = effective;
     // Batched chunk prefill (4a): non-hybrid models on the contiguous
     // backend forward each chunk through `LlamaModel::forward_prefill`
@@ -6944,7 +6979,7 @@ fn spec_prefill_and_forward(
     );
 
     let dn_replay_base = if want_dn_replay_base {
-        state.delta_net_cache.as_ref().map(|dn| dn.snapshot())
+        dn_snapshot_synced(&mut state.delta_net_cache)
     } else {
         None
     };
@@ -7136,7 +7171,7 @@ fn verify_speculation_inner(
     // call [`verify_and_commit_speculation`] instead.
     let saved_seq_len = state.kv_backend.seq_len();
     let saved_last_ids = state.last_ids.clone();
-    let saved_dn = state.delta_net_cache.as_ref().map(|dn| dn.snapshot());
+    let saved_dn = dn_snapshot_synced(&mut state.delta_net_cache);
     let result = spec_prefill_and_forward(
         &model,
         &mut state,
@@ -7184,7 +7219,7 @@ fn score_continuations_inner(
     let mut state = state.lock().expect("state lock");
     let saved_seq_len = state.kv_backend.seq_len();
     let saved_last_ids = state.last_ids.clone();
-    let saved_dn = state.delta_net_cache.as_ref().map(|dn| dn.snapshot());
+    let saved_dn = dn_snapshot_synced(&mut state.delta_net_cache);
 
     let mut scores = Vec::with_capacity(options.len());
     for opt in options {
@@ -7250,7 +7285,7 @@ fn sequence_logprob_inner(
     let mut state = state.lock().expect("state lock");
     let saved_seq_len = state.kv_backend.seq_len();
     let saved_last_ids = state.last_ids.clone();
-    let saved_dn = state.delta_net_cache.as_ref().map(|dn| dn.snapshot());
+    let saved_dn = dn_snapshot_synced(&mut state.delta_net_cache);
 
     let res = spec_prefill_and_forward(
         &model,
@@ -7556,7 +7591,7 @@ fn mtp_round(
         // DeltaNet base snapshot BEFORE the forward (covers
         // `[0, base_pos)`) so a rejection can restore + replay, exactly
         // like `verify_and_commit_speculation`.
-        let dn_base = state.delta_net_cache.as_ref().map(|dn| dn.snapshot());
+        let dn_base = dn_snapshot_synced(&mut state.delta_net_cache);
         let mut two = vec![0f32; 2 * vocab];
         {
             let EngineState {
@@ -8254,7 +8289,7 @@ fn tree_mtp_round_hybrid(
     // DeltaNet state, so this snapshot is how the commit re-establishes a clean
     // starting point. Reset discipline: a fresh snapshot each round means a later
     // round / model reload can never reuse a stale per-node recurrent state.
-    let dn_tip = state.delta_net_cache.as_ref().map(|dn| dn.snapshot());
+    let dn_tip = dn_snapshot_synced(&mut state.delta_net_cache);
 
     // --- Recurrent tree verify forward: per-node logits via the DFS walk. ---
     let node_tokens: Vec<i32> = nodes.iter().map(|n| n.id as i32).collect();

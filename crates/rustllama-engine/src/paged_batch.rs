@@ -2765,6 +2765,10 @@ fn build_hybrid_slot_state(
         .hybrid_layers
         .as_ref()
         .expect("build_hybrid_slot_state called on a non-hybrid model — dispatch bug");
+    // C1: the paged engine interleaves MANY sequences through the shared per-layer
+    // device state, so the resident GPU DeltaNet step is incorrect here — force the
+    // CPU recurrence path (also drops any stale single-sequence device state).
+    rustllama_models::accel::dn_resident_set_active(false);
     let (mut kv, mut dn, prefilled) = match restored {
         Some((kv, dn, anchor_len)) => {
             debug_assert_eq!(

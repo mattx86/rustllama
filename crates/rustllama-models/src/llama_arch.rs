@@ -3307,6 +3307,21 @@ impl DeltaNetCache {
         for layer in self.layers.iter_mut() {
             layer.reset();
         }
+        // C1: host state was just zeroed → the resident GPU copy (if any) is stale.
+        crate::accel::delta_net_invalidate_device();
+    }
+
+    /// C1: drain the resident GPU DeltaNet state back into host `recurrent_state`
+    /// for every layer, so a subsequent [`snapshot`](Self::snapshot) / serialize
+    /// sees the current state. No-op off CUDA / when the GPU step is disabled or no
+    /// layer is device-live. Engines call this immediately before snapshotting a
+    /// hybrid anchor (the GPU decode step leaves host state behind on the hot path).
+    pub fn sync_from_device(&mut self) {
+        for (li, layer) in self.layers.iter_mut().enumerate() {
+            if !layer.recurrent_state.is_empty() {
+                crate::accel::delta_net_sync_to_host(li, &mut layer.recurrent_state);
+            }
+        }
     }
 
     /// Total bytes of recurrent state held by this cache. Feeds the
@@ -3345,6 +3360,9 @@ impl DeltaNetCache {
             live.conv_state.copy_from_slice(&src.conv_state);
             live.recurrent_state.copy_from_slice(&src.recurrent_state);
         }
+        // C1: host state was just overwritten from the anchor → the resident GPU
+        // copy (if any) is stale; the next GPU step re-uploads from host.
+        crate::accel::delta_net_invalidate_device();
     }
 }
 
@@ -8677,7 +8695,43 @@ impl LlamaModel {
                     } else {
                         vec![]
                     };
-                    if dump_dn {
+                    // C1: resident-state GPU DeltaNet step (verdict-gated, fail-
+                    // closed). Skipped while dumping (logs need the CPU head order).
+                    // On success the fused recurrence + l2norm/q-scale +
+                    // gated_rmsnorm ran on-device and `v_out_concat` is filled; the
+                    // device state S is updated in place (host `recurrent_state`
+                    // stays authoritative only until the next `delta_net_sync_to_host`).
+                    let mut gpu_step_done = false;
+                    if !dump_dn && crate::accel::delta_net_step_enabled() {
+                        let mut decay_all = vec![0.0f32; n_v_heads];
+                        for h in 0..n_v_heads {
+                            decay_all[h] = block.ssm_a[h]
+                                * delta_net_softplus(alpha[h] + block.ssm_dt_bias[h]);
+                        }
+                        // Reborrow the existing `&mut dn` (conv1d binding) immutably
+                        // for the upload; released before the parallel arm's
+                        // `recurrent_state.par_chunks_mut`.
+                        gpu_step_done = crate::accel::try_delta_net_step_cuda(
+                            li,
+                            &dn.recurrent_state,
+                            &qkv_conv,
+                            &gate_path,
+                            &decay_all,
+                            &beta,
+                            &block.ssm_norm,
+                            &mut v_out_concat,
+                            n_v_heads,
+                            n_qk_heads,
+                            head_qk_dim,
+                            head_v_dim,
+                            q_block_size,
+                            k_block_size,
+                            cfg.rms_eps,
+                        );
+                    }
+                    if gpu_step_done {
+                        // Recurrence ran on-device; `v_out_concat` is populated.
+                    } else if dump_dn {
                         // Debug-dump arm: keep the original serial loop so
                         // activation logs stay in deterministic head order.
                         for h in 0..n_v_heads {

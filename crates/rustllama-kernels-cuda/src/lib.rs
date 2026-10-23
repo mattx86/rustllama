@@ -186,6 +186,26 @@ extern "C" {
         n_bytes: u64,
     ) -> c_int;
     fn rsl_cuda_stream_sync(s: *mut RslCudaStreamRaw) -> c_int;
+    // C1 — resident-state single-token Gated-DeltaNet recurrence step. All pointers
+    // are DEVICE pointers; `state` is the RESIDENT per-layer S (caller-owned), the
+    // rest are the uploaded per-token I/O. Declines (nonzero) when qk != vd.
+    fn rsl_cuda_delta_net_step_f32(
+        s: *mut RslCudaStreamRaw,
+        qkv_conv: *const f32,
+        gate: *const f32,
+        decay: *const f32,
+        beta: *const f32,
+        ssm_norm: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        n_v_heads: c_int,
+        n_qk_heads: c_int,
+        qk: c_int,
+        vd: c_int,
+        q_block: c_int,
+        k_block: c_int,
+        rms_eps: f32,
+    ) -> c_int;
     fn rsl_cuda_graph_begin_capture(s: *mut RslCudaStreamRaw) -> c_int;
     fn rsl_cuda_graph_end_capture(s: *mut RslCudaStreamRaw, out_graph: *mut *mut c_void) -> c_int;
     fn rsl_cuda_graph_instantiate(graph: *mut c_void, out_exec: *mut *mut c_void) -> c_int;
@@ -3935,6 +3955,210 @@ impl Drop for RawDevBuf {
     fn drop(&mut self) {
         // SAFETY: ptr came from this stream's allocator; freed once.
         unsafe { rsl_cuda_free(self.raw_stream, self.ptr) };
+    }
+}
+
+#[inline]
+fn dn_f32_bytes(s: &[f32]) -> &[u8] {
+    // SAFETY: f32 has no padding/invalid bit-patterns as bytes; len is exact.
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+#[inline]
+fn dn_f32_bytes_mut(s: &mut [f32]) -> &mut [u8] {
+    // SAFETY: as above; exclusive borrow preserved.
+    unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, std::mem::size_of_val(s)) }
+}
+
+/// C1 — resident-state Gated-DeltaNet DECODE cache. Holds each SSM layer's
+/// recurrent state S (`n_v_heads * head_qk_dim * head_v_dim` f32) RESIDENT in
+/// device memory across decoded tokens + reusable per-token I/O scratch. The
+/// recurrence is memory-bound on S (~2 MiB/head), so keeping S resident and
+/// running the step at device bandwidth beats the CPU per-head path — but ONLY
+/// because S never leaves the device on the hot path. Host-authoritative
+/// coherence: the caller passes `upload_state = Some(host S)` on the FIRST step
+/// after any host write (prefill / restore / reset, tracked by the accel seam),
+/// and calls [`download_state`](Self::download_state) to refresh host S at the
+/// (rare) snapshot / serialize points. Reset on model load (drops all buffers).
+pub struct CudaDeltaNetCache {
+    stream: CudaStream,
+    states: Vec<Option<RawDevBuf>>, // per layer: [n_v_heads*qk*vd] f32, RESIDENT
+    d_qkv: Option<RawDevBuf>,
+    d_gate: Option<RawDevBuf>,
+    d_decay: Option<RawDevBuf>,
+    d_beta: Option<RawDevBuf>,
+    d_norm: Option<RawDevBuf>,
+    d_out: Option<RawDevBuf>,
+}
+
+// SAFETY: the raw device/stream pointers are only ever used behind the global
+// `Mutex<CudaDeltaNetCache>` (one thread at a time), exactly as `CudaMatvecCache`.
+unsafe impl Send for CudaDeltaNetCache {}
+
+impl CudaDeltaNetCache {
+    pub fn new(device_index: u32) -> Option<Self> {
+        Some(Self {
+            stream: CudaStream::create(device_index)?,
+            states: Vec::new(),
+            d_qkv: None,
+            d_gate: None,
+            d_decay: None,
+            d_beta: None,
+            d_norm: None,
+            d_out: None,
+        })
+    }
+
+    fn ensure_scratch(buf: &mut Option<RawDevBuf>, stream: &CudaStream, n_bytes: usize) -> bool {
+        if buf.as_ref().map_or(true, |b| b.cap_bytes < n_bytes) {
+            *buf = RawDevBuf::alloc(stream, n_bytes);
+        }
+        buf.is_some()
+    }
+
+    /// Ensure layer `li`'s resident state buffer exists (zeroed on first alloc).
+    fn ensure_state(&mut self, li: usize, elems: usize) -> bool {
+        if self.states.len() <= li {
+            self.states.resize_with(li + 1, || None);
+        }
+        let need = elems * 4;
+        if self.states[li]
+            .as_ref()
+            .map_or(true, |b| b.cap_bytes < need)
+        {
+            let mut b = match RawDevBuf::alloc(&self.stream, need) {
+                Some(b) => b,
+                None => return false,
+            };
+            if !b.upload(&vec![0u8; need]) {
+                return false;
+            }
+            self.states[li] = Some(b);
+        }
+        self.states[li].is_some()
+    }
+
+    /// One resident-state decode step for SSM layer `li`. `upload_state` is
+    /// `Some(host S)` when the device copy is stale and must be refreshed before
+    /// the step (None on the hot path). On success `out` holds v_out for all heads
+    /// and the device state is updated in place. Returns false (caller falls back
+    /// to the CPU recurrence) on any alloc/transfer/kernel miss or `qk != vd`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(
+        &mut self,
+        li: usize,
+        qkv_conv: &[f32],
+        gate: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        ssm_norm: &[f32],
+        out: &mut [f32],
+        upload_state: Option<&[f32]>,
+        n_v_heads: usize,
+        n_qk_heads: usize,
+        qk: usize,
+        vd: usize,
+        q_block: usize,
+        k_block: usize,
+        rms_eps: f32,
+    ) -> bool {
+        if qk != vd || n_qk_heads == 0 || n_v_heads == 0 || n_v_heads % n_qk_heads != 0 {
+            return false;
+        }
+        let state_elems = n_v_heads * qk * vd;
+        if out.len() != n_v_heads * vd {
+            return false;
+        }
+        if !self.ensure_state(li, state_elems) {
+            return false;
+        }
+        if let Some(hs) = upload_state {
+            if hs.len() != state_elems
+                || !self.states[li].as_mut().unwrap().upload(dn_f32_bytes(hs))
+            {
+                return false;
+            }
+        }
+        if !Self::ensure_scratch(
+            &mut self.d_qkv,
+            &self.stream,
+            std::mem::size_of_val(qkv_conv),
+        ) || !Self::ensure_scratch(&mut self.d_gate, &self.stream, std::mem::size_of_val(gate))
+            || !Self::ensure_scratch(
+                &mut self.d_decay,
+                &self.stream,
+                std::mem::size_of_val(decay),
+            )
+            || !Self::ensure_scratch(&mut self.d_beta, &self.stream, std::mem::size_of_val(beta))
+            || !Self::ensure_scratch(
+                &mut self.d_norm,
+                &self.stream,
+                std::mem::size_of_val(ssm_norm),
+            )
+            || !Self::ensure_scratch(&mut self.d_out, &self.stream, std::mem::size_of_val(out))
+        {
+            return false;
+        }
+        if !self.d_qkv.as_mut().unwrap().upload(dn_f32_bytes(qkv_conv))
+            || !self.d_gate.as_mut().unwrap().upload(dn_f32_bytes(gate))
+            || !self.d_decay.as_mut().unwrap().upload(dn_f32_bytes(decay))
+            || !self.d_beta.as_mut().unwrap().upload(dn_f32_bytes(beta))
+            || !self.d_norm.as_mut().unwrap().upload(dn_f32_bytes(ssm_norm))
+        {
+            return false;
+        }
+        // SAFETY: all pointers are live device allocations sized to the dims; the
+        // wrapper syncs (rsl_cuda_check) before returning, so the download below
+        // reads completed results.
+        let rc = unsafe {
+            rsl_cuda_delta_net_step_f32(
+                self.stream.raw(),
+                self.d_qkv.as_ref().unwrap().f32_ptr_at(0) as *const f32,
+                self.d_gate.as_ref().unwrap().f32_ptr_at(0) as *const f32,
+                self.d_decay.as_ref().unwrap().f32_ptr_at(0) as *const f32,
+                self.d_beta.as_ref().unwrap().f32_ptr_at(0) as *const f32,
+                self.d_norm.as_ref().unwrap().f32_ptr_at(0) as *const f32,
+                self.states[li].as_ref().unwrap().f32_ptr_at(0),
+                self.d_out.as_ref().unwrap().f32_ptr_at(0),
+                n_v_heads as c_int,
+                n_qk_heads as c_int,
+                qk as c_int,
+                vd as c_int,
+                q_block as c_int,
+                k_block as c_int,
+                rms_eps,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        self.d_out.as_ref().unwrap().download(dn_f32_bytes_mut(out))
+    }
+
+    /// D2H layer `li`'s resident state into `host` (snapshot / serialize). Returns
+    /// false when the layer has no resident buffer (nothing to sync).
+    pub fn download_state(&self, li: usize, host: &mut [f32]) -> bool {
+        match self.states.get(li).and_then(|o| o.as_ref()) {
+            Some(b) if b.cap_bytes >= std::mem::size_of_val(host) => {
+                b.download(dn_f32_bytes_mut(host))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether layer `li` currently holds a resident state buffer.
+    pub fn has_state(&self, li: usize) -> bool {
+        self.states.get(li).map(|o| o.is_some()).unwrap_or(false)
+    }
+
+    /// Drop all resident state + scratch (model load / device reset).
+    pub fn reset(&mut self) {
+        self.states.clear();
+        self.d_qkv = None;
+        self.d_gate = None;
+        self.d_decay = None;
+        self.d_beta = None;
+        self.d_norm = None;
+        self.d_out = None;
     }
 }
 

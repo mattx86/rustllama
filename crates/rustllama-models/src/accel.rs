@@ -102,6 +102,195 @@ fn cuda_cache() -> Option<&'static Mutex<ck::CudaMatvecCache>> {
         .as_ref()
 }
 
+// ===========================================================================
+// C1 — resident-state Gated-DeltaNet DECODE step (CUDA). The per-token recurrence
+// is memory-bound on the per-head state S (~2 MiB/head); running it at device
+// bandwidth with S kept RESIDENT in VRAM across tokens beats the CPU per-head
+// path — but only because S never leaves the device on the hot path. Fail-closed
+// behind the `ssm:delta_net_step` verdict; inert off CUDA. Coherence is
+// host-authoritative: `DN_SYNCED[li]` marks that the device S[li] is current (it
+// was uploaded this decode run). The FEW host-write points — prefill (the chunk
+// path), prefix-restore, model load — call `delta_net_invalidate_device()` so the
+// next step re-uploads; `delta_net_sync_to_host` drains the device S back to host
+// before a snapshot/serialize. WRITE-BLIND: the kernel is parity-probed, but the
+// MULTI-TOKEN + prefill-handoff + prefix-reuse coherence must be confirmed live on
+// the pod (the single-step probe can't catch a coherence bug).
+// ===========================================================================
+fn cuda_delta_net_cache() -> Option<&'static Mutex<ck::CudaDeltaNetCache>> {
+    static CACHE: OnceLock<Option<Mutex<ck::CudaDeltaNetCache>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if std::env::var("RUSTLLAMA_CUDA_DISPATCH")
+                .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            if ck::device_count() == 0 {
+                return None;
+            }
+            ck::CudaDeltaNetCache::new(0).map(Mutex::new)
+        })
+        .as_ref()
+}
+
+fn dn_synced() -> &'static Mutex<Vec<bool>> {
+    static S: OnceLock<Mutex<Vec<bool>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The resident-state GPU DeltaNet step maintains ONE sequence's state per layer
+/// in a shared device cache, so it is correct ONLY for a SINGLE-SEQUENCE decode
+/// (the ContiguousEngine). The paged / continuous-batching engine interleaves
+/// MANY sequences through the same per-layer state, so it must stay on the CPU
+/// path. This flag is set true by the ContiguousEngine prefill and false by the
+/// paged prefill (a server runs one engine, so the active engine's setting wins);
+/// default false ⇒ the step is off until a single-sequence prefill opts in.
+static DN_RESIDENT_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the resident GPU DeltaNet step as allowed (single-sequence decode) or not
+/// (paged multi-sequence). Called from each engine's prefill entry.
+pub fn dn_resident_set_active(on: bool) {
+    DN_RESIDENT_ACTIVE.store(on, std::sync::atomic::Ordering::Relaxed);
+    if !on {
+        // Switching to the multi-sequence engine: the shared device state is no
+        // longer a single sequence's — drop it so nothing stale lingers.
+        delta_net_invalidate_device();
+    }
+}
+
+/// Whether the resident-state GPU DeltaNet decode step is enabled: the
+/// `ssm:delta_net_step` verdict passed on-device AND CUDA is active (cached) AND
+/// the single-sequence engine is active (dynamic). Fail-closed; the env override
+/// `RUSTLLAMA_DELTA_NET_STEP` forces the cached half for the pre-verdict A/B.
+pub fn delta_net_step_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    let base =
+        *EN.get_or_init(
+            || match std::env::var("RUSTLLAMA_DELTA_NET_STEP").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => kernel_verdict(rustllama_tuner::VERDICT_SSM_DELTA_NET_STEP) && cuda_active(),
+            },
+        );
+    base && DN_RESIDENT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mark the device-resident DeltaNet state stale (next step for each layer
+/// re-uploads from host). Called at every host-side write of `recurrent_state`:
+/// the chunk prefill, a prefix-cache restore, and model load.
+pub fn delta_net_invalidate_device() {
+    if let Ok(mut g) = dn_synced().lock() {
+        for s in g.iter_mut() {
+            *s = false;
+        }
+    }
+}
+
+/// Drain layer `li`'s resident device state into host `recurrent_state` (before a
+/// snapshot / serialize). No-op when the device copy isn't live for `li`.
+pub fn delta_net_sync_to_host(li: usize, host_state: &mut [f32]) {
+    let live = dn_synced()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(li).copied())
+        .unwrap_or(false);
+    if !live {
+        return;
+    }
+    if let Some(cache) = cuda_delta_net_cache() {
+        if let Ok(g) = cache.lock() {
+            g.download_state(li, host_state);
+        }
+    }
+}
+
+/// Reset the resident DeltaNet device cache (model load). Drops all buffers and
+/// clears the synced flags so a new model re-uploads from scratch.
+pub fn delta_net_reset_device() {
+    if let Some(cache) = cuda_delta_net_cache() {
+        if let Ok(mut g) = cache.lock() {
+            g.reset();
+        }
+    }
+    if let Ok(mut g) = dn_synced().lock() {
+        g.clear();
+    }
+}
+
+/// One resident-state GPU DeltaNet decode step for SSM layer `li`. Uploads
+/// `recurrent_state` to the device S[li] only when it is stale (first step after a
+/// host write), runs the fused 2-pass recurrence + l2norm/q-scale + gated_rmsnorm
+/// on-device, and writes `v_out` for all heads. Returns false (caller runs the CPU
+/// recurrence) when disabled, off-CUDA, on `qk != vd`, or any transfer/kernel miss.
+#[allow(clippy::too_many_arguments)]
+pub fn try_delta_net_step_cuda(
+    li: usize,
+    recurrent_state: &[f32],
+    qkv_conv: &[f32],
+    gate: &[f32],
+    decay: &[f32],
+    beta: &[f32],
+    ssm_norm: &[f32],
+    v_out: &mut [f32],
+    n_v_heads: usize,
+    n_qk_heads: usize,
+    head_qk_dim: usize,
+    head_v_dim: usize,
+    q_block: usize,
+    k_block: usize,
+    rms_eps: f32,
+) -> bool {
+    if !delta_net_step_enabled() || head_qk_dim != head_v_dim {
+        return false;
+    }
+    let Some(cache) = cuda_delta_net_cache() else {
+        return false;
+    };
+    // Is the device S[li] already current for this decode run?
+    let synced = {
+        let Ok(mut g) = dn_synced().lock() else {
+            return false;
+        };
+        if g.len() <= li {
+            g.resize(li + 1, false);
+        }
+        g[li]
+    };
+    let Ok(mut c) = cache.lock() else {
+        return false;
+    };
+    let upload = if synced { None } else { Some(recurrent_state) };
+    let ok = c.step(
+        li,
+        qkv_conv,
+        gate,
+        decay,
+        beta,
+        ssm_norm,
+        v_out,
+        upload,
+        n_v_heads,
+        n_qk_heads,
+        head_qk_dim,
+        head_v_dim,
+        q_block,
+        k_block,
+        rms_eps,
+    );
+    drop(c);
+    if ok {
+        if let Ok(mut g) = dn_synced().lock() {
+            if g.len() <= li {
+                g.resize(li + 1, false);
+            }
+            g[li] = true;
+        }
+    }
+    ok
+}
+
 /// Map a weight [`Dtype`] to the CUDA cache's packed kind, or `None`
 /// for dtypes the CUDA backend doesn't dispatch (non-packed F16/BF16
 /// and NVFP4's non-`Raw` markers) — those fall through to the SYCL/CPU
@@ -3466,6 +3655,7 @@ pub fn reset_device_caches_for_new_model() {
     paged_sycl_mirror_reset();
     paged_mlx_mirror_reset();
     set_moe_tier_active(false);
+    delta_net_reset_device();
 }
 
 // ===========================================================================

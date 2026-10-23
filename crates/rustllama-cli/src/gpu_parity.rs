@@ -9291,6 +9291,125 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- C1: resident-state Gated-DeltaNet single-token DECODE step ----
+    // Grades `CudaDeltaNetCache::step` (the fused 2-pass recurrence + l2norm/
+    // q-scale + gated_rmsnorm, one block per V-head, resident S) vs the CPU
+    // per-head reference built from the SAME `k::delta_net` kernels the Ssm arm
+    // uses. Grades BOTH v_out AND the UPDATED state S — the recurrence carries S
+    // across tokens, so a state miscompute is the dangerous one (it compounds).
+    // Verdict `ssm:delta_net_step` (read by `accel::delta_net_step_enabled`).
+    // WRITE-BLIND (no NVIDIA here) — validated on the pod via `--cuda-parity`.
+    {
+        let name = rustllama_tuner::VERDICT_SSM_DELTA_NET_STEP;
+        const QK: usize = 128;
+        const VD: usize = 128;
+        const N_V: usize = 8; // > N_QK so the h % n_qk_heads K-group mapping is exercised
+        const N_QK: usize = 4;
+        const EPS: f32 = 1e-5;
+        let q_block = QK * N_QK;
+        let k_block = QK * N_QK;
+        let qkv_dim = q_block + k_block + VD * N_V;
+        let mut rng = XorShift(0xDE17_A9E7);
+        let u01 = |r: &mut XorShift| r.f32_pm(0.5) + 0.5; // [0,1)
+        let qkv_conv: Vec<f32> = (0..qkv_dim).map(|_| rng.f32_pm(0.8)).collect();
+        let gate: Vec<f32> = (0..N_V * VD).map(|_| rng.f32_pm(0.8)).collect();
+        // decay is the pre-exp `g` (the kernel exps it); keep g < 0 so exp(g)∈(0,1).
+        let decay: Vec<f32> = (0..N_V).map(|_| -(0.05 + 0.30 * u01(&mut rng))).collect();
+        let beta: Vec<f32> = (0..N_V).map(|_| 0.5 + 0.4 * u01(&mut rng)).collect();
+        let ssm_norm: Vec<f32> = (0..VD).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+        let s0: Vec<f32> = (0..N_V * QK * VD).map(|_| rng.f32_pm(0.3)).collect();
+
+        // CPU reference: per head, the exact Ssm-arm recurrence sequence.
+        let mut s_cpu = s0.clone();
+        let mut vout_cpu = vec![0f32; N_V * VD];
+        let qs = 1.0f32 / (QK as f32).sqrt();
+        for h in 0..N_V {
+            let kh = h % N_QK;
+            let mut q: Vec<f32> = qkv_conv[kh * QK..kh * QK + QK].to_vec();
+            let mut kv: Vec<f32> = qkv_conv[q_block + kh * QK..q_block + kh * QK + QK].to_vec();
+            let v = &qkv_conv[q_block + k_block + h * VD..q_block + k_block + h * VD + VD];
+            k::delta_net::l2norm_f32_inplace(&mut q, 1e-6);
+            k::delta_net::l2norm_f32_inplace(&mut kv, 1e-6);
+            for x in q.iter_mut() {
+                *x *= qs;
+            }
+            let mut out_head = vec![0f32; VD];
+            let sh = &mut s_cpu[h * QK * VD..h * QK * VD + QK * VD];
+            k::delta_net::delta_rule_step_f32(
+                &q,
+                &kv,
+                v,
+                decay[h],
+                beta[h],
+                sh,
+                &mut out_head,
+                QK,
+                VD,
+            );
+            k::delta_net::gated_rmsnorm_f32_inplace(
+                &mut out_head,
+                &gate[h * VD..h * VD + VD],
+                &ssm_norm,
+                EPS,
+            );
+            vout_cpu[h * VD..h * VD + VD].copy_from_slice(&out_head);
+        }
+
+        match ck::CudaDeltaNetCache::new(0) {
+            None => {
+                cu_emit(name, "KERNEL_ERR", "cache-create-failed");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            Some(mut cache) => {
+                let mut vout_gpu = vec![0f32; N_V * VD];
+                let ok = cache.step(
+                    0,
+                    &qkv_conv,
+                    &gate,
+                    &decay,
+                    &beta,
+                    &ssm_norm,
+                    &mut vout_gpu,
+                    Some(&s0),
+                    N_V,
+                    N_QK,
+                    QK,
+                    VD,
+                    q_block,
+                    k_block,
+                    EPS,
+                );
+                if !ok {
+                    cu_emit(name, "SKIP", "step-declined");
+                    *counts.entry("SKIP").or_default() += 1;
+                } else {
+                    let mut s_gpu = vec![0f32; N_V * QK * VD];
+                    cache.download_state(0, &mut s_gpu);
+                    // Grade v_out ++ updated state S together.
+                    let mut gpu = vout_gpu.clone();
+                    gpu.extend_from_slice(&s_gpu);
+                    let mut cpu = vout_cpu.clone();
+                    cpu.extend_from_slice(&s_cpu);
+                    let (cos, within, worst_abs, tol_frac) =
+                        allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, 0.05);
+                    let key: &'static str = if cos > 0.999 && within {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
+                    *counts.entry(key).or_default() += 1;
+                    cu_emit(
+                        name,
+                        key,
+                        &format!(
+                            "cos={cos:.6} worst_abs={worst_abs:.5} tol_used={tol_frac:.3} (vout+state {N_V}h)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

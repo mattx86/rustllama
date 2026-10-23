@@ -399,6 +399,15 @@ pub const VERDICT_DEQUANT_GPU: &str = "dequant:gpu";
 /// CUDA/MLX twins); fail-closed: absent / `false` ⇒ the hybrid DeltaNet forward
 /// stays byte-identical on the CPU path. No env gate.
 pub const VERDICT_SSM_DELTA_NET: &str = "ssm:delta_net";
+/// C1 — resident-state Gated-DeltaNet single-token DECODE step on the GPU (the
+/// per-token twin of the chunk-prefill `ssm:delta_net`). The recurrence is
+/// memory-bound on the per-head state S; the GPU step keeps S RESIDENT in VRAM
+/// across tokens and runs the fused 2-pass recurrence at device bandwidth. Backs
+/// `accel::delta_net_step_enabled`; graded vs the CPU scalar reference by
+/// `doctor --cuda-parity ssm:delta_net_step`. Fail-closed: absent / `false` ⇒ the
+/// DeltaNet decode stays on the SIMD/rayon CPU path. Pre-verdict A/B override:
+/// `RUSTLLAMA_DELTA_NET_STEP=1`.
+pub const VERDICT_SSM_DELTA_NET_STEP: &str = "ssm:delta_net_step";
 
 // --- P6-fusions: the three forward-path fusion verdicts ----------------
 //
