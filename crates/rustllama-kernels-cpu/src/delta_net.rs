@@ -525,54 +525,45 @@ pub(crate) fn delta_rule_step_f32_with_scratch_scalar(
     head_v_dim: usize,
     v_tilde: &mut [f32],
 ) {
-    // 1. State decay: S *= exp(g).
+    // S is the dominant per-token working set (`head_qk_dim × head_v_dim`,
+    // typically 128×128 = 64 KiB per head → the decode is bound on S memory
+    // traffic). The naive form sweeps S FOUR times (decay, S^T@k, rank-1 update,
+    // q^T@S). We fuse it into TWO sweeps, which is bit-identical to the 4-pass
+    // form:
+    //   Pass A = decay ⊕ S^T@k. Decay must touch EVERY row (a k_i==0 row still
+    //     feeds the q^T@S output), so — unlike the old split form — there is no
+    //     `k_i==0` skip here: a zero k_i contributes `decayed_row * 0 == 0` to
+    //     v_tilde, bit-identical to skipping for finite S.
+    //   Pass B = rank-1 update ⊕ q^T@S. Row i's update depends only on
+    //     (k_i, v_tilde), and the output reads the UPDATED row, so updating row i
+    //     then immediately dotting it with q_i yields the exact value the 4-pass
+    //     form produces after a full rank-1 pass. The `i`-outer reduction order
+    //     of the output sum is preserved.
     let decay = g.exp();
-    for s in state.iter_mut() {
-        *s *= decay;
-    }
 
-    // 2. Compute v_tilde = (v - S^T @ k) * beta.
-    //    S has shape [head_qk_dim, head_v_dim] row-major, so
-    //    (S^T @ k)[j] = sum_i S[i, j] * k[i] for j in 0..head_v_dim.
+    // Pass A: S *= exp(g) in place, accumulating v_tilde = S_decayed^T @ k.
     v_tilde.fill(0.0);
     for i in 0..head_qk_dim {
         let k_i = k[i];
-        if k_i == 0.0 {
-            continue;
-        }
-        let row = &state[i * head_v_dim..(i + 1) * head_v_dim];
+        let row = &mut state[i * head_v_dim..(i + 1) * head_v_dim];
         for j in 0..head_v_dim {
+            row[j] *= decay;
             v_tilde[j] += row[j] * k_i;
         }
     }
-    // Now v_tilde = S^T @ k. Apply v_tilde = (v - v_tilde) * beta.
+    // v_tilde = (v - S^T @ k) * beta.
     for j in 0..head_v_dim {
         v_tilde[j] = (v[j] - v_tilde[j]) * beta;
     }
 
-    // 3. Rank-1 state update: S += outer(k, v_tilde).
-    //    S[i, j] += k[i] * v_tilde[j].
+    // Pass B: S += outer(k, v_tilde) in place, accumulating out = q^T @ S_updated.
+    out.fill(0.0);
     for i in 0..head_qk_dim {
         let k_i = k[i];
-        if k_i == 0.0 {
-            continue;
-        }
+        let q_i = q[i];
         let row = &mut state[i * head_v_dim..(i + 1) * head_v_dim];
         for j in 0..head_v_dim {
             row[j] += k_i * v_tilde[j];
-        }
-    }
-
-    // 4. Output: out = q^T @ S.
-    //    out[j] = sum_i q[i] * S[i, j].
-    out.fill(0.0);
-    for i in 0..head_qk_dim {
-        let q_i = q[i];
-        if q_i == 0.0 {
-            continue;
-        }
-        let row = &state[i * head_v_dim..(i + 1) * head_v_dim];
-        for j in 0..head_v_dim {
             out[j] += q_i * row[j];
         }
     }
@@ -605,25 +596,14 @@ unsafe fn delta_rule_step_f32_with_scratch_avx2(
     let sp = state.as_mut_ptr();
     let vtp = v_tilde.as_mut_ptr();
 
-    // 1. State decay over the flat [head_qk_dim * head_v_dim] buffer.
-    {
-        let total = head_qk_dim * vd;
-        let t8 = total & !7;
-        let decay_b = _mm256_set1_ps(decay);
-        let mut p = 0;
-        while p < t8 {
-            let s = _mm256_loadu_ps(sp.add(p));
-            _mm256_storeu_ps(sp.add(p), _mm256_mul_ps(s, decay_b));
-            p += 8;
-        }
-        while p < total {
-            *sp.add(p) *= decay;
-            p += 1;
-        }
-    }
+    // Two fused sweeps over S (see the scalar reference for the bit-identity
+    // argument). Pass A = decay ⊕ S^T@k; Pass B = rank-1 update ⊕ q^T@S. FMA
+    // operand order is preserved from the 4-pass form, so this stays ≈1 ulp from
+    // the scalar reference exactly as before. No `k_i==0` skip in Pass A (decay
+    // must touch every row); a zero k_i contributes `fmadd(dv, 0, acc) == acc`.
 
-    // 2. v_tilde = S^T @ k (accumulate row-scaled), i outer to preserve
-    //    the scalar reduction order.
+    // Pass A: decay each row in place (`dv = row * decay`), accumulating
+    // v_tilde += dv * k_i. `i` outer preserves the scalar reduction order.
     {
         let mut j = 0;
         while j < vd8 {
@@ -635,26 +615,27 @@ unsafe fn delta_rule_step_f32_with_scratch_avx2(
             j += 1;
         }
     }
+    let decay_b = _mm256_set1_ps(decay);
     for i in 0..head_qk_dim {
         let k_i = *k.get_unchecked(i);
-        if k_i == 0.0 {
-            continue;
-        }
         let k_b = _mm256_set1_ps(k_i);
         let row = sp.add(i * vd);
         let mut j = 0;
         while j < vd8 {
+            let dv = _mm256_mul_ps(_mm256_loadu_ps(row.add(j)), decay_b);
+            _mm256_storeu_ps(row.add(j), dv);
             let acc = _mm256_loadu_ps(vtp.add(j));
-            let rv = _mm256_loadu_ps(row.add(j));
-            _mm256_storeu_ps(vtp.add(j), _mm256_fmadd_ps(rv, k_b, acc));
+            _mm256_storeu_ps(vtp.add(j), _mm256_fmadd_ps(dv, k_b, acc));
             j += 8;
         }
         while j < vd {
-            *vtp.add(j) += *row.add(j) * k_i;
+            let dv = *row.add(j) * decay;
+            *row.add(j) = dv;
+            *vtp.add(j) += dv * k_i;
             j += 1;
         }
     }
-    // v_tilde = (v - v_tilde) * beta.
+    // v_tilde = (v - S^T @ k) * beta.
     {
         let vp = v.as_ptr();
         let beta_b = _mm256_set1_ps(beta);
@@ -671,29 +652,8 @@ unsafe fn delta_rule_step_f32_with_scratch_avx2(
         }
     }
 
-    // 3. Rank-1 update S[i, j] += k[i] * v_tilde[j].
-    for i in 0..head_qk_dim {
-        let k_i = *k.get_unchecked(i);
-        if k_i == 0.0 {
-            continue;
-        }
-        let k_b = _mm256_set1_ps(k_i);
-        let row = sp.add(i * vd);
-        let mut j = 0;
-        while j < vd8 {
-            let sv = _mm256_loadu_ps(row.add(j));
-            let tv = _mm256_loadu_ps(vtp.add(j));
-            _mm256_storeu_ps(row.add(j), _mm256_fmadd_ps(k_b, tv, sv));
-            j += 8;
-        }
-        while j < vd {
-            *row.add(j) += k_i * *vtp.add(j);
-            j += 1;
-        }
-    }
-
-    // 4. Output out[j] = sum_i q[i] * S[i, j], i outer (reduction order
-    //    preserved).
+    // Pass B: rank-1 update row += k_i * v_tilde in place, accumulating
+    // out += q_i * row (the UPDATED row). `i` outer preserves the scalar order.
     let op = out.as_mut_ptr();
     {
         let mut j = 0;
@@ -707,21 +667,25 @@ unsafe fn delta_rule_step_f32_with_scratch_avx2(
         }
     }
     for i in 0..head_qk_dim {
+        let k_i = *k.get_unchecked(i);
         let q_i = *q.get_unchecked(i);
-        if q_i == 0.0 {
-            continue;
-        }
+        let k_b = _mm256_set1_ps(k_i);
         let q_b = _mm256_set1_ps(q_i);
         let row = sp.add(i * vd);
         let mut j = 0;
         while j < vd8 {
+            let sv = _mm256_loadu_ps(row.add(j));
+            let tv = _mm256_loadu_ps(vtp.add(j));
+            let nv = _mm256_fmadd_ps(k_b, tv, sv);
+            _mm256_storeu_ps(row.add(j), nv);
             let acc = _mm256_loadu_ps(op.add(j));
-            let rv = _mm256_loadu_ps(row.add(j));
-            _mm256_storeu_ps(op.add(j), _mm256_fmadd_ps(rv, q_b, acc));
+            _mm256_storeu_ps(op.add(j), _mm256_fmadd_ps(nv, q_b, acc));
             j += 8;
         }
         while j < vd {
-            *op.add(j) += q_i * *row.add(j);
+            let nv = *row.add(j) + k_i * *vtp.add(j);
+            *row.add(j) = nv;
+            *op.add(j) += q_i * nv;
             j += 1;
         }
     }
@@ -751,24 +715,10 @@ unsafe fn delta_rule_step_f32_with_scratch_avx512(
     let sp = state.as_mut_ptr();
     let vtp = v_tilde.as_mut_ptr();
 
-    // 1. State decay.
-    {
-        let total = head_qk_dim * vd;
-        let t16 = total & !15;
-        let decay_b = _mm512_set1_ps(decay);
-        let mut p = 0;
-        while p < t16 {
-            let s = _mm512_loadu_ps(sp.add(p));
-            _mm512_storeu_ps(sp.add(p), _mm512_mul_ps(s, decay_b));
-            p += 16;
-        }
-        while p < total {
-            *sp.add(p) *= decay;
-            p += 1;
-        }
-    }
+    // Two fused sweeps over S (see the scalar reference for the bit-identity
+    // argument); 16-wide. Pass A = decay ⊕ S^T@k; Pass B = rank-1 update ⊕ q^T@S.
 
-    // 2. v_tilde = S^T @ k.
+    // Pass A: decay each row (`dv = row * decay`), accumulate v_tilde += dv * k_i.
     {
         let mut j = 0;
         while j < vd16 {
@@ -780,26 +730,27 @@ unsafe fn delta_rule_step_f32_with_scratch_avx512(
             j += 1;
         }
     }
+    let decay_b = _mm512_set1_ps(decay);
     for i in 0..head_qk_dim {
         let k_i = *k.get_unchecked(i);
-        if k_i == 0.0 {
-            continue;
-        }
         let k_b = _mm512_set1_ps(k_i);
         let row = sp.add(i * vd);
         let mut j = 0;
         while j < vd16 {
+            let dv = _mm512_mul_ps(_mm512_loadu_ps(row.add(j)), decay_b);
+            _mm512_storeu_ps(row.add(j), dv);
             let acc = _mm512_loadu_ps(vtp.add(j));
-            let rv = _mm512_loadu_ps(row.add(j));
-            _mm512_storeu_ps(vtp.add(j), _mm512_fmadd_ps(rv, k_b, acc));
+            _mm512_storeu_ps(vtp.add(j), _mm512_fmadd_ps(dv, k_b, acc));
             j += 16;
         }
         while j < vd {
-            *vtp.add(j) += *row.add(j) * k_i;
+            let dv = *row.add(j) * decay;
+            *row.add(j) = dv;
+            *vtp.add(j) += dv * k_i;
             j += 1;
         }
     }
-    // v_tilde = (v - v_tilde) * beta.
+    // v_tilde = (v - S^T @ k) * beta.
     {
         let vp = v.as_ptr();
         let beta_b = _mm512_set1_ps(beta);
@@ -816,28 +767,7 @@ unsafe fn delta_rule_step_f32_with_scratch_avx512(
         }
     }
 
-    // 3. Rank-1 update.
-    for i in 0..head_qk_dim {
-        let k_i = *k.get_unchecked(i);
-        if k_i == 0.0 {
-            continue;
-        }
-        let k_b = _mm512_set1_ps(k_i);
-        let row = sp.add(i * vd);
-        let mut j = 0;
-        while j < vd16 {
-            let sv = _mm512_loadu_ps(row.add(j));
-            let tv = _mm512_loadu_ps(vtp.add(j));
-            _mm512_storeu_ps(row.add(j), _mm512_fmadd_ps(k_b, tv, sv));
-            j += 16;
-        }
-        while j < vd {
-            *row.add(j) += k_i * *vtp.add(j);
-            j += 1;
-        }
-    }
-
-    // 4. Output.
+    // Pass B: rank-1 update row += k_i * v_tilde, accumulate out += q_i * row.
     let op = out.as_mut_ptr();
     {
         let mut j = 0;
@@ -851,21 +781,25 @@ unsafe fn delta_rule_step_f32_with_scratch_avx512(
         }
     }
     for i in 0..head_qk_dim {
+        let k_i = *k.get_unchecked(i);
         let q_i = *q.get_unchecked(i);
-        if q_i == 0.0 {
-            continue;
-        }
+        let k_b = _mm512_set1_ps(k_i);
         let q_b = _mm512_set1_ps(q_i);
         let row = sp.add(i * vd);
         let mut j = 0;
         while j < vd16 {
+            let sv = _mm512_loadu_ps(row.add(j));
+            let tv = _mm512_loadu_ps(vtp.add(j));
+            let nv = _mm512_fmadd_ps(k_b, tv, sv);
+            _mm512_storeu_ps(row.add(j), nv);
             let acc = _mm512_loadu_ps(op.add(j));
-            let rv = _mm512_loadu_ps(row.add(j));
-            _mm512_storeu_ps(op.add(j), _mm512_fmadd_ps(rv, q_b, acc));
+            _mm512_storeu_ps(op.add(j), _mm512_fmadd_ps(nv, q_b, acc));
             j += 16;
         }
         while j < vd {
-            *op.add(j) += q_i * *row.add(j);
+            let nv = *row.add(j) + k_i * *vtp.add(j);
+            *row.add(j) = nv;
+            *op.add(j) += q_i * nv;
             j += 1;
         }
     }
@@ -901,24 +835,11 @@ unsafe fn delta_rule_step_f32_with_scratch_neon(
     let sp = state.as_mut_ptr();
     let vtp = v_tilde.as_mut_ptr();
 
-    // 1. State decay over the flat [head_qk_dim * head_v_dim] buffer.
-    {
-        let total = head_qk_dim * vd;
-        let t4 = total & !3;
-        let decay_b = vdupq_n_f32(decay);
-        let mut p = 0;
-        while p < t4 {
-            let s = vld1q_f32(sp.add(p));
-            vst1q_f32(sp.add(p), vmulq_f32(s, decay_b));
-            p += 4;
-        }
-        while p < total {
-            *sp.add(p) *= decay;
-            p += 1;
-        }
-    }
+    // Two fused sweeps over S (see the scalar reference for the bit-identity
+    // argument); 4-wide. Pass A = decay ⊕ S^T@k; Pass B = rank-1 update ⊕ q^T@S.
+    // `vfmaq_f32(a, b, c) == a + b*c`, matching each 4-pass FMA site.
 
-    // 2. v_tilde = S^T @ k (i outer to preserve the scalar reduction order).
+    // Pass A: decay each row (`dv = row * decay`), accumulate v_tilde += dv * k_i.
     {
         let mut j = 0;
         while j < vd4 {
@@ -930,26 +851,27 @@ unsafe fn delta_rule_step_f32_with_scratch_neon(
             j += 1;
         }
     }
+    let decay_b = vdupq_n_f32(decay);
     for i in 0..head_qk_dim {
         let k_i = *k.get_unchecked(i);
-        if k_i == 0.0 {
-            continue;
-        }
         let k_b = vdupq_n_f32(k_i);
         let row = sp.add(i * vd);
         let mut j = 0;
         while j < vd4 {
+            let dv = vmulq_f32(vld1q_f32(row.add(j)), decay_b);
+            vst1q_f32(row.add(j), dv);
             let acc = vld1q_f32(vtp.add(j));
-            let rv = vld1q_f32(row.add(j));
-            vst1q_f32(vtp.add(j), vfmaq_f32(acc, rv, k_b));
+            vst1q_f32(vtp.add(j), vfmaq_f32(acc, dv, k_b));
             j += 4;
         }
         while j < vd {
-            *vtp.add(j) += *row.add(j) * k_i;
+            let dv = *row.add(j) * decay;
+            *row.add(j) = dv;
+            *vtp.add(j) += dv * k_i;
             j += 1;
         }
     }
-    // v_tilde = (v - v_tilde) * beta.
+    // v_tilde = (v - S^T @ k) * beta.
     {
         let vp = v.as_ptr();
         let beta_b = vdupq_n_f32(beta);
@@ -966,29 +888,7 @@ unsafe fn delta_rule_step_f32_with_scratch_neon(
         }
     }
 
-    // 3. Rank-1 update S[i, j] += k[i] * v_tilde[j].
-    for i in 0..head_qk_dim {
-        let k_i = *k.get_unchecked(i);
-        if k_i == 0.0 {
-            continue;
-        }
-        let k_b = vdupq_n_f32(k_i);
-        let row = sp.add(i * vd);
-        let mut j = 0;
-        while j < vd4 {
-            let sv = vld1q_f32(row.add(j));
-            let tv = vld1q_f32(vtp.add(j));
-            vst1q_f32(row.add(j), vfmaq_f32(sv, k_b, tv));
-            j += 4;
-        }
-        while j < vd {
-            *row.add(j) += k_i * *vtp.add(j);
-            j += 1;
-        }
-    }
-
-    // 4. Output out[j] = sum_i q[i] * S[i, j], i outer (reduction order
-    //    preserved).
+    // Pass B: rank-1 update row += k_i * v_tilde, accumulate out += q_i * row.
     let op = out.as_mut_ptr();
     {
         let mut j = 0;
@@ -1002,21 +902,25 @@ unsafe fn delta_rule_step_f32_with_scratch_neon(
         }
     }
     for i in 0..head_qk_dim {
+        let k_i = *k.get_unchecked(i);
         let q_i = *q.get_unchecked(i);
-        if q_i == 0.0 {
-            continue;
-        }
+        let k_b = vdupq_n_f32(k_i);
         let q_b = vdupq_n_f32(q_i);
         let row = sp.add(i * vd);
         let mut j = 0;
         while j < vd4 {
+            let sv = vld1q_f32(row.add(j));
+            let tv = vld1q_f32(vtp.add(j));
+            let nv = vfmaq_f32(sv, k_b, tv);
+            vst1q_f32(row.add(j), nv);
             let acc = vld1q_f32(op.add(j));
-            let rv = vld1q_f32(row.add(j));
-            vst1q_f32(op.add(j), vfmaq_f32(acc, rv, q_b));
+            vst1q_f32(op.add(j), vfmaq_f32(acc, nv, q_b));
             j += 4;
         }
         while j < vd {
-            *op.add(j) += q_i * *row.add(j);
+            let nv = *row.add(j) + k_i * *vtp.add(j);
+            *row.add(j) = nv;
+            *op.add(j) += q_i * nv;
             j += 1;
         }
     }
@@ -1906,6 +1810,82 @@ mod tests {
         // State should be the decayed identity.
         assert!((state[0] - 0.5).abs() < 1e-5);
         assert!((state[3] - 0.5).abs() < 1e-5);
+    }
+
+    /// D1 fusion guard: the SIMD dispatcher (AVX-512 / AVX2 / NEON, per host)
+    /// must track the scalar reference across a multi-token recurrence to the
+    /// module's ≈1e-4 tolerance, for a range of head dims (incl. non-SIMD-width
+    /// tails) and with a few EXACT-zero q/k entries exercising the fused
+    /// no-`k_i==0`-skip path. State is carried across tokens on both sides so a
+    /// per-step divergence would compound and trip the assert.
+    #[test]
+    fn delta_rule_simd_matches_scalar_fused_multistep() {
+        // Deterministic LCG (no rng dependency) producing values in [-1, 1).
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        for &(qk, vd) in &[(128usize, 128usize), (64, 128), (16, 24), (7, 5)] {
+            let mut state_simd = vec![0f32; qk * vd];
+            let mut state_scalar = vec![0f32; qk * vd];
+            let mut vt_simd = vec![0f32; vd];
+            let mut vt_scalar = vec![0f32; vd];
+            for t in 0..6 {
+                let mut q: Vec<f32> = (0..qk).map(|_| next()).collect();
+                let mut k: Vec<f32> = (0..qk).map(|_| next()).collect();
+                let v: Vec<f32> = (0..vd).map(|_| next()).collect();
+                // Force exact zeros so the fused decay-on-read path (no k_i skip)
+                // and the fused output path (no q_i skip) are both exercised.
+                if qk > 3 {
+                    q[1] = 0.0;
+                    k[2] = 0.0;
+                    k[qk - 1] = 0.0;
+                }
+                let g = -0.1 * (t as f32 + 1.0); // decay = exp(g) in (0, 1)
+                let beta = 0.5 + 0.1 * t as f32;
+                let mut out_simd = vec![0f32; vd];
+                let mut out_scalar = vec![0f32; vd];
+                delta_rule_step_f32_with_scratch(
+                    &q,
+                    &k,
+                    &v,
+                    g,
+                    beta,
+                    &mut state_simd,
+                    &mut out_simd,
+                    qk,
+                    vd,
+                    &mut vt_simd,
+                );
+                delta_rule_step_f32_with_scratch_scalar(
+                    &q,
+                    &k,
+                    &v,
+                    g,
+                    beta,
+                    &mut state_scalar,
+                    &mut out_scalar,
+                    qk,
+                    vd,
+                    &mut vt_scalar,
+                );
+                for (a, b) in out_simd.iter().zip(&out_scalar) {
+                    assert!(
+                        (a - b).abs() <= 1e-4 * b.abs().max(1.0),
+                        "out mismatch qk={qk} vd={vd} t={t}: simd={a} scalar={b}"
+                    );
+                }
+                for (a, b) in state_simd.iter().zip(&state_scalar) {
+                    assert!(
+                        (a - b).abs() <= 1e-4 * b.abs().max(1.0),
+                        "state mismatch qk={qk} vd={vd} t={t}: simd={a} scalar={b}"
+                    );
+                }
+            }
+        }
     }
 
     /// Full DeltaNet layer end-to-end. Tiny synthetic dimensions
