@@ -2921,6 +2921,30 @@ fn median_of(runs: &mut [f64], last_err: Option<String>) -> (Option<f64>, Option
     (Some(median), None)
 }
 
+/// Whether stage-9b (spec-strategy) progress markers are enabled — opt-in via
+/// `RUSTLLAMA_DEBUG_SPEC_STAGE` (any non-empty, non-"0" value). Cached.
+fn spec_dbg_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DEBUG_SPEC_STAGE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Emit a stage-9b progress marker to STDERR (unbuffered → flushed before any
+/// subsequent stall) when `RUSTLLAMA_DEBUG_SPEC_STAGE` is set; silent otherwise. On
+/// a HANG, the LAST marker with no matching "… done" names the wedged piece — a
+/// debugger-free way to bisect which candidate/phase of `measure_spec_strategy`
+/// never returns.
+macro_rules! spec_dbg {
+    ($($arg:tt)*) => {
+        if spec_dbg_enabled() {
+            eprintln!("[spec-9b] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// Median decode tok/s for a speculative stream, timed first-token→last-token
 /// (prefill-excluded). `init` re-initializes the stream per run; it is the only
 /// strategy-specific part. One untimed warmup drain + `repeats` timed drains.
@@ -2933,6 +2957,7 @@ fn median_of(runs: &mut [f64], last_err: Option<String>) -> (Option<f64>, Option
 const SPEC_CAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn bench_spec_stream<F>(
+    label: &str,
     repeats: usize,
     timeout: std::time::Duration,
     mut init: F,
@@ -2944,8 +2969,10 @@ where
     // Warmup — wall-clock BOUNDED so a slow/wedged candidate (e.g. a hybrid whose
     // CPU DeltaNet recurrence under spec runs tens of seconds per measurement) bails
     // and is recorded as "no winner" instead of stalling the whole sweep (stage 9b).
+    spec_dbg!("{label}: warmup init stream");
     match init() {
         Ok(mut stream) => {
+            spec_dbg!("{label}: warmup draining");
             let deadline = std::time::Instant::now() + timeout;
             let warm = futures::executor::block_on(async {
                 while let Some(item) = stream.next().await {
@@ -2958,6 +2985,7 @@ where
                 }
                 Ok(())
             });
+            spec_dbg!("{label}: warmup drained ({warm:?})");
             if let Err(e) = warm {
                 return (None, Some(format!("warmup failed: {e}")));
             }
@@ -2966,7 +2994,8 @@ where
     }
     let mut runs: Vec<f64> = Vec::with_capacity(repeats);
     let mut last_err: Option<String> = None;
-    for _ in 0..repeats {
+    for i in 0..repeats {
+        spec_dbg!("{label}: run {i} init stream");
         let mut stream = match init() {
             Ok(s) => s,
             Err(e) => {
@@ -2974,6 +3003,7 @@ where
                 continue;
             }
         };
+        spec_dbg!("{label}: run {i} draining");
         let deadline = std::time::Instant::now() + timeout;
         let drained = futures::executor::block_on(async {
             let mut generated = 0usize;
@@ -2997,6 +3027,7 @@ where
             }
             Ok((generated, t_first, t_last))
         });
+        spec_dbg!("{label}: run {i} drained ({drained:?})");
         match drained {
             Ok((generated, Some(t_first), t_last)) if generated >= 2 => {
                 let decode_s = (t_last - t_first).as_secs_f64();
@@ -3040,6 +3071,7 @@ pub fn measure_spec_strategy(
     const DECODE_TOKENS: u32 = 16;
     let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
 
+    spec_dbg!("load start ({})", model_path.display());
     let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
@@ -3051,9 +3083,11 @@ pub fn measure_spec_strategy(
     cpu.set_prefix_cache(false);
     cpu.set_flash_attention(cfg.flash_attention);
     apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
+    spec_dbg!("load done");
 
     // Capability probes (cheap flag flips on the loaded engine, reset after): the
     // Mtp / Tree candidates only apply to a model with a NextN head.
+    spec_dbg!("probe mtp/tree capability");
     cpu.set_mtp_speculative(true);
     let mtp_capable = cpu.mtp_speculative();
     cpu.set_mtp_speculative(false);
@@ -3063,6 +3097,7 @@ pub fn measure_spec_strategy(
     cpu.set_tree_speculative(Some(widths_vec.clone()));
     let tree_capable = cpu.tree_speculative();
     cpu.set_tree_speculative(None);
+    spec_dbg!("capability: mtp={mtp_capable} tree={tree_capable}");
 
     let vocab = cpu.vocab_size() as i32;
     let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
@@ -3084,6 +3119,7 @@ pub fn measure_spec_strategy(
 
     // `None` baseline: classic `generate_token_ids` (&mut; measured FIRST, before
     // the &self stream closures borrow the engine).
+    spec_dbg!("baseline None start (warmup + {repeats} runs)");
     let none_tps = {
         cpu.clear_prefix_cache();
         if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
@@ -3106,6 +3142,11 @@ pub fn measure_spec_strategy(
             median_of(&mut runs, last_err)
         }
     };
+    spec_dbg!(
+        "baseline None done (tps={:?} err={:?})",
+        none_tps.0,
+        none_tps.1
+    );
 
     // Per-candidate wall-clock timeout, AWARE of this (model, config)'s REAL decode
     // speed rather than a fixed 20s. A large model, a CPU / low `n_gpu_layers`
@@ -3130,6 +3171,7 @@ pub fn measure_spec_strategy(
             None => std::time::Duration::from_secs(120),
         }
     };
+    spec_dbg!("per-candidate timeout = {cand_timeout:?}");
 
     let mut candidates: Vec<SpecStrategyMeasurement> = Vec::new();
     candidates.push(SpecStrategyMeasurement {
@@ -3140,7 +3182,7 @@ pub fn measure_spec_strategy(
 
     // Self-contained drafters (always available).
     let ng = crate::speculative::NgramDrafterConfig::default();
-    let r = bench_spec_stream(repeats, cand_timeout, || {
+    let r = bench_spec_stream("Ngram", repeats, cand_timeout, || {
         cpu.clear_prefix_cache();
         cpu.speculate_ngram_stream_from_ids(prompt_ids.clone(), ng.clone(), sampling.clone())
     });
@@ -3151,7 +3193,7 @@ pub fn measure_spec_strategy(
     });
 
     let la = crate::speculative::LookaheadDrafterConfig::default();
-    let r = bench_spec_stream(repeats, cand_timeout, || {
+    let r = bench_spec_stream("Lookahead", repeats, cand_timeout, || {
         cpu.clear_prefix_cache();
         cpu.speculate_lookahead_stream_from_ids(prompt_ids.clone(), la.clone(), sampling.clone())
     });
@@ -3163,7 +3205,7 @@ pub fn measure_spec_strategy(
 
     // NextN-head drafters.
     if mtp_capable {
-        let r = bench_spec_stream(repeats, cand_timeout, || {
+        let r = bench_spec_stream("Mtp", repeats, cand_timeout, || {
             cpu.clear_prefix_cache();
             cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None)
         });
@@ -3175,7 +3217,7 @@ pub fn measure_spec_strategy(
     }
     if tree_capable {
         let widths = widths_vec.clone();
-        let r = bench_spec_stream(repeats, cand_timeout, || {
+        let r = bench_spec_stream("Tree", repeats, cand_timeout, || {
             cpu.clear_prefix_cache();
             cpu.speculate_mtp_stream_from_ids(
                 prompt_ids.clone(),
