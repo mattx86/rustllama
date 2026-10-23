@@ -8901,6 +8901,276 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- T2 (B1): WHOLE-DECODE-STEP CUDA-graph capture (ALL dense layers) ----
+    // The per-layer graph is validated above; this drives
+    // `decode_step_graph_f32`, which captures EVERY dense layer's attention +
+    // SwiGLU-FFN chain into ONE cudaGraph replayed with ONE launch + ONE sync for
+    // the whole token (vs the per-layer graph's one launch + sync PER layer). The
+    // captured kernels are IDENTICAL to the per-layer graph, so this grades
+    // correctness against a CPU reference that stacks the SAME attn+FFN chain over
+    // N synthetic dense layers — a layer-indexing / residual-threading bug in the
+    // step driver surfaces as a MISCOMPUTE. Verdict = the gate's anchor
+    // `step:dev_resident_cuda_graph` (read by `accel::dev_step_cuda_graph_enabled`,
+    // which is otherwise dead: nothing wrote this key, so the whole-step graph
+    // could only be forced on by `RUSTLLAMA_DEV_STEP_GRAPH=1`). Emitting OK here
+    // auto-enables it on the next load (first-load self-heal re-runs
+    // `--validate-kernels` on a build change).
+    //
+    // PERF: the step graph runs the SAME kernels as the already-perf-gated
+    // per-layer graph with STRICTLY FEWER launches/syncs (1 vs N), so it is
+    // structurally never slower — correctness-gating is sufficient. (A measured
+    // perf A/B — a `tune --dev-attn` step arm — would be a future hardening; the
+    // gate reads one verdict today.) WRITE-BLIND (no NVIDIA GPU here) — validated
+    // on-device via `--cuda-parity`.
+    {
+        let name = rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH;
+        const HEAD_DIM: usize = 128;
+        const N_HEADS: usize = 8;
+        const N_KV: usize = 2;
+        const D_MODEL: usize = 1024;
+        const D_FF: usize = 256; // Q4_K `down` has k=D_FF → multiple of 256
+        const MAX_CTX: usize = 64;
+        const POS: usize = 5;
+        const EPS: f32 = 1e-5;
+        const THETA: f32 = 10000.0;
+        const N_LAYERS: usize = 6; // >1 so cross-layer residual threading is exercised
+        let d_q = N_HEADS * HEAD_DIM;
+        let d_kv = N_KV * HEAD_DIM;
+        let half = HEAD_DIM / 2;
+        let kv_len = POS + 1;
+
+        let layout = LAYOUTS
+            .iter()
+            .find(|l| l.name == "q4_k")
+            .expect("q4_k layout");
+        let cpu_mv = cpu_matvec_for("q4_k");
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|j| 1.0f32 / THETA.powf(2.0 * j as f32 / HEAD_DIM as f32))
+            .collect();
+
+        // Per-layer DISTINCT weights + norms (so a layer-index mixup surfaces).
+        struct Lw {
+            wq: Vec<u8>,
+            wk: Vec<u8>,
+            wv: Vec<u8>,
+            wo: Vec<u8>,
+            wg: Vec<u8>,
+            wu: Vec<u8>,
+            wd: Vec<u8>,
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+        }
+        let mut rng = XorShift(0x57E9_1D0B);
+        let mut lws: Vec<Lw> = Vec::with_capacity(N_LAYERS);
+        for l in 0..N_LAYERS {
+            let s = (l as u32).wrapping_mul(0x9E37_79B1).wrapping_add(1);
+            lws.push(Lw {
+                wq: gen_quant_bytes(layout, d_q, D_MODEL, 0x1A1A ^ s),
+                wk: gen_quant_bytes(layout, d_kv, D_MODEL, 0x2B2B ^ s),
+                wv: gen_quant_bytes(layout, d_kv, D_MODEL, 0x3C3C ^ s),
+                wo: gen_quant_bytes(layout, D_MODEL, d_q, 0x4D4D ^ s),
+                wg: gen_quant_bytes(layout, D_FF, D_MODEL, 0x5E5E ^ s),
+                wu: gen_quant_bytes(layout, D_FF, D_MODEL, 0x6F6F ^ s),
+                wd: gen_quant_bytes(layout, D_MODEL, D_FF, 0x7070 ^ s),
+                attn_norm: (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect(),
+                ffn_norm: (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect(),
+            });
+        }
+
+        // Per-layer KV caches: history slots [0,POS) filled (slot POS = this token).
+        let hist_elems = N_KV * MAX_CTX * HEAD_DIM;
+        let mut kcaches: Vec<Vec<f32>> = (0..N_LAYERS).map(|_| vec![0f32; hist_elems]).collect();
+        let mut vcaches: Vec<Vec<f32>> = (0..N_LAYERS).map(|_| vec![0f32; hist_elems]).collect();
+        for l in 0..N_LAYERS {
+            for h in 0..N_KV {
+                for t in 0..POS {
+                    for dd in 0..HEAD_DIM {
+                        let idx = (h * MAX_CTX + t) * HEAD_DIM + dd;
+                        kcaches[l][idx] = rng.f32_pm(0.6);
+                        vcaches[l][idx] = rng.f32_pm(0.6);
+                    }
+                }
+            }
+        }
+        let hidden0: Vec<f32> = (0..D_MODEL).map(|_| rng.f32_pm(0.6)).collect();
+
+        let rope = |qk: &mut [f32], nh: usize| {
+            for hh in 0..nh {
+                let base = hh * HEAD_DIM;
+                for j in 0..half {
+                    let angle = POS as f32 * inv_freq[j];
+                    let (s, c) = angle.sin_cos();
+                    let x0 = qk[base + j];
+                    let x1 = qk[base + j + half];
+                    qk[base + j] = x0 * c - x1 * s;
+                    qk[base + j + half] = x0 * s + x1 * c;
+                }
+            }
+        };
+
+        // ---- CPU reference: stack the N dense layers; hidden threads forward ----
+        let mut hidden_cpu = hidden0.clone();
+        for (li, lw) in lws.iter().enumerate() {
+            let mut hnorm = vec![0f32; D_MODEL];
+            k::rmsnorm_f32_row(&hidden_cpu, &lw.attn_norm, &mut hnorm, EPS);
+            let mut q_ref = vec![0f32; d_q];
+            let mut k_ref = vec![0f32; d_kv];
+            let mut v_ref = vec![0f32; d_kv];
+            cpu_mv(&lw.wq, &hnorm, &mut q_ref, d_q, D_MODEL);
+            cpu_mv(&lw.wk, &hnorm, &mut k_ref, d_kv, D_MODEL);
+            cpu_mv(&lw.wv, &hnorm, &mut v_ref, d_kv, D_MODEL);
+            rope(&mut q_ref, N_HEADS);
+            rope(&mut k_ref, N_KV);
+            // Append this token's K/V at [POS] into a scratch copy of the history.
+            let mut rk = kcaches[li].clone();
+            let mut rv = vcaches[li].clone();
+            for h in 0..N_KV {
+                for dd in 0..HEAD_DIM {
+                    let idx = (h * MAX_CTX + POS) * HEAD_DIM + dd;
+                    rk[idx] = k_ref[h * HEAD_DIM + dd];
+                    rv[idx] = v_ref[h * HEAD_DIM + dd];
+                }
+            }
+            let mut attn = vec![0f32; d_q];
+            k::gqa_attention_one_step_capped_windowed(
+                &q_ref, &rk, &rv, &mut attn, N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len, 0, 0.0,
+            );
+            let mut o = vec![0f32; D_MODEL];
+            cpu_mv(&lw.wo, &attn, &mut o, D_MODEL, d_q);
+            for i in 0..D_MODEL {
+                hidden_cpu[i] += o[i];
+            }
+            let mut hn2 = vec![0f32; D_MODEL];
+            k::rmsnorm_f32_row(&hidden_cpu, &lw.ffn_norm, &mut hn2, EPS);
+            let mut g = vec![0f32; D_FF];
+            let mut u = vec![0f32; D_FF];
+            cpu_mv(&lw.wg, &hn2, &mut g, D_FF, D_MODEL);
+            cpu_mv(&lw.wu, &hn2, &mut u, D_FF, D_MODEL);
+            let mut act = vec![0f32; D_FF];
+            k::silu_mul_f32(&g, &u, &mut act);
+            let mut fo = vec![0f32; D_MODEL];
+            cpu_mv(&lw.wd, &act, &mut fo, D_MODEL, D_FF);
+            for i in 0..D_MODEL {
+                hidden_cpu[i] += fo[i];
+            }
+        }
+
+        match ck::CudaMatvecCache::new(0, 64 << 20) {
+            None => {
+                cu_emit(name, "KERNEL_ERR", "cache-create-failed");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            Some(mut cache) => {
+                let step_layers: Vec<ck::StepLayer> = lws
+                    .iter()
+                    .map(|lw| ck::StepLayer {
+                        wq: (ck::CudaPackedKind::Q4_K, lw.wq.as_ptr() as usize, &lw.wq),
+                        wk: (ck::CudaPackedKind::Q4_K, lw.wk.as_ptr() as usize, &lw.wk),
+                        wv: (ck::CudaPackedKind::Q4_K, lw.wv.as_ptr() as usize, &lw.wv),
+                        wo: (ck::CudaPackedKind::Q4_K, lw.wo.as_ptr() as usize, &lw.wo),
+                        dense_ffn: Some((
+                            (
+                                ck::CudaPackedKind::Q4_K,
+                                lw.wg.as_ptr() as usize,
+                                lw.wg.as_slice(),
+                            ),
+                            (
+                                ck::CudaPackedKind::Q4_K,
+                                lw.wu.as_ptr() as usize,
+                                lw.wu.as_slice(),
+                            ),
+                            (
+                                ck::CudaPackedKind::Q4_K,
+                                lw.wd.as_ptr() as usize,
+                                lw.wd.as_slice(),
+                            ),
+                            D_FF,
+                        )),
+                        attn_norm: &lw.attn_norm,
+                        post_norm: &lw.ffn_norm,
+                        q_norm: None,
+                        k_norm: None,
+                        inv_freq: &inv_freq,
+                        window: 0,
+                        softcap: 0.0,
+                    })
+                    .collect();
+                let mut hidden_dev = hidden0.clone();
+                let mut kc_refs: Vec<&mut [f32]> =
+                    kcaches.iter_mut().map(|c| c.as_mut_slice()).collect();
+                let mut vc_refs: Vec<&mut [f32]> =
+                    vcaches.iter_mut().map(|c| c.as_mut_slice()).collect();
+                // SAFETY: weight + norm slices in `lws` outlive the call; host KV
+                // caches sized d_kv*max_ctx; pos < max_ctx.
+                let ok = unsafe {
+                    cache.decode_step_graph_f32(
+                        &step_layers,
+                        &mut hidden_dev,
+                        &mut kc_refs,
+                        &mut vc_refs,
+                        N_HEADS,
+                        N_KV,
+                        HEAD_DIM,
+                        D_MODEL,
+                        POS,
+                        MAX_CTX,
+                        EPS,
+                    )
+                };
+                if !ok {
+                    cu_emit(name, "SKIP", "step-graph-declined");
+                    *counts.entry("SKIP").or_default() += 1;
+                } else {
+                    // Grade the residual hidden DELTA after the full N-layer stack
+                    // (the delta covers every layer's o-proj + ffn_out — the whole
+                    // step). Same cos>0.99 / rel<0.15 bar + 5e-3 floor as the
+                    // per-layer FFN-in-graph probe.
+                    let gpu: Vec<f32> = hidden_dev
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
+                    let cpu: Vec<f32> = hidden_cpu
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
+                    const GRAPH_REL_TOL: f64 = 0.15;
+                    let (cos, within, worst_abs, tol_frac) =
+                        allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, GRAPH_REL_TOL);
+                    let key: &'static str = if cos > 0.99 && within {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
+                    *counts.entry(key).or_default() += 1;
+                    let mut wi = 0usize;
+                    let mut wfrac = 0f64;
+                    for i in 0..gpu.len() {
+                        let allowed =
+                            GRAPH_ALLCLOSE_ABS_TOL + GRAPH_REL_TOL * (cpu[i] as f64).abs();
+                        let frac = (gpu[i] as f64 - cpu[i] as f64).abs() / allowed;
+                        if frac > wfrac {
+                            wfrac = frac;
+                            wi = i;
+                        }
+                    }
+                    let w_allowed = GRAPH_ALLCLOSE_ABS_TOL + GRAPH_REL_TOL * (cpu[wi] as f64).abs();
+                    let w_abs = (gpu[wi] as f64 - cpu[wi] as f64).abs();
+                    cu_emit(
+                        name,
+                        key,
+                        &format!(
+                            "cos={cos:.6} worst_abs={worst_abs:.5} tol_used={tol_frac:.3} \
+                             ({N_LAYERS}L attn+ffn) fail@[{wi}] ref={:.4} gpu={:.4} abs={w_abs:.4} allowed={w_allowed:.4}",
+                            cpu[wi], gpu[wi]
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));
