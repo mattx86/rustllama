@@ -614,6 +614,49 @@ extern "C" int rsl_cuda_memcpy_d2d_async(rsl_cuda_stream *s, void *dst_dev,
                : -1;
 }
 
+// ============================================================
+// Multi-GPU PP/TP transport (PP-0): cross-GPU peer access + peer copy. The
+// foundation for pipeline-stage activation handoff + the hand-rolled TP
+// collectives. WRITE-BLIND: the cross-device transport is only exercised on real
+// 2+ GPU hardware; on a single-GPU box these are inert (dev_a == dev_b degenerate
+// self-ops that the parity probe uses to validate the API).
+// ============================================================
+
+// Enable `accessing_dev` to directly read `peer_dev`'s memory (NVLink/PCIe P2P).
+// Idempotent. Returns 0 if peer access is enabled (or already was), 1 if the pair
+// does NOT support peer access (caller falls back to host staging — cudaMemcpyPeer
+// still works, just via host), negative on error. Same device → 0 (trivially ok).
+extern "C" int rsl_cuda_enable_peer_access(int accessing_dev, int peer_dev) {
+    if (accessing_dev == peer_dev) return 0;
+    int can = 0;
+    if (cudaDeviceCanAccessPeer(&can, accessing_dev, peer_dev) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    if (!can) return 1; // unsupported pair → host-staging fallback
+    cudaSetDevice(accessing_dev);
+    cudaError_t e = cudaDeviceEnablePeerAccess(peer_dev, 0);
+    // Already-enabled is success; clear the latched error either way.
+    int ok = (e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled);
+    cudaGetLastError();
+    return ok ? 0 : -1;
+}
+
+// Async copy of `n_bytes` from `src` (resident on `src_dev`) to `dst` (resident on
+// `dst_dev`) on the stream `s`. `cudaMemcpyPeerAsync` is correct whether or not peer
+// access was enabled (CUDA stages through host when it wasn't); enabling it (above)
+// makes it a direct P2P transfer. Non-synchronizing; return 0 on success.
+extern "C" int rsl_cuda_memcpy_peer(rsl_cuda_stream *s, void *dst, int dst_dev,
+                                    const void *src, int src_dev,
+                                    unsigned long long n_bytes) {
+    if (!s) return -1;
+    cudaSetDevice(s->device);
+    return cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, (size_t)n_bytes, s->stream) ==
+                   cudaSuccess
+               ? 0
+               : -1;
+}
+
 // Block until all prior work queued on the stream completes (the ONE sync after
 // a graph launch). Return 0 on success.
 extern "C" int rsl_cuda_stream_sync(rsl_cuda_stream *s) {

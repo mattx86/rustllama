@@ -9410,6 +9410,31 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- PP-0: multi-GPU peer-copy transport (foundation for pipeline handoff +
+    // TP collectives). On a single-GPU box the round-trip is src==dst, so this
+    // grades the API + exact byte fidelity; the real P2P transport is confirmed on
+    // multi-GPU HW. WRITE-BLIND.
+    {
+        let name = rustllama_tuner::VERDICT_PEER_COPY;
+        match ck::peer_copy_self_check(0) {
+            None => {
+                cu_emit(name, "SKIP", "no-cuda-device");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+            Some((passed, worst)) => {
+                let key: &'static str = if passed { "OK" } else { "MISCOMPUTE" };
+                *counts.entry(key).or_default() += 1;
+                cu_emit(
+                    name,
+                    key,
+                    &format!(
+                        "worst_abs={worst:.5} (single-GPU self-copy; P2P transport validated on multi-GPU HW)"
+                    ),
+                );
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

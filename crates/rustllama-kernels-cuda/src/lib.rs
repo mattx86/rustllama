@@ -185,6 +185,16 @@ extern "C" {
         src_dev: *const c_void,
         n_bytes: u64,
     ) -> c_int;
+    // PP-0 multi-GPU transport: enable P2P + cross-device peer copy.
+    fn rsl_cuda_enable_peer_access(accessing_dev: c_int, peer_dev: c_int) -> c_int;
+    fn rsl_cuda_memcpy_peer(
+        s: *mut RslCudaStreamRaw,
+        dst: *mut c_void,
+        dst_dev: c_int,
+        src: *const c_void,
+        src_dev: c_int,
+        n_bytes: u64,
+    ) -> c_int;
     fn rsl_cuda_stream_sync(s: *mut RslCudaStreamRaw) -> c_int;
     // C1 — resident-state single-token Gated-DeltaNet recurrence step. All pointers
     // are DEVICE pointers; `state` is the RESIDENT per-layer S (caller-owned), the
@@ -3967,6 +3977,90 @@ fn dn_f32_bytes(s: &[f32]) -> &[u8] {
 fn dn_f32_bytes_mut(s: &mut [f32]) -> &mut [u8] {
     // SAFETY: as above; exclusive borrow preserved.
     unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, std::mem::size_of_val(s)) }
+}
+
+// ============================================================
+// PP-0 — multi-GPU peer transport (pipeline-stage handoff + TP collectives).
+// ============================================================
+
+/// Best-effort enable of direct P2P so `accessing_dev` can read `peer_dev`'s
+/// memory (NVLink/PCIe). Returns true if direct peer access is now enabled, false
+/// if the pair doesn't support it (a peer copy still works, staged through host) or
+/// on any error. Idempotent. Same device → true.
+pub fn enable_peer_access(accessing_dev: u32, peer_dev: u32) -> bool {
+    // SAFETY: FFI; the C side validates the device indices.
+    unsafe { rsl_cuda_enable_peer_access(accessing_dev as c_int, peer_dev as c_int) == 0 }
+}
+
+/// Async peer copy of `n_bytes` from `src` (resident on `src_dev`) to `dst`
+/// (resident on `dst_dev`) on `stream`. Correct whether or not peer access was
+/// enabled (CUDA stages through host when it wasn't). Non-synchronizing — pair with
+/// a stream sync. Returns true on success.
+///
+/// SAFETY: `dst`/`src` must be live device allocations of ≥ `n_bytes` on the named
+/// devices for the duration of the (async) copy.
+pub unsafe fn peer_memcpy(
+    stream: &CudaStream,
+    dst: *mut c_void,
+    dst_dev: u32,
+    src: *const c_void,
+    src_dev: u32,
+    n_bytes: usize,
+) -> bool {
+    rsl_cuda_memcpy_peer(
+        stream.raw(),
+        dst,
+        dst_dev as c_int,
+        src,
+        src_dev as c_int,
+        n_bytes as u64,
+    ) == 0
+}
+
+/// PP-0 parity self-check: round-trip a buffer through `peer_memcpy`. On a
+/// single-GPU box `src_dev == dst_dev == device_index`, so this validates the API +
+/// exact byte fidelity (the only part verifiable without a 2nd GPU); on real
+/// multi-GPU the identical call exercises P2P transport. Returns
+/// `(passed, worst_abs_diff)`, or `None` if the device/stream/alloc fails.
+pub fn peer_copy_self_check(device_index: u32) -> Option<(bool, f32)> {
+    let stream = CudaStream::create(device_index)?;
+    let _ = enable_peer_access(device_index, device_index); // no-op (same dev); exercises the path
+    let n = 4096usize;
+    let src: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 7.0).collect();
+    let nbytes = n * 4;
+    let mut src_dev = RawDevBuf::alloc(&stream, nbytes)?;
+    let dst_dev = RawDevBuf::alloc(&stream, nbytes)?;
+    if !src_dev.upload(dn_f32_bytes(&src)) {
+        return None;
+    }
+    // SAFETY: both buffers are live, sized nbytes, on device_index.
+    let ok = unsafe {
+        peer_memcpy(
+            &stream,
+            dst_dev.ptr,
+            device_index,
+            src_dev.ptr as *const c_void,
+            device_index,
+            nbytes,
+        )
+    };
+    if !ok {
+        return Some((false, f32::INFINITY));
+    }
+    // SAFETY: FFI; blocks until the async peer copy completes.
+    unsafe {
+        rsl_cuda_stream_sync(stream.raw());
+    }
+    let mut out = vec![0f32; n];
+    if !dst_dev.download(dn_f32_bytes_mut(&mut out)) {
+        return None;
+    }
+    let worst = src
+        .iter()
+        .zip(&out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    Some((worst == 0.0, worst))
 }
 
 /// C1 — resident-state Gated-DeltaNet DECODE cache. Holds each SSM layer's

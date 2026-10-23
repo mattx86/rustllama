@@ -408,6 +408,12 @@ pub const VERDICT_SSM_DELTA_NET: &str = "ssm:delta_net";
 /// DeltaNet decode stays on the SIMD/rayon CPU path. Pre-verdict A/B override:
 /// `RUSTLLAMA_DELTA_NET_STEP=1`.
 pub const VERDICT_SSM_DELTA_NET_STEP: &str = "ssm:delta_net_step";
+/// PP-0 (multi-GPU) — the cross-GPU peer-copy transport is byte-correct. Graded by
+/// `doctor --cuda-parity peer:copy` (a round-trip through `rsl_cuda_memcpy_peer`;
+/// on a single-GPU box src==dst validates the API + byte fidelity, the only part
+/// verifiable without a 2nd GPU — real P2P transport is confirmed on multi-GPU HW).
+/// Foundation for pipeline-stage activation handoff + the TP collectives.
+pub const VERDICT_PEER_COPY: &str = "peer:copy";
 
 // --- P6-fusions: the three forward-path fusion verdicts ----------------
 //
