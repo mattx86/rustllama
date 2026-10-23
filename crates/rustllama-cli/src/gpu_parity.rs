@@ -9481,6 +9481,32 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- TP-2: ROW-parallel (K-split) packed matvec. The contraction dim K is
+    // split into block-aligned slices, each device computes a partial, and the sum
+    // is graded vs the WHOLE single-device matvec. On one GPU the two logical
+    // slices run on device 0 → validates the strided-extraction + reduce ALGEBRA;
+    // the real cross-device split is confirmed on multi-GPU HW. WRITE-BLIND.
+    {
+        let name = rustllama_tuner::VERDICT_MATVEC_TP_ROW;
+        match rustllama_models::accel::tp_row_self_check() {
+            None => {
+                cu_emit(name, "SKIP", "no-cuda-device");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+            Some((passed, worst)) => {
+                let key: &'static str = if passed { "OK" } else { "MISCOMPUTE" };
+                *counts.entry(key).or_default() += 1;
+                cu_emit(
+                    name,
+                    key,
+                    &format!(
+                        "worst_abs={worst:.5} (Q8_0 K-split=2 vs whole; cross-device split on multi-GPU HW)"
+                    ),
+                );
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

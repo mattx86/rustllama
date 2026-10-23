@@ -2300,6 +2300,184 @@ fn tp_cuda_usable() -> bool {
     })
 }
 
+/// TP-2 — distinct cache-key salt for a ROW-parallel (K-split) band, so a
+/// K-slice's per-device cache entry can't collide with the full weight OR a
+/// COLUMN-split band (`TP_KEY_SALT`).
+const TP_KEY_SALT_ROW: usize = 0x5450_524F_575F_4B21; // "TPROW_K!"
+
+/// Minimum contraction width (K) before a ROW-parallel split pays its host-side
+/// slice extraction + reduce overhead.
+const TP_MIN_K_SPLIT: usize = 4096;
+
+/// TP-2 — ROW-parallel (K-split) packed matvec CORE over an EXPLICIT device list,
+/// the complement of the column-split [`try_matvec_tp_cuda`] (which splits OUTPUT
+/// ROWS). Splits the contraction dim K into `devices.len()` block-aligned slices;
+/// device `d` computes the PARTIAL dot over its K-slice and the partials are summed
+/// into `out`. A K-slice of a PACKED row is NOT contiguous — it is one block-aligned
+/// sub-run per row at stride `row_bytes(k)` (block-aligned so every quant block's
+/// scale stays within the slice ⇒ exact dequant), so each device's weight is
+/// gathered host-side into a contiguous `[m × row_bytes(kd)]` buffer. `devices` may
+/// repeat an index (the self-check passes `[0, 0]` to validate the algebra on ONE
+/// GPU). Partials are summed host-side (exact; the device-resident all-reduce from
+/// TP-1 is the recombine once partials stay on-device, with PP-2b). Returns false on
+/// any miss (caller overwrites `out` on the single-device path).
+#[allow(clippy::too_many_arguments)]
+fn tp_row_matvec_on(
+    devices: &[u32],
+    kind: ck::CudaPackedKind,
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let ndev = devices.len();
+    let align = kind.k_alignment();
+    // The split is only EXACT when each device's K is block-aligned (so a whole
+    // number of quant blocks, scales intact) and the row bytes partition evenly.
+    if ndev < 2 || k == 0 || align == 0 || k % (ndev * align) != 0 {
+        return false;
+    }
+    let kd = k / ndev;
+    let row_bytes = kind.row_bytes(k);
+    let rbd = kind.row_bytes(kd);
+    if row_bytes == 0 || rbd == 0 || rbd * ndev != row_bytes {
+        return false;
+    }
+    if w_bytes.len() < m * row_bytes || out.len() != m || x.len() != k {
+        return false;
+    }
+    // Each device computes the full [m] partial over its K-slice; the scoped joins
+    // collect them, then they're summed into `out` (exact reduce of ndev vectors).
+    let results: Vec<Option<Vec<f32>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = devices
+            .iter()
+            .enumerate()
+            .map(|(di, &dev)| {
+                // Strided extraction: row r's d-th sub-run [di*rbd, di*rbd+rbd).
+                let mut w_d = vec![0u8; m * rbd];
+                for (r, chunk) in w_d.chunks_mut(rbd).enumerate() {
+                    let so = r * row_bytes + di * rbd;
+                    chunk.copy_from_slice(&w_bytes[so..so + rbd]);
+                }
+                let x_d = x[di * kd..(di + 1) * kd].to_vec();
+                // Per-(device-slice) key: distinct from the whole weight AND the
+                // column bands, stable so each slice re-hits its own cache entry.
+                let band_key = weight_key ^ TP_KEY_SALT_ROW ^ di.wrapping_mul(0x9E37_79B9);
+                s.spawn(move || {
+                    let mut local = vec![0f32; m];
+                    if try_matvec_packed_cuda_dev(
+                        dev, kind, band_key, &w_d, &x_d, &mut local, m, kd,
+                    ) {
+                        Some(local)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    });
+    if results.iter().any(|r| r.is_none()) {
+        return false;
+    }
+    out.fill(0.0);
+    for part in results.iter().flatten() {
+        for (o, &v) in out.iter_mut().zip(part) {
+            *o += v;
+        }
+    }
+    true
+}
+
+/// TP-2 — ROW-parallel (K-split) packed matvec across the usable CUDA devices.
+/// Thin wrapper over [`tp_row_matvec_on`]; `false` (single-device fallback) on <2
+/// devices or any miss.
+#[allow(clippy::too_many_arguments)]
+fn try_matvec_tp_row_cuda(
+    kind: ck::CudaPackedKind,
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    tp_row_matvec_on(
+        &usable_cuda_devices(),
+        kind,
+        weight_key,
+        w_bytes,
+        x,
+        out,
+        m,
+        k,
+    )
+}
+
+/// TP-2 — shared parity core for the row-parallel matvec: build a synthetic Q8_0
+/// weight, run the K-split path over `devices`, and compare to the WHOLE
+/// single-device matvec. `(passed, worst_abs)` or `None` on a kernel miss. Used by
+/// both the dispatch gate (real devices) and the write-blind self-check (`[0, 0]`).
+fn tp_row_parity(devices: &[u32]) -> Option<(bool, f32)> {
+    let kind = ck::CudaPackedKind::Q8_0;
+    let (m, k) = (256usize, 512usize); // k = 512 = 2*256; block-32 → splits cleanly
+    let wf: Vec<f32> = (0..m * k)
+        .map(|i| (((i as i64 * 2_654_435_761) % 101) as f32 - 50.0) * 0.02)
+        .collect();
+    let mut w = vec![0u8; (m * k / 32) * 34];
+    rustllama_gguf::encode::encode_q8_0(&wf, &mut w);
+    let x: Vec<f32> = (0..k).map(|j| ((j % 13) as f32 - 6.0) * 0.1).collect();
+    let key = w.as_ptr() as usize;
+    let mut ref_out = vec![0f32; m];
+    let mut row_out = vec![0f32; m];
+    if !try_matvec_packed_cuda(kind, key, &w, &x, &mut ref_out, m, k) {
+        return None;
+    }
+    if !tp_row_matvec_on(devices, kind, key, &w, &x, &mut row_out, m, k) {
+        return None;
+    }
+    let worst = ref_out
+        .iter()
+        .zip(&row_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let scale = ref_out.iter().map(|v| v.abs()).fold(0f32, f32::max);
+    Some((worst <= 1e-3 + 1e-3 * scale, worst))
+}
+
+/// Whether the ROW-parallel multi-GPU matvec is usable — cached. True only with
+/// ≥2 usable CUDA devices AND a passing parity probe (K-split-then-sum ==
+/// single-device on a Q8_0 weight), so a single-GPU box or a wrong split fails
+/// closed. The dispatch gate for the row arm.
+fn tp_row_cuda_usable() -> bool {
+    static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USABLE.get_or_init(|| {
+        let devices = usable_cuda_devices();
+        if !cuda_active() || devices.len() < 2 {
+            return false;
+        }
+        matches!(tp_row_parity(&devices), Some((true, _)))
+    })
+}
+
+/// TP-2 write-blind parity self-check (CUDA): grade the ROW-parallel K-split + sum
+/// against the WHOLE single-device matvec on ONE device (two LOGICAL K-slices both
+/// on device 0, via `[0, 0]`), validating the strided-extraction + reduce ALGEBRA
+/// + plumbing — the only part verifiable without a 2nd GPU; the real cross-device
+/// split is confirmed on 2+ GPU HW. `None` off CUDA. Read by
+/// `doctor --cuda-parity matvec:tp_row`.
+pub fn tp_row_self_check() -> Option<(bool, f32)> {
+    if !cuda_active() {
+        return None;
+    }
+    tp_row_parity(&[0, 0])
+}
+
 /// Single-row packed matvec on a SPECIFIC CUDA device (Phase 4 cross-GPU
 /// routing). Mirrors [`try_matvec_packed_cuda`] but targets `device_index`'s
 /// own resident cache. `false` on any miss so the caller falls through.
@@ -16732,6 +16910,20 @@ pub fn try_matvec_tensor_usm_f32(
                 && !pipeline_active()
                 && tp_cuda_usable()
                 && try_matvec_tp_cuda(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k)
+            {
+                return true;
+            }
+            // Multi-GPU tensor parallelism (ROW-parallel / K-split): for a large
+            // CONTRACTION dim, split K across ≥2 GPUs — each computes a partial,
+            // summed into `out`. Complements the column-split above (output-row
+            // split); the standard TP choice for the O- / down-projections. Its own
+            // self-check gate (K-split == single-device on Q8_0) → inert on a
+            // single-GPU box; mutually exclusive with a PP stage split. A miss falls
+            // through to the single-device matvec below.
+            if k >= TP_MIN_K_SPLIT
+                && !pipeline_active()
+                && tp_row_cuda_usable()
+                && try_matvec_tp_row_cuda(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k)
             {
                 return true;
             }

@@ -430,6 +430,15 @@ pub const VERDICT_COLLECTIVE_ALL_REDUCE: &str = "collective:all_reduce";
 /// the concat-placement algebra + plumbing; real P2P gather on multi-GPU HW.
 /// Foundation for TP-3 head-parallel attention (per-head outputs → all-gather).
 pub const VERDICT_COLLECTIVE_ALL_GATHER: &str = "collective:all_gather";
+/// TP-2 (multi-GPU) — the ROW-parallel (K-split) matvec recombines correctly.
+/// Graded by `doctor --cuda-parity matvec:tp_row`: a packed weight's contraction
+/// dim K is split into block-aligned slices, each device computes a partial over
+/// its slice, and the summed partials are checked against the WHOLE single-device
+/// matvec. On a single-GPU box the two logical slices run on device 0, so this
+/// validates the strided-extraction + reduce ALGEBRA + plumbing; the real
+/// cross-device split is confirmed on 2+ GPU HW. The complement of the column
+/// split (output-row partition); the standard TP choice for O- / down-proj.
+pub const VERDICT_MATVEC_TP_ROW: &str = "matvec:tp_row";
 
 // --- P6-fusions: the three forward-path fusion verdicts ----------------
 //

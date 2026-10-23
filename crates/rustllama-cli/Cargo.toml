@@ -62,6 +62,10 @@ rustllama-runtime = { path = "../rustllama-runtime" }
 rustllama-hub = { path = "../rustllama-hub" }
 rustllama-server = { path = "../rustllama-server" }
 rustllama-engine = { path = "../rustllama-engine" }
+# Direct dep for the TP-2 row-parallel matvec self-check in `doctor --cuda-parity`
+# (already present transitively via -engine); the probe calls
+# `rustllama_models::accel::tp_row_self_check`.
+rustllama-models = { path = "../rustllama-models" }
 # NPU device model + compute offload — `doctor --npu-parity` grades the Intel
 # NPU MatMul offload (Phase 5) vs the CPU reference.
 rustllama-npu = { path = "../rustllama-npu" }
