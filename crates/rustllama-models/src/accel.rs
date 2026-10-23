@@ -160,10 +160,65 @@ pub fn dn_resident_set_active(on: bool) {
     }
 }
 
+/// True while the engine is inside a SPECULATIVE decode region (draft → verify →
+/// rollback). The whole-step CUDA graph and the resident DeltaNet step both assume
+/// a monotonic single-token decode at an increasing position; speculation rewinds
+/// the position (KV `set_seq_len`) and DeltaNet state (snapshot/restore) on reject,
+/// which makes the captured step graph wedge/re-capture (~10 s/step) and the
+/// resident DeltaNet step's host-sync path fragile. So both self-disable while this
+/// is set — spec falls back to the proven per-layer graph / CPU recurrence, and
+/// the fast steps stay on for ordinary greedy decode. Set by the engine around
+/// every speculative loop.
+// Reference COUNT (not a bool) so concurrent / nested speculative streams compose:
+// the flag is "active" while any guard is alive. Prevents one stream clearing it
+// out from under another (e.g. paged slots, overlapping requests).
+static SPEC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Mark speculative decode active (`true`) / one region done (`false`). Prefer the
+/// [`SpecActiveGuard`] RAII wrapper, which can't leak the flag on an early return
+/// or a dropped stream.
+pub fn set_spec_active(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if on {
+        SPEC_ACTIVE.fetch_add(1, Relaxed);
+    } else {
+        // Saturating — never underflow if a `false` ever arrives unpaired.
+        let _ = SPEC_ACTIVE.fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(1)));
+    }
+}
+
+/// Whether the engine is currently in a speculative decode region.
+pub fn spec_active() -> bool {
+    SPEC_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// RAII marker for a speculative decode region. The engine creates one inside each
+/// speculative stream body (right after the worker-install block), so the resident
+/// DeltaNet step and the whole-step CUDA graph disable themselves across BOTH the
+/// draft and the verify forwards of every round, and auto-re-enable when the stream
+/// finishes OR is dropped (client disconnect / cancelled autotune candidate).
+pub struct SpecActiveGuard(());
+impl SpecActiveGuard {
+    pub fn new() -> Self {
+        set_spec_active(true);
+        SpecActiveGuard(())
+    }
+}
+impl Default for SpecActiveGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Drop for SpecActiveGuard {
+    fn drop(&mut self) {
+        set_spec_active(false);
+    }
+}
+
 /// Whether the resident-state GPU DeltaNet decode step is enabled: the
 /// `ssm:delta_net_step` verdict passed on-device AND CUDA is active (cached) AND
-/// the single-sequence engine is active (dynamic). Fail-closed; the env override
-/// `RUSTLLAMA_DELTA_NET_STEP` forces the cached half for the pre-verdict A/B.
+/// the single-sequence engine is active (dynamic) AND we are NOT speculating.
+/// Fail-closed; the env override `RUSTLLAMA_DELTA_NET_STEP` forces the cached half.
 pub fn delta_net_step_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     let base =
@@ -174,7 +229,7 @@ pub fn delta_net_step_enabled() -> bool {
                 _ => kernel_verdict(rustllama_tuner::VERDICT_SSM_DELTA_NET_STEP) && cuda_active(),
             },
         );
-    base && DN_RESIDENT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    base && DN_RESIDENT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) && !spec_active()
 }
 
 /// Mark the device-resident DeltaNet state stale (next step for each layer
@@ -10530,13 +10585,17 @@ fn dev_layer_cuda_graph_enabled() -> bool {
 /// ladder without corruption.
 pub fn dev_step_cuda_graph_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(
-        || match std::env::var("RUSTLLAMA_DEV_STEP_GRAPH").ok().as_deref() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => kernel_verdict(rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH),
-        },
-    )
+    let base =
+        *ON.get_or_init(
+            || match std::env::var("RUSTLLAMA_DEV_STEP_GRAPH").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => kernel_verdict(rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH),
+            },
+        );
+    // Disable the whole-step graph while speculating — the captured graph assumes a
+    // monotonic position and wedges/re-captures under draft/verify rollback.
+    base && !spec_active()
 }
 
 /// Run the WHOLE attention block for one decode token on the GPU, keeping the

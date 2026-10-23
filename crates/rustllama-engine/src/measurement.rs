@@ -2782,18 +2782,35 @@ fn median_of(runs: &mut [f64], last_err: Option<String>) -> (Option<f64>, Option
 /// (prefill-excluded). `init` re-initializes the stream per run; it is the only
 /// strategy-specific part. One untimed warmup drain + `repeats` timed drains.
 /// Mirrors `measure_speculative_mtp`'s `bench_mtp`, generalized over the stream.
-fn bench_spec_stream<F>(repeats: usize, mut init: F) -> (Option<f64>, Option<String>)
+/// Per-candidate wall-clock budget for the spec-strategy sweep (stage 9b). A
+/// candidate whose warmup/timed decode exceeds this is recorded as "no winner" and
+/// the sweep continues — a slow hybrid (CPU DeltaNet recurrence under spec) or a
+/// wedged drafter can't stall the whole autotune. Generous vs the ~1 s a healthy
+/// 16-token spec decode takes, so it only trips on genuinely-too-slow candidates.
+const SPEC_CAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn bench_spec_stream<F>(
+    repeats: usize,
+    timeout: std::time::Duration,
+    mut init: F,
+) -> (Option<f64>, Option<String>)
 where
     F: FnMut() -> crate::Result<crate::TokenStream>,
 {
     use futures::StreamExt;
-    // Untimed warmup.
+    // Warmup — wall-clock BOUNDED so a slow/wedged candidate (e.g. a hybrid whose
+    // CPU DeltaNet recurrence under spec runs tens of seconds per measurement) bails
+    // and is recorded as "no winner" instead of stalling the whole sweep (stage 9b).
     match init() {
         Ok(mut stream) => {
+            let deadline = std::time::Instant::now() + timeout;
             let warm = futures::executor::block_on(async {
                 while let Some(item) = stream.next().await {
                     if let Err(e) = item {
                         return Err(e.to_string());
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return Err("timeout".to_string());
                     }
                 }
                 Ok(())
@@ -2814,6 +2831,7 @@ where
                 continue;
             }
         };
+        let deadline = std::time::Instant::now() + timeout;
         let drained = futures::executor::block_on(async {
             let mut generated = 0usize;
             let mut t_first: Option<std::time::Instant> = None;
@@ -2829,6 +2847,9 @@ where
                         generated += 1;
                     }
                     Err(e) => return Err(e.to_string()),
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err("timeout".to_string());
                 }
             }
             Ok((generated, t_first, t_last))
@@ -2952,7 +2973,7 @@ pub fn measure_spec_strategy(
 
     // Self-contained drafters (always available).
     let ng = crate::speculative::NgramDrafterConfig::default();
-    let r = bench_spec_stream(repeats, || {
+    let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
         cpu.clear_prefix_cache();
         cpu.speculate_ngram_stream_from_ids(prompt_ids.clone(), ng.clone(), sampling.clone())
     });
@@ -2963,7 +2984,7 @@ pub fn measure_spec_strategy(
     });
 
     let la = crate::speculative::LookaheadDrafterConfig::default();
-    let r = bench_spec_stream(repeats, || {
+    let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
         cpu.clear_prefix_cache();
         cpu.speculate_lookahead_stream_from_ids(prompt_ids.clone(), la.clone(), sampling.clone())
     });
@@ -2975,7 +2996,7 @@ pub fn measure_spec_strategy(
 
     // NextN-head drafters.
     if mtp_capable {
-        let r = bench_spec_stream(repeats, || {
+        let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
             cpu.clear_prefix_cache();
             cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None)
         });
@@ -2987,7 +3008,7 @@ pub fn measure_spec_strategy(
     }
     if tree_capable {
         let widths = widths_vec.clone();
-        let r = bench_spec_stream(repeats, || {
+        let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
             cpu.clear_prefix_cache();
             cpu.speculate_mtp_stream_from_ids(
                 prompt_ids.clone(),

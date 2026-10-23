@@ -8842,6 +8842,9 @@ impl ContiguousEngine {
         let cpu_force_patterns = self.cpu_force_patterns.clone();
 
         let stream = async_stream::stream! {
+            // C1/B1 spec-safety: disable the resident DeltaNet step + whole-step
+            // CUDA graph for the whole draft→verify region (they wedge under rollback).
+            let _spec_guard = rustllama_models::accel::SpecActiveGuard::new();
             use futures::StreamExt;
             // Decode-throughput clock for the GUI tok/s (published per token below).
             let decode_start = std::time::Instant::now();
@@ -9222,6 +9225,9 @@ impl ContiguousEngine {
         let cpu_force_patterns = self.cpu_force_patterns.clone();
 
         let stream = async_stream::stream! {
+            // C1/B1 spec-safety: disable the resident DeltaNet step + whole-step graph
+            // for the whole draft→verify region (they wedge under rollback).
+            let _spec_guard = rustllama_models::accel::SpecActiveGuard::new();
             let mut rng_slot = Some(Rng::from_seed(seed));
             let mut current_prompt_ids: Vec<i32> = initial_prompt_ids;
             let mut total_emitted: usize = 0;
@@ -9479,6 +9485,9 @@ impl ContiguousEngine {
         let cpu_force_patterns = self.cpu_force_patterns.clone();
 
         let stream = async_stream::stream! {
+            // C1/B1 spec-safety: disable the resident DeltaNet step + whole-step graph
+            // for the whole draft→verify region (they wedge under rollback).
+            let _spec_guard = rustllama_models::accel::SpecActiveGuard::new();
             // Moved into each round's spawn_blocking (accept/reject
             // now runs inside the state lock) and moved back out.
             let mut rng_slot = Some(Rng::from_seed(seed));
@@ -9719,6 +9728,9 @@ impl ContiguousEngine {
         let cpu_force_patterns = self.cpu_force_patterns.clone();
 
         let stream = async_stream::stream! {
+            // C1/B1 spec-safety: disable the resident DeltaNet step + whole-step graph
+            // for the whole draft→verify region (they wedge under rollback).
+            let _spec_guard = rustllama_models::accel::SpecActiveGuard::new();
             let mut rng_slot = Some(Rng::from_seed(seed));
             let mut current_prompt_ids: Vec<i32> = initial_prompt_ids;
             let mut total_emitted: usize = 0;
@@ -10008,6 +10020,9 @@ impl ContiguousEngine {
         let eagle = eagle;
 
         let stream = async_stream::stream! {
+            // C1/B1 spec-safety: disable the resident DeltaNet step + whole-step graph
+            // for the whole draft→verify region (they wedge under rollback).
+            let _spec_guard = rustllama_models::accel::SpecActiveGuard::new();
             let mut rng_slot = Some(Rng::from_seed(seed));
             let mut total_emitted: usize = 0;
             let mut emitted_text = String::new();
