@@ -1376,6 +1376,98 @@ extern "C" int rsl_cuda_gemm_q4_k_f32(rsl_cuda_stream *s, const void *w,
     return rsl_cuda_check("rsl_cuda_gemm_q4_k_f32");
 }
 
+// out[N,M] = x[N,K] . W[M,K]^T, W = Q8_0 packed (34 B / 32-weight block). K % 32 == 0.
+// Register-blocked f32 GEMM — the LOSSLESS twin of the Q8_0 W8A8 TC GEMM, mirroring
+// gemm_q4_k_f32_rb_kernel: only the weight dequant differs (Q8_0 = one f16 scale ×
+// 32 int8 per BK=32 k-tile vs Q4_K's nibble super-block). Fixes the O(M·K·N) weight
+// re-streaming of the batched matvec for Q8_0 prefill; unlike the TC GEMM it has NO
+// int8 activation round-trip (lossless), so it is the Q8_0 analogue of the Q4_K f32 GEMM.
+__global__ void gemm_q8_0_f32_rb_kernel(const unsigned char *w, const float *x,
+                                        float *out, int M, int K, int N) {
+    __shared__ float As[RSL_Q4K_GEMM_BK][RSL_Q4K_GEMM_BM];
+    __shared__ float Bs[RSL_Q4K_GEMM_BK][RSL_Q4K_GEMM_BN];
+    const int rowBase = blockIdx.x * RSL_Q4K_GEMM_BM;
+    const int tokBase = blockIdx.y * RSL_Q4K_GEMM_BN;
+    const int tr = threadIdx.y;
+    const int tc = threadIdx.x;
+    const int nthreads = (RSL_Q4K_GEMM_BM / RSL_Q4K_GEMM_TM) *
+                         (RSL_Q4K_GEMM_BN / RSL_Q4K_GEMM_TN);
+    const int tid = tr * (RSL_Q4K_GEMM_BN / RSL_Q4K_GEMM_TN) + tc;
+    const int bpr = K / 32; // Q8_0 blocks per row
+    float acc[RSL_Q4K_GEMM_TM][RSL_Q4K_GEMM_TN];
+#pragma unroll
+    for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j) acc[i][j] = 0.0f;
+
+    const int ktiles = K / RSL_Q4K_GEMM_BK; // K/32 == bpr (BK=32 == one Q8_0 block)
+    for (int kt = 0; kt < ktiles; ++kt) {
+        // Stage As[BK][BM] — dequant BM weight rows' block kt.
+        for (int rl = tid; rl < RSL_Q4K_GEMM_BM; rl += nthreads) {
+            int mg = rowBase + rl;
+            float d = 0.0f;
+            const signed char *qb = nullptr;
+            if (mg < M) {
+                const unsigned char *blk = w + ((size_t)mg * bpr + kt) * 34;
+                d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+                qb = (const signed char *)(blk + 2);
+            }
+#pragma unroll
+            for (int kk = 0; kk < RSL_Q4K_GEMM_BK; ++kk) {
+                As[kk][rl] = (mg < M) ? d * (float)qb[kk] : 0.0f;
+            }
+        }
+        // Stage Bs[BK][BN] — the BN tokens' k-tile kt.
+        for (int e = tid; e < RSL_Q4K_GEMM_BN * RSL_Q4K_GEMM_BK; e += nthreads) {
+            int tl = e % RSL_Q4K_GEMM_BN;
+            int kk = e / RSL_Q4K_GEMM_BN;
+            int ng = tokBase + tl;
+            int kg = kt * RSL_Q4K_GEMM_BK + kk;
+            Bs[kk][tl] = (ng < N) ? x[(size_t)ng * K + kg] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < RSL_Q4K_GEMM_BK; ++k) {
+            float ar[RSL_Q4K_GEMM_TM], br[RSL_Q4K_GEMM_TN];
+#pragma unroll
+            for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i)
+                ar[i] = As[k][tr * RSL_Q4K_GEMM_TM + i];
+#pragma unroll
+            for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j)
+                br[j] = Bs[k][tc * RSL_Q4K_GEMM_TN + j];
+#pragma unroll
+            for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i)
+#pragma unroll
+                for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j) acc[i][j] += ar[i] * br[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i) {
+        int mg = rowBase + tr * RSL_Q4K_GEMM_TM + i;
+        if (mg >= M) continue;
+#pragma unroll
+        for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j) {
+            int ng = tokBase + tc * RSL_Q4K_GEMM_TN + j;
+            if (ng < N) out[(size_t)ng * M + mg] = acc[i][j];
+        }
+    }
+}
+
+// out[N,M] = x[N,K] . W[M,K]^T, W = Q8_0 packed. K % 32 == 0.
+extern "C" int rsl_cuda_gemm_q8_0_f32(rsl_cuda_stream *s, const void *w,
+                                      const float *x, float *out, int M, int K, int N) {
+    if (!s || !w || !x || !out || M <= 0 || K <= 0 || N <= 0 || (K % 32) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    dim3 block(RSL_Q4K_GEMM_BN / RSL_Q4K_GEMM_TN, RSL_Q4K_GEMM_BM / RSL_Q4K_GEMM_TM);
+    dim3 grid((unsigned)((M + RSL_Q4K_GEMM_BM - 1) / RSL_Q4K_GEMM_BM),
+              (unsigned)((N + RSL_Q4K_GEMM_BN - 1) / RSL_Q4K_GEMM_BN));
+    gemm_q8_0_f32_rb_kernel<<<grid, block, 0, s->stream>>>(
+        (const unsigned char *)w, x, out, M, K, N);
+    return rsl_cuda_check("rsl_cuda_gemm_q8_0_f32");
+}
+
 // ============================================================
 // Q4_K prefill GEMM — Phase 2: int8 TENSOR CORES (W8A8). Same 64x64/BK=32 tiling
 // as the f32 GEMM, but the inner product is the s8 tensor-core MMA

@@ -461,6 +461,65 @@ fn try_gemm_q8_0_w8a8_tc_batched(
     guard.gemm_packed_batched_q8_0_w8a8_tc(weight_key, w_bytes, x, out, m, k, n)
 }
 
+/// Batched Q8_0 matvec via the native CUDA f32-reuse prefill GEMM (verdict
+/// `gemm:q8_0_f32`, bit-exact/LOSSLESS). The Q8_0 analog of
+/// [`try_gemm_q4k_f32_batched`]: the kernel stages a dequantized weight block in
+/// shared memory and reuses it across the token tile (the weight-reuse fix for the
+/// re-streaming batched matvec). Weights are the SAME packed Q8_0 bytes.
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_q8_0_f32_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_packed_batched_q8_0_f32(weight_key, w_bytes, x, out, m, k, n)
+}
+
+/// Device-resident bit-exact Q8_0 f32-reuse prefill GEMM (MoE tiered-expert): a
+/// promoted Q8_0 expert already in CUDA device memory, run through the lossless
+/// f32 GEMM WITHOUT re-upload. The Q8_0 twin of
+/// [`try_gemm_q4k_f32_batched_dev_resident`]. Returns false on any miss.
+///
+/// # Safety
+/// `w_ptr_dev` must be a live device-accessible pointer of at least `w_nbytes`
+/// bytes on the default CUDA device, valid for the call.
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_gemm_q8_0_f32_batched_dev_resident(
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
+    // `>= w_nbytes` bytes on this cache's (default) device for the call.
+    let ok = unsafe {
+        guard.gemm_packed_batched_q8_0_f32_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n)
+    };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
+}
+
 // ------------------------------------------------------------
 // Blackwell SM12x FP4 tensor-core GEMM dispatch (opt-in)
 // ------------------------------------------------------------
@@ -941,6 +1000,18 @@ fn q4k_w8a8_tc_enabled() -> bool {
 fn q8_0_w8a8_tc_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q8_0_W8A8_TC) && cuda_active())
+}
+
+/// **AUTOMATIC** — no env var: the Q8_0 f32-reuse PREFILL GEMM (bit-exact,
+/// LOSSLESS) is on where its probe recorded a pass
+/// (`kernel_verdict("gemm:q8_0_f32")`). The lossless Q8_0 analog of
+/// [`q4k_gemm_f32_enabled`]: dispatched BELOW the lossy int8-TC Q8_0 GEMM, so it is
+/// the fast Q8_0 prefill path whenever the TC GEMM is perf-gated off. Fail-closed;
+/// cached (a write-blind kernel bug on an unvalidated arch leaves the verdict unset
+/// → the re-streaming batched matvec runs).
+fn q8_0_gemm_f32_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q8_0_F32) && cuda_active())
 }
 
 /// **AUTOMATIC** — no env var: the Q4_K W4A8 DECODE matvec (int8 activations,
@@ -18535,6 +18606,20 @@ pub fn try_matvec_tensor_batched_usm_f32(
                     {
                         return true;
                     }
+                    // Promoted Q8_0 expert → the lossless f32-reuse GEMM
+                    // dev-resident (there is no Q8_0 TC dev-resident path; the f32
+                    // GEMM is the fast lossless Q8_0 prefill). Verdict-gated,
+                    // fail-closed. SAFETY: as above.
+                    if matches!(ck_kind, ck::CudaPackedKind::Q8_0)
+                        && q8_0_gemm_f32_enabled()
+                        && n >= 16
+                        && k % 32 == 0
+                        && unsafe {
+                            try_gemm_q8_0_f32_batched_dev_resident(dptr, w_nbytes, x, out, m, k, n)
+                        }
+                    {
+                        return true;
+                    }
                     // Tensor-core prefill GEMMs for the TC formats, same gates +
                     // order as the uploading arm — so a promoted NVFP4/MXFP4/
                     // MXFP8/MXFP6 expert on a GPU-placed layer keeps its TC GEMM
@@ -18776,6 +18861,17 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 && n >= 16
                 && k % 32 == 0
                 && try_gemm_q8_0_w8a8_tc_batched(wb.as_ptr() as usize, wb, x, out, m, k, n)
+            {
+                return true;
+            }
+            // Q8_0 f32-reuse prefill GEMM (bit-exact, LOSSLESS) — the lossless
+            // fallback below the lossy int8-TC GEMM: fixes the O(M·K·N) weight
+            // re-streaming of the batched matvec for Q8_0 when the TC GEMM is off.
+            if matches!(ck_kind, ck::CudaPackedKind::Q8_0)
+                && q8_0_gemm_f32_enabled()
+                && n >= 16
+                && k % 32 == 0
+                && try_gemm_q8_0_f32_batched(wb.as_ptr() as usize, wb, x, out, m, k, n)
             {
                 return true;
             }

@@ -264,6 +264,18 @@ extern "C" {
         k: c_int,
         n: c_int,
     ) -> c_int;
+    // Q8_0 prefill GEMM: tiled, shared-mem weight REUSE, f32 accumulate (bit-exact,
+    // LOSSLESS — the Q8_0 analogue of `rsl_cuda_gemm_q4_k_f32`). out[N,M] = x[N,K] .
+    // W[M,K]^T. Selected by accel.rs on the prefill path via `gemm:q8_0_f32`.
+    fn rsl_cuda_gemm_q8_0_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // Q4_K prefill GEMM (Phase 2): int8 tensor-core W8A8 (lossy). Same shape;
     // selected via the `gemm:q4_k_w8a8_tc` verdict.
     fn rsl_cuda_gemm_q4_k_w8a8_tc(
@@ -2282,6 +2294,30 @@ pub unsafe fn gemm_q4_k_f32(
     n: usize,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_gemm_q4_k_f32(stream.raw(), w, x, out, m as c_int, k as c_int, n as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Safe wrapper for the Q8_0 f32-reuse prefill GEMM (bit-exact, LOSSLESS — the
+/// Q8_0 analogue of [`gemm_q4_k_f32`]). Selected only when the `gemm:q8_0_f32`
+/// verdict passed.
+///
+/// SAFETY: `w`/`x`/`out` are device pointers on `stream`'s device sized for the
+/// Q8_0 block layout and the given M/K/N (K % 32 == 0).
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn gemm_q8_0_f32(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_gemm_q8_0_f32(stream.raw(), w, x, out, m as c_int, k as c_int, n as c_int);
     if rc == 0 {
         Ok(())
     } else {
@@ -7201,6 +7237,55 @@ impl CudaMatvecCache {
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
 
+    /// Q8_0 f32-reuse prefill GEMM — the LOSSLESS Q8_0 analogue of
+    /// [`Self::gemm_packed_batched_q4k_f32`] (same device-buffer lifecycle, same
+    /// shared-mem weight-reuse tiled GEMM; only the packed dtype differs). Selected
+    /// by accel.rs on the prefill (batched) path when the `gemm:q8_0_f32` verdict
+    /// passed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_packed_batched_q8_0_f32(
+        &mut self,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q8_0;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_bytes.len() < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: device buffers sized for N rows, as `matvec_packed_batched`.
+        let res = unsafe { gemm_q8_0_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
     /// Device-resident Q4_K prefill GEMM — the promoted-expert analogue of
     /// [`Self::gemm_packed_batched_q4k_f32`]. The weight already lives on the
     /// device (`w_ptr_dev`, managed memory): no `weight_key` / no upload. The
@@ -7249,6 +7334,62 @@ impl CudaMatvecCache {
         // SAFETY: w is a caller-guaranteed live device buffer; x/out are device
         // scratch sized for N rows; same kernel as the uploading GEMM → bit-exact.
         let res = unsafe { gemm_q4_k_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Device-resident Q8_0 f32-reuse prefill GEMM — the promoted-expert analogue
+    /// of [`Self::gemm_packed_batched_q8_0_f32`] and the Q8_0 twin of
+    /// [`Self::gemm_packed_batched_q4k_f32_dev_resident`]. The weight already lives
+    /// on the device (`w_ptr_dev`, managed memory): no `weight_key` / no upload.
+    /// LOSSLESS (bit-exact) and keeps the prefill-GEMM win for a promoted Q8_0
+    /// expert. Returns false (caller falls through) on bad shape / scratch / kernel
+    /// failure; leaves `out` untouched.
+    ///
+    /// # Safety
+    /// `w_ptr_dev` must be a live device-accessible pointer of at least
+    /// `w_nbytes` bytes on this cache's device, valid for the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_packed_batched_q8_0_f32_dev_resident(
+        &mut self,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q8_0;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_nbytes < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = w_ptr_dev;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w is a caller-guaranteed live device buffer; x/out are device
+        // scratch sized for N rows; same kernel as the uploading GEMM → bit-exact.
+        let res = unsafe { gemm_q8_0_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }

@@ -202,6 +202,12 @@ pub const VERDICT_XMX_GEMM: &str = "xmx:gemm";
 /// bit-exact batched parity probe; gated fail-closed (catches a write-blind
 /// kernel bug on an unvalidated arch).
 pub const VERDICT_GEMM_Q4K_F32: &str = "gemm:q4_k_f32";
+/// Q8_0 prefill GEMM via shared-mem weight reuse, f32 accumulate (bit-exact,
+/// LOSSLESS — the Q8_0 analog of [`VERDICT_GEMM_Q4K_F32`]). Backs `q8_0_gemm_f32`,
+/// wired onto the batched/prefill CUDA path BELOW the lossy int8-TC Q8_0 GEMM, so
+/// it is the lossless fast Q8_0 prefill path when the TC GEMM is perf-gated off.
+/// Graded by the bit-exact batched parity probe; gated fail-closed.
+pub const VERDICT_GEMM_Q8_0_F32: &str = "gemm:q8_0_f32";
 /// Q4_K prefill GEMM via int8 tensor cores (W8A8, LOSSY). Backs `q4k_w8a8_tc`,
 /// wired onto the batched/prefill CUDA path ABOVE the bit-exact f32 GEMM (it is
 /// dispatched first). Graded by a FAIR W8A8 probe (int8 activations) + the perf gate.
