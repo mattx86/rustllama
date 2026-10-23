@@ -531,6 +531,11 @@ fn probe_names() -> Vec<String> {
     // GPU encoder and falls back to CPU on error), so it's excluded from the
     // banked verdicts in `collect_sycl_verdicts`.
     v.push("encoder:iq1_s".to_string());
+    // PP-0s — SYCL cross-device USM peer-copy transport. On a single SYCL GPU the
+    // round-trip is src==dst (a device-local copy), validating the API + byte
+    // fidelity; the real cross-device transfer runs the identical call on
+    // multi-Arc/PVC HW. WRITE-BLIND. Banked by `collect_sycl_verdicts`.
+    v.push("peer:copy_sycl".to_string());
     v
 }
 
@@ -1108,9 +1113,29 @@ pub fn run_probe(name: &str) -> anyhow::Result<()> {
         "ssm" => probe_delta_net(&stream, name, rest, started),
         // F17: IQ1_S GPU quant-encoder vs CPU reference.
         "encoder" => probe_iq_encoder(&stream, name, rest, started),
+        // PP-0s: SYCL cross-device USM peer-copy transport.
+        "peer" => probe_peer_copy_sycl(&stream, name, started),
         _ => anyhow::bail!("unknown probe kind {kind}"),
     }
     Ok(())
+}
+
+/// PP-0s — grade the SYCL peer-copy transport: round-trip a buffer through
+/// `sycl_memcpy_peer` on this device and check byte fidelity. On one SYCL GPU
+/// src==dst (device-local copy); the real cross-device transfer is validated on
+/// multi-Arc/PVC HW. WRITE-BLIND.
+fn probe_peer_copy_sycl(stream: &sk::SyclStream, name: &str, started: Instant) {
+    let ms = started.elapsed().as_millis();
+    match sk::peer_copy_self_check(stream) {
+        None => emit(name, "SKIP", "usm-alloc-failed-or-no-sycl"),
+        Some((passed, worst)) => emit(
+            name,
+            if passed { "OK" } else { "MISCOMPUTE" },
+            &format!(
+                "worst_abs={worst:.5} ms={ms} (single-GPU self-copy; cross-device USM on multi-GPU HW)"
+            ),
+        ),
+    }
 }
 
 /// Model-realistic shape: the per-expert gate/up matvec of the target

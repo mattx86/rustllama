@@ -773,6 +773,24 @@ void* rsl_usm_alloc_device_from_host(rsl_stream* s, const void* src_host, std::s
     return p;
 })
 
+// PP-0s (multi-GPU SYCL) — cross-device USM copy: the SYCL twin of the CUDA peer
+// transport (`rsl_cuda_memcpy_peer`). `queue.memcpy` copies USM->USM; when `dst`
+// and `src` share a context (devices on one platform share oneAPI's default
+// context) this is a cross-device transfer, otherwise SYCL host-stages it — so it
+// is correct whether or not direct P2P is available, exactly like
+// `cudaMemcpyPeerAsync`. On a SINGLE device `src` and `dst` are on the same device
+// => a device-local copy (what the peer self-check exercises on 1 SYCL GPU).
+// Synchronous. rc: 0 ok, -1 bad args; a SYCL exception maps to the macro's error.
+int rsl_sycl_memcpy_peer(rsl_stream* dst_s, void* dst, const void* src,
+                         std::size_t n_bytes)
+        RSL_FFI_BODY_RET("rsl_sycl_memcpy_peer", -1, {
+    if (dst_s == nullptr || dst == nullptr || src == nullptr || n_bytes == 0) {
+        return -1;
+    }
+    dst_s->q.memcpy(dst, src, n_bytes).wait();
+    return 0;
+})
+
 // Pull the most-recent USM allocation diagnostic into `dst_buf` and
 // clear it. Returns the byte length copied (excluding NUL); 0 when
 // no diagnostic has been stored since the last consume call. Buffer

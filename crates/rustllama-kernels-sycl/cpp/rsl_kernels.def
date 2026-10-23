@@ -31,6 +31,7 @@ EXPORTS
     rsl_usm_alloc_shared
     rsl_usm_free
     rsl_usm_alloc_device_from_host
+    rsl_sycl_memcpy_peer
 
     ; Host-pointer kernels
     rsl_gemm_f16

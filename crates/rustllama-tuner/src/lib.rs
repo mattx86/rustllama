@@ -414,6 +414,13 @@ pub const VERDICT_SSM_DELTA_NET_STEP: &str = "ssm:delta_net_step";
 /// verifiable without a 2nd GPU — real P2P transport is confirmed on multi-GPU HW).
 /// Foundation for pipeline-stage activation handoff + the TP collectives.
 pub const VERDICT_PEER_COPY: &str = "peer:copy";
+/// SYCL multi-GPU — the cross-device USM peer-copy transport is byte-correct. The
+/// SYCL twin of [`VERDICT_PEER_COPY`], graded by `doctor --sycl-parity peer:copy_sycl`
+/// (a round-trip through `rsl_sycl_memcpy_peer`; on a single SYCL GPU src==dst
+/// validates the API + byte fidelity, the only part verifiable without a 2nd SYCL
+/// GPU — real cross-device USM transfer confirmed on multi-Arc/PVC HW). Foundation
+/// for the SYCL `GpuTransport` (per-device SYCL matvec routing + collectives).
+pub const VERDICT_PEER_COPY_SYCL: &str = "peer:copy_sycl";
 /// TP-1 (multi-GPU) — the cross-GPU all-reduce (SUM) collective recombines
 /// correctly. Graded by `doctor --cuda-parity collective:all_reduce`: K partial
 /// buffers are summed via a star reduce (peer-copy + on-device `add_f32`) +

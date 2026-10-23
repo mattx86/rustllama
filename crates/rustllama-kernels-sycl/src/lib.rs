@@ -157,6 +157,13 @@ mod imp {
             src_host: *const std::ffi::c_void,
             n_bytes: usize,
         ) -> *mut std::ffi::c_void;
+        // PP-0s — cross-device USM copy on `dst_s`'s queue. rc 0 ok, -1 bad args.
+        pub(super) fn rsl_sycl_memcpy_peer(
+            dst_s: *mut rsl_stream,
+            dst: *mut std::ffi::c_void,
+            src: *const std::ffi::c_void,
+            n_bytes: usize,
+        ) -> c_int;
 
         // XMX/DPAS bf16 tensor-core GEMM (Arc/PVC). out[n*M+m] = sum_k
         // W[m,k]*X[n,k], W/X/out f32 (USM pointers). rc: 0 ok, -1 bad args,
@@ -2399,6 +2406,64 @@ mod imp {
                 src.len(),
             )
         }
+    }
+
+    /// PP-0s — cross-device USM copy on `stream`'s queue (the SYCL twin of the
+    /// CUDA peer transport). Correct whether or not direct P2P is available (SYCL
+    /// host-stages otherwise); on a single device it is a device-local copy.
+    ///
+    /// SAFETY: `dst`/`src` must be live USM allocations of >= `n_bytes` reachable
+    /// from `stream`'s context for the synchronous copy.
+    pub unsafe fn sycl_memcpy_peer(
+        stream: &SyclStream,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        n_bytes: usize,
+    ) -> bool {
+        unsafe { rsl_sycl_memcpy_peer(stream.raw, dst, src, n_bytes) == 0 }
+    }
+
+    /// PP-0s parity self-check: round-trip a buffer through [`sycl_memcpy_peer`] on
+    /// `stream`'s device. On a single-GPU box this validates the API + exact byte
+    /// fidelity (the only part verifiable without a 2nd SYCL GPU); the real
+    /// cross-device transfer runs the identical call on multi-GPU HW. Returns
+    /// `(passed, worst_abs_diff)`, or `None` on alloc failure / no SYCL. Uses shared
+    /// USM (host-accessible) so the check can fill `src` + read `dst` directly.
+    pub fn peer_copy_self_check(stream: &SyclStream) -> Option<(bool, f32)> {
+        let n = 4096usize;
+        let nbytes = n * 4;
+        let src = usm_alloc_shared(stream, nbytes);
+        let dst = usm_alloc_shared(stream, nbytes);
+        if src.is_null() || dst.is_null() {
+            if !src.is_null() {
+                unsafe { usm_free(stream, src) };
+            }
+            if !dst.is_null() {
+                unsafe { usm_free(stream, dst) };
+            }
+            return None;
+        }
+        let expect: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 7.0).collect();
+        // Shared USM is host-accessible: fill `src`, read `dst` back directly.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expect.as_ptr(), src as *mut f32, n);
+        }
+        let ok = unsafe { sycl_memcpy_peer(stream, dst, src as *const std::ffi::c_void, nbytes) };
+        let worst = if ok {
+            let got = unsafe { std::slice::from_raw_parts(dst as *const f32, n) };
+            expect
+                .iter()
+                .zip(got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+        } else {
+            f32::INFINITY
+        };
+        unsafe {
+            usm_free(stream, src);
+            usm_free(stream, dst);
+        }
+        Some((ok && worst == 0.0, worst))
     }
 
     pub fn rmsnorm_usm(
@@ -7021,6 +7086,29 @@ pub fn usm_alloc_shared(stream: &SyclStream, n_bytes: usize) -> *mut std::ffi::c
 /// See above.
 pub unsafe fn usm_free(stream: &SyclStream, ptr: *mut std::ffi::c_void) {
     unsafe { imp::usm_free(stream, ptr) };
+}
+
+/// PP-0s — cross-device USM copy (the SYCL twin of the CUDA peer transport),
+/// re-exported from [`imp`]. The multi-GPU `GpuTransport` SYCL primitive.
+///
+/// # Safety
+///
+/// `dst`/`src` must be live USM allocations of >= `n_bytes` reachable from
+/// `stream`'s context for the synchronous copy.
+pub unsafe fn sycl_memcpy_peer(
+    stream: &SyclStream,
+    dst: *mut std::ffi::c_void,
+    src: *const std::ffi::c_void,
+    n_bytes: usize,
+) -> bool {
+    unsafe { imp::sycl_memcpy_peer(stream, dst, src, n_bytes) }
+}
+
+/// PP-0s parity self-check for the SYCL peer transport (`peer:copy_sycl`): a
+/// single-device round-trip that validates the API + byte fidelity (the only part
+/// verifiable without a 2nd SYCL GPU). `None` with no SYCL device.
+pub fn peer_copy_self_check(stream: &SyclStream) -> Option<(bool, f32)> {
+    imp::peer_copy_self_check(stream)
 }
 
 /// Raw-pointer variant of [`flash_attn_decode_usm`] for callers
