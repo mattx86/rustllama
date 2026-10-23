@@ -229,7 +229,12 @@ pub fn delta_net_step_enabled() -> bool {
                 _ => kernel_verdict(rustllama_tuner::VERDICT_SSM_DELTA_NET_STEP) && cuda_active(),
             },
         );
-    base && DN_RESIDENT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) && !spec_active()
+    // `!pipeline_active()`: a multi-device pipeline split (PP-2) keeps DeltaNet
+    // state host-authoritative and routes each SSM layer to its own device, so
+    // the device-0-resident step stays off.
+    base && DN_RESIDENT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        && !spec_active()
+        && !pipeline_active()
 }
 
 /// Mark the device-resident DeltaNet state stale (next step for each layer
@@ -2004,6 +2009,18 @@ static MULTI_GPU_PLAN: std::sync::RwLock<Option<std::sync::Arc<MultiGpuPlan>>> =
 /// touches the lock and runs exactly today's code.
 static MULTI_GPU_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// PP-2 hot-path gate: a multi-device PIPELINE plan is installed (a per-layer
+/// stage map spanning ≥2 distinct GPUs). When set, the single-device-0 resident
+/// decode fast paths (the whole-step / whole-layer CUDA graphs, the resident
+/// attention block, the resident DeltaNet step, the TP column-split) self-disable
+/// so every layer's matvecs route to THAT layer's own device through the
+/// per-matvec cross-device dispatch — those fast paths assume all layers live on
+/// device 0 and keep cross-token / cross-layer state there, so they would compute
+/// a split-off stage's layers on the wrong GPU. Kept in lockstep with
+/// `MULTI_GPU_PLAN`. `false` for the default / single-GPU / per-tensor-heat-plan
+/// case ⇒ byte-identical to the pre-PP-2 path (one relaxed atomic load).
+static PIPELINE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Install (or clear) the multi-GPU device-assignment plan process-wide.
 /// Called by the engine at model load: `Some(plan)` after the heat planner
 /// produces one; `None` on every VRAM-fit / tune-measurement load, which also
@@ -2011,10 +2028,20 @@ static MULTI_GPU_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// call from any thread.
 pub fn set_multi_gpu_plan(plan: Option<std::sync::Arc<MultiGpuPlan>>) {
     let active = plan.is_some();
+    // PP-2: only a genuine multi-device stage plan (a pipeline per-layer map AND
+    // ≥2 distinct GPUs) flips the pipeline gate. A per-tensor heat plan, a
+    // single-GPU plan, or `None` leaves it `false`, so those paths keep every
+    // resident fast path and stay byte-identical. Computed before `plan` moves
+    // into the slot.
+    let pipeline = plan
+        .as_ref()
+        .map(|p| p.is_pipeline() && p.distinct_gpu_count() >= 2)
+        .unwrap_or(false);
     if let Ok(mut slot) = MULTI_GPU_PLAN.write() {
         *slot = plan;
     }
     MULTI_GPU_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+    PIPELINE_ACTIVE.store(pipeline, std::sync::atomic::Ordering::Release);
 }
 
 /// Is a multi-GPU plan installed? Hot-path gate — one atomic load. `false`
@@ -2022,6 +2049,15 @@ pub fn set_multi_gpu_plan(plan: Option<std::sync::Arc<MultiGpuPlan>>) {
 #[inline]
 pub fn multi_gpu_plan_active() -> bool {
     MULTI_GPU_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// PP-2: is a multi-device PIPELINE plan active? One relaxed-acquire atomic load.
+/// `true` ⇒ the single-device-0 resident decode fast paths self-disable so each
+/// layer runs on its assigned device via the per-matvec cross-device routing.
+/// `false` (default / single-GPU / per-tensor plan) ⇒ the historical path.
+#[inline]
+pub fn pipeline_active() -> bool {
+    PIPELINE_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Snapshot the installed plan (cheap `Arc` clone) for the dispatch branch.
@@ -10560,6 +10596,12 @@ pub fn moe_vram_margin_override() -> Option<u64> {
 /// per-arm force override short-circuits the verdict so the A/B itself can drive
 /// both arms. (The block is already bit-exact/coherent; the gate is purely perf.)
 fn dev_attn_enabled() -> bool {
+    // PP-2: a multi-device pipeline split host-stages `hidden` between layers, so
+    // the cross-layer-resident attention block (which pins `hidden` on device 0
+    // across the layer) must stay off — even under a tuner force override.
+    if pipeline_active() {
+        return false;
+    }
     match DEV_ATTN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => return false,
         1 => return true,
@@ -10579,6 +10621,11 @@ fn dev_attn_enabled() -> bool {
 /// captured chain is the same kernels as the eager block, so the gate is purely
 /// perf (correctness via `doctor --cuda-parity`).
 fn dev_attn_cuda_graph_enabled() -> bool {
+    // PP-2: off under a multi-device pipeline split — the captured graph is a
+    // device-0 chain, so a stage on another GPU must take the host-staged path.
+    if pipeline_active() {
+        return false;
+    }
     match DEV_ATTN_GRAPH_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => return false,
         1 => return true,
@@ -10599,7 +10646,10 @@ fn dev_attn_cuda_graph_enabled() -> bool {
 /// unvalidated — this keeps it off until its own probe is green.
 fn dev_layer_cuda_graph_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // PP-2: off under a multi-device pipeline split (the captured FFN-in-graph
+    // chain is a device-0 chain).
     *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH))
+        && !pipeline_active()
 }
 
 /// T2 (B1) WHOLE-DECODE-STEP graph gate — perf-gated on
@@ -10622,8 +10672,10 @@ pub fn dev_step_cuda_graph_enabled() -> bool {
             },
         );
     // Disable the whole-step graph while speculating — the captured graph assumes a
-    // monotonic position and wedges/re-captures under draft/verify rollback.
-    base && !spec_active()
+    // monotonic position and wedges/re-captures under draft/verify rollback — and
+    // under a multi-device pipeline split (PP-2), where the single-device-0 step
+    // graph would run every stage's layers on device 0 instead of their own GPUs.
+    base && !spec_active() && !pipeline_active()
 }
 
 /// Run the WHOLE attention block for one decode token on the GPU, keeping the
@@ -11079,6 +11131,12 @@ pub fn try_decode_step_cuda_graph_f32(
 /// The block is already correctness-validated (`doctor --sycl-parity`), so the
 /// gate is purely perf.
 fn dev_attn_sycl_enabled() -> bool {
+    // PP-2: off under a multi-device pipeline split (defense-in-depth for the
+    // future SYCL pipeline phase — the resident block pins `hidden` on one USM
+    // device across the layer).
+    if pipeline_active() {
+        return false;
+    }
     match DEV_ATTN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => return false,
         1 => return true,
@@ -11450,6 +11508,11 @@ pub fn try_decode_attn_block_sycl_f32(
 /// path runs). The block is correctness-validated (`doctor --metal-parity`), so
 /// the gate is purely perf.
 fn dev_attn_mlx_enabled() -> bool {
+    // PP-2: off under a multi-device pipeline split (defense-in-depth; in-box MLX
+    // is single-GPU, so this is reachable only via the future multi-Mac phase).
+    if pipeline_active() {
+        return false;
+    }
     match DEV_ATTN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => return false,
         1 => return true,
@@ -16661,7 +16724,12 @@ pub fn try_matvec_tensor_usm_f32(
             // big projection). Self-check-gated + fail-closed → inert on a
             // single-GPU box; a miss falls through to the single-device matvec,
             // which overwrites `out` fully.
+            // TP column-split is mutually exclusive with a PP stage split: under
+            // pipeline mode this layer is already pinned to one device, so don't
+            // also shard its matvec across GPUs (that would double-book device 1
+            // against the next stage's work).
             if m >= TP_MIN_ROWS
+                && !pipeline_active()
                 && tp_cuda_usable()
                 && try_matvec_tp_cuda(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k)
             {

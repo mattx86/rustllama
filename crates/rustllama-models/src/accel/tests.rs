@@ -456,3 +456,71 @@ fn try_usm_helpers_short_circuit_when_layer_past_cutoff() {
     .join()
     .unwrap();
 }
+
+/// PP-2: `pipeline_active()` (the gate that disables the device-0-resident fast
+/// paths so each stage runs on its own GPU) must flip ON only for a genuine
+/// multi-device stage plan — not for a per-tensor heat plan or a 1-GPU stage
+/// plan — and reset on plan clear. No GPU needed: `set_multi_gpu_plan` /
+/// `pipeline_active` are pure process state.
+#[test]
+fn pp2_pipeline_gate_tracks_multi_device_stage_plan() {
+    use std::sync::Arc;
+    let cuda0 = DeviceTarget {
+        backend: GpuBackend::Cuda,
+        device_index: 0,
+    };
+    let cuda1 = DeviceTarget {
+        backend: GpuBackend::Cuda,
+        device_index: 1,
+    };
+
+    // No plan: both gates false (the single-GPU / CPU default).
+    set_multi_gpu_plan(None);
+    assert!(!multi_gpu_plan_active());
+    assert!(!pipeline_active());
+
+    // A per-tensor heat plan (by_name only, no per-layer map) is NOT a pipeline:
+    // the dispatch gate is active but the pipeline gate stays off.
+    let mut by_name = std::collections::HashMap::new();
+    by_name.insert("blk.0.attn_q.weight".to_string(), cuda1);
+    let per_tensor = MultiGpuPlan::new(by_name, None);
+    assert!(!per_tensor.is_pipeline());
+    set_multi_gpu_plan(Some(Arc::new(per_tensor)));
+    assert!(multi_gpu_plan_active());
+    assert!(
+        !pipeline_active(),
+        "a per-tensor heat plan must not trip the pipeline gate"
+    );
+
+    // A single-GPU stage plan (every layer on cuda:0) is a pipeline MAP but spans
+    // only ONE device, so the pipeline gate stays off (byte-identical path).
+    let single = MultiGpuPlan::new(std::collections::HashMap::new(), None)
+        .with_by_layer(vec![cuda0, cuda0, cuda0]);
+    assert!(single.is_pipeline());
+    assert_eq!(single.distinct_gpu_count(), 1);
+    set_multi_gpu_plan(Some(Arc::new(single)));
+    assert!(
+        !pipeline_active(),
+        "a 1-GPU stage plan must not trip the pipeline gate"
+    );
+
+    // A genuine 2-GPU stage split: the per-layer routing resolves correctly AND
+    // the pipeline gate trips.
+    let split = MultiGpuPlan::new(std::collections::HashMap::new(), None)
+        .with_by_layer(vec![cuda0, cuda0, cuda1]);
+    assert!(split.is_pipeline());
+    assert_eq!(split.distinct_gpu_count(), 2);
+    assert_eq!(split.layer_device(2), Some(cuda1));
+    assert_eq!(split.device_for("blk.2.attn_q.weight", 2), Some(cuda1));
+    set_multi_gpu_plan(Some(Arc::new(split)));
+    assert!(multi_gpu_plan_active());
+    assert!(
+        pipeline_active(),
+        "a ≥2-GPU stage split must trip the pipeline gate"
+    );
+
+    // Clearing the plan (model unload / reload) resets both gates.
+    set_multi_gpu_plan(None);
+    assert!(!multi_gpu_plan_active());
+    assert!(!pipeline_active());
+}
