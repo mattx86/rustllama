@@ -1926,6 +1926,12 @@ pub struct MultiGpuPlan {
     /// The GPU that runs attention (and therefore holds the KV cache).
     /// Informational for the engine; `None` when attention is on CPU.
     attn_device: Option<DeviceTarget>,
+    /// PP (pipeline): per-LAYER device — `by_layer[L]` = the device running
+    /// transformer layer `L`. Empty for a pure per-tensor heat plan. A stage-based
+    /// pipeline plan fills this (contiguous layer ranges per device) AND `by_name`
+    /// (so the matvec dispatch still routes per tensor); the forward loop reads
+    /// `layer_device()` to find stage boundaries for the P2P activation handoff.
+    by_layer: Vec<DeviceTarget>,
 }
 
 impl MultiGpuPlan {
@@ -1933,21 +1939,40 @@ impl MultiGpuPlan {
         Self {
             by_name,
             attn_device,
+            by_layer: Vec::new(),
         }
     }
-    /// The GPU a weight is assigned to, or `None` for the CPU tier.
-    /// `_layer_idx` is accepted for future per-layer fallbacks; today the
-    /// table is keyed purely by tensor name (exact GGUF names are unique).
+    /// Attach a per-layer device map (PP stage plan). Builder-style.
+    pub fn with_by_layer(mut self, by_layer: Vec<DeviceTarget>) -> Self {
+        self.by_layer = by_layer;
+        self
+    }
+    /// The GPU a weight is assigned to, or `None` for the CPU tier. Per-tensor
+    /// (`by_name`) first; falls back to the per-layer map (`by_layer[layer_idx]`)
+    /// so a stage plan routes a layer's tensors even if not individually named.
     #[inline]
-    pub fn device_for(&self, tensor_name: &str, _layer_idx: u32) -> Option<DeviceTarget> {
-        self.by_name.get(tensor_name).copied()
+    pub fn device_for(&self, tensor_name: &str, layer_idx: u32) -> Option<DeviceTarget> {
+        self.by_name
+            .get(tensor_name)
+            .copied()
+            .or_else(|| self.by_layer.get(layer_idx as usize).copied())
+    }
+    /// PP: the device running transformer layer `layer_idx`, or `None` when there
+    /// is no per-layer map (pure per-tensor plan) or the index is out of range.
+    #[inline]
+    pub fn layer_device(&self, layer_idx: usize) -> Option<DeviceTarget> {
+        self.by_layer.get(layer_idx).copied()
+    }
+    /// Whether this is a stage-based pipeline plan (has a per-layer map).
+    pub fn is_pipeline(&self) -> bool {
+        !self.by_layer.is_empty()
     }
     /// The device running attention (KV-cache-resident GPU), if any.
     pub fn attn_device(&self) -> Option<DeviceTarget> {
         self.attn_device
     }
     pub fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
+        self.by_name.is_empty() && self.by_layer.is_empty()
     }
     /// Number of distinct GPU devices this plan routes weights to. `<= 1`
     /// means no cross-GPU routing is needed (single active device handles
@@ -1955,6 +1980,9 @@ impl MultiGpuPlan {
     pub fn distinct_gpu_count(&self) -> usize {
         let mut set: std::collections::HashSet<DeviceTarget> = std::collections::HashSet::new();
         for t in self.by_name.values() {
+            set.insert(*t);
+        }
+        for t in &self.by_layer {
             set.insert(*t);
         }
         set.len()

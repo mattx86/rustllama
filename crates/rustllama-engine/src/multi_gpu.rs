@@ -314,12 +314,16 @@ pub struct HeatPlan {
     /// Number of distinct GPU devices the plan routes to. `> 1` ⇒ cross-GPU
     /// routing is in play (needs Phase 4's per-device caches).
     pub distinct_gpu_count: usize,
+    /// PP (pipeline): per-LAYER device (`by_layer[L]` = the GPU running transformer
+    /// layer L). Empty for a per-tensor heat plan; a stage plan fills it so the
+    /// forward loop can find stage boundaries for the P2P activation handoff.
+    pub by_layer: Vec<DeviceTarget>,
 }
 
 impl HeatPlan {
     /// Lower to the runtime [`MultiGpuPlan`] the dispatch hot path consults.
     /// Only GPU-assigned tensors are entered; CPU tensors are absent (⇒ the
-    /// dispatch gate routes them to CPU).
+    /// dispatch gate routes them to CPU). A stage plan also carries `by_layer`.
     pub fn to_multi_gpu_plan(&self) -> MultiGpuPlan {
         let mut by_name: HashMap<String, DeviceTarget> = HashMap::new();
         for (name, tier) in &self.assignments {
@@ -327,8 +331,124 @@ impl HeatPlan {
                 by_name.insert(name.clone(), *t);
             }
         }
-        MultiGpuPlan::new(by_name, self.attn_device)
+        MultiGpuPlan::new(by_name, self.attn_device).with_by_layer(self.by_layer.clone())
     }
+}
+
+/// Extract the transformer-layer index from a GGUF tensor name (`blk.<N>.<rest>`),
+/// or `None` for non-layer tensors (`token_embd`, `output`, `output_norm`).
+fn layer_index_of(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("blk.")?;
+    let end = rest.find('.')?;
+    rest[..end].parse::<usize>().ok()
+}
+
+/// PP-1 — stage-based pipeline placement: split the transformer layers into
+/// CONTIGUOUS ranges, one range ("stage") per GPU, by per-device VRAM budget, so a
+/// model that doesn't fit one GPU runs across N. Fills both `by_layer` (per-layer
+/// device, for the forward's P2P handoff) and `assignments` (per-tensor, for the
+/// matvec dispatch). Returns `None` on <2 usable GPUs (the single-GPU path is
+/// unchanged) or when perf tiers are unavailable. `placement_error` when the model
+/// overflows even all GPUs (caller refuses). WRITE-BLIND (needs real multi-GPU HW).
+pub fn plan_pipeline_stages(
+    weights: &LlamaWeights,
+    per_device_perf: &HashMap<String, f32>,
+    opts: &AutoPlacementOpts,
+) -> Option<HeatPlan> {
+    let tiers = build_tiers(per_device_perf, opts, false)?;
+    // GPU tiers in the order build_tiers emits them (CUDA by index, then SYCL) —
+    // stage 0 = the first GPU. (device, budget_bytes)
+    let gpu_tiers: Vec<(DeviceTarget, u64)> = tiers
+        .iter()
+        .filter_map(|t| match t.kind {
+            TierKind::Gpu(d) => Some((d, t.budget_bytes)),
+            _ => None,
+        })
+        .collect();
+    if gpu_tiers.len() < 2 {
+        return None; // PP is meaningless on <2 GPUs; single-device path is unchanged.
+    }
+
+    let tensors = collect_tensors(weights);
+    let mut layer_bytes: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
+    let mut non_layer: Vec<&TensorInfo> = Vec::new();
+    for ti in &tensors {
+        match layer_index_of(&ti.name) {
+            Some(l) => *layer_bytes.entry(l).or_default() += ti.bytes,
+            None => non_layer.push(ti),
+        }
+    }
+    let n_layers = layer_bytes.keys().max().map(|m| m + 1).unwrap_or(0);
+    if n_layers == 0 {
+        return None;
+    }
+
+    // Greedy contiguous fill: accumulate layers onto the current GPU until its
+    // budget is exceeded, then advance; the LAST GPU takes whatever remains.
+    let mut by_layer: Vec<DeviceTarget> = Vec::with_capacity(n_layers);
+    let mut dev_i = 0usize;
+    let mut used: u64 = 0;
+    let mut overflow = false;
+    for l in 0..n_layers {
+        let lb = *layer_bytes.get(&l).unwrap_or(&0);
+        while dev_i + 1 < gpu_tiers.len() && used + lb > gpu_tiers[dev_i].1 {
+            dev_i += 1;
+            used = 0;
+        }
+        used += lb;
+        if dev_i + 1 == gpu_tiers.len() && used > gpu_tiers[dev_i].1 {
+            overflow = true;
+        }
+        by_layer.push(gpu_tiers[dev_i].0);
+    }
+
+    let mut assignments: HashMap<String, TierKind> = HashMap::new();
+    for ti in &tensors {
+        if let Some(l) = layer_index_of(&ti.name) {
+            if l < by_layer.len() {
+                assignments.insert(ti.name.clone(), TierKind::Gpu(by_layer[l]));
+            }
+        }
+    }
+    let first = by_layer[0];
+    let last = *by_layer.last().unwrap();
+    for ti in &non_layer {
+        // Embedding on the first stage (its input), LM head / final norm on the last.
+        let dev = if ti.heat == Heat::Embedding {
+            first
+        } else {
+            last
+        };
+        assignments.insert(ti.name.clone(), TierKind::Gpu(dev));
+    }
+
+    let gpu_resident_bytes: u64 =
+        layer_bytes.values().sum::<u64>() + non_layer.iter().map(|t| t.bytes).sum::<u64>();
+    let distinct = {
+        let mut s: std::collections::HashSet<DeviceTarget> = std::collections::HashSet::new();
+        for d in &by_layer {
+            s.insert(*d);
+        }
+        s.len()
+    };
+    let placement_error = overflow.then(|| {
+        format!(
+            "pipeline: model ({} MiB of layers) overflows all {} GPUs' budgets",
+            gpu_resident_bytes / (1 << 20),
+            gpu_tiers.len()
+        )
+    });
+
+    Some(HeatPlan {
+        assignments,
+        attn_device: Some(first),
+        placement_error,
+        gpu_resident_bytes,
+        cpu_resident_bytes: 0,
+        reason: format!("pipeline: {n_layers} layers across {distinct} GPU stages"),
+        distinct_gpu_count: distinct,
+        by_layer,
+    })
 }
 
 /// PURE heat-ranked first-fit placement over pre-built, pre-measured tiers.
@@ -469,6 +589,7 @@ pub fn plan_from_tiers(weights: &LlamaWeights, tiers: &[Tier], cpu_allowed: bool
         cpu_resident_bytes: cpu_resident,
         reason,
         distinct_gpu_count,
+        by_layer: Vec::new(), // per-tensor heat plan has no per-layer stage map
     }
 }
 

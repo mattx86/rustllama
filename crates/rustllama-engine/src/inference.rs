@@ -4894,6 +4894,45 @@ impl ContiguousEngine {
                 .map(|t| t.per_device_perf)
                 .unwrap_or_default();
 
+        // PP-1: pipeline-stage mode (env `RUSTLLAMA_MULTI_GPU=pp`) splits the
+        // transformer layers into contiguous per-GPU stages (run a model bigger than
+        // one GPU's VRAM). Falls through to the per-tensor heat planner when not
+        // requested, or when <2 GPUs / no perf tiers make a stage plan impossible
+        // (`plan_pipeline_stages` returns None). WRITE-BLIND: execution validated on
+        // real multi-GPU HW; the forward's P2P handoff lands in PP-2.
+        if std::env::var("RUSTLLAMA_MULTI_GPU")
+            .map(|v| v.eq_ignore_ascii_case("pp"))
+            .unwrap_or(false)
+        {
+            if let Some(hp) = crate::multi_gpu::plan_pipeline_stages(
+                &self.model.weights,
+                &per_device_perf,
+                &effective,
+            ) {
+                let total = hp.by_layer.len() as u32;
+                let d = crate::placement_auto::AutoPlacementDecision {
+                    n_gpu_layers: total,
+                    total_layers: total,
+                    effective_budget_bytes: 0,
+                    gpu_resident_bytes: hp.gpu_resident_bytes,
+                    device_global_mem_bytes: 0,
+                    reason: hp.reason.clone(),
+                    placement_error: hp.placement_error.clone(),
+                    vram_only_noop: false,
+                    stream_window: None,
+                };
+                if hp.placement_error.is_some() {
+                    rustllama_models::accel::set_multi_gpu_plan(None);
+                    return d;
+                }
+                self.n_gpu_layers = total; // every layer is GPU-resident across stages
+                let plan = std::sync::Arc::new(hp.to_multi_gpu_plan());
+                rustllama_models::accel::set_multi_gpu_plan(Some(plan));
+                return d;
+            }
+            // None ⇒ <2 GPUs / no tiers: fall through to the single-device planner.
+        }
+
         match crate::multi_gpu::plan_heat_placement(
             &self.model.weights,
             &per_device_perf,
