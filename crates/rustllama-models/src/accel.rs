@@ -2309,6 +2309,61 @@ const TP_KEY_SALT_ROW: usize = 0x5450_524F_575F_4B21; // "TPROW_K!"
 /// slice extraction + reduce overhead.
 const TP_MIN_K_SPLIT: usize = 4096;
 
+/// TP-4 — host-side cache of extracted ROW-parallel (K-split) weight slices, so
+/// the strided per-row gather in [`tp_row_matvec_on`] runs ONCE per (weight host
+/// pointer, slice index, split degree) instead of every decode token. The
+/// device-resident UPLOAD is already cached per device by `matvec_packed`'s own
+/// weight-key cache; this amortizes the HOST extraction on top (the "pre-shard the
+/// row-parallel slices, keyed per device" refinement over TP-2's per-call band
+/// re-extract). Keyed by the weight's host pointer, so it is cleared on model
+/// (re)load by [`reset_device_caches_for_new_model`] — pointers churn and a stale
+/// entry could alias a freed weight.
+#[allow(clippy::type_complexity)]
+static TP_ROW_SLICE_CACHE: Mutex<
+    Option<std::collections::HashMap<(usize, usize, usize), std::sync::Arc<Vec<u8>>>>,
+> = Mutex::new(None);
+
+/// TP-4 — the device-`di` K-slice for a `ndev`-way split of the weight at
+/// `weight_key`, extracting + caching on a miss. The strided gather (one
+/// block-aligned sub-run per row at stride `row_bytes`) runs once per (weight,
+/// slice, degree); later calls clone the cached `Arc`. The extraction is done
+/// OUTSIDE the lock so a cold miss doesn't block other slices.
+fn tp_row_slice(
+    weight_key: usize,
+    w_bytes: &[u8],
+    row_bytes: usize,
+    rbd: usize,
+    m: usize,
+    di: usize,
+    ndev: usize,
+) -> std::sync::Arc<Vec<u8>> {
+    let key = (weight_key, di, ndev);
+    if let Ok(g) = TP_ROW_SLICE_CACHE.lock() {
+        if let Some(s) = g.as_ref().and_then(|map| map.get(&key)) {
+            return s.clone();
+        }
+    }
+    let mut w_d = vec![0u8; m * rbd];
+    for (r, chunk) in w_d.chunks_mut(rbd).enumerate() {
+        let so = r * row_bytes + di * rbd;
+        chunk.copy_from_slice(&w_bytes[so..so + rbd]);
+    }
+    let arc = std::sync::Arc::new(w_d);
+    if let Ok(mut g) = TP_ROW_SLICE_CACHE.lock() {
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(key, arc.clone());
+    }
+    arc
+}
+
+/// Clear the TP-4 row-slice cache (model reload), hooked into
+/// [`reset_device_caches_for_new_model`].
+pub fn tp_row_slice_cache_reset() {
+    if let Ok(mut g) = TP_ROW_SLICE_CACHE.lock() {
+        *g = None;
+    }
+}
+
 /// TP-2 — ROW-parallel (K-split) packed matvec CORE over an EXPLICIT device list,
 /// the complement of the column-split [`try_matvec_tp_cuda`] (which splits OUTPUT
 /// ROWS). Splits the contraction dim K into `devices.len()` block-aligned slices;
@@ -2348,6 +2403,11 @@ fn tp_row_matvec_on(
     if w_bytes.len() < m * row_bytes || out.len() != m || x.len() != k {
         return false;
     }
+    // TP-4: extract (or reuse the cached) per-device K-slice ONCE — the strided
+    // per-row gather is amortized across decode tokens, not rebuilt every call.
+    let slices: Vec<std::sync::Arc<Vec<u8>>> = (0..ndev)
+        .map(|di| tp_row_slice(weight_key, w_bytes, row_bytes, rbd, m, di, ndev))
+        .collect();
     // Each device computes the full [m] partial over its K-slice; the scoped joins
     // collect them, then they're summed into `out` (exact reduce of ndev vectors).
     let results: Vec<Option<Vec<f32>>> = std::thread::scope(|s| {
@@ -2355,12 +2415,7 @@ fn tp_row_matvec_on(
             .iter()
             .enumerate()
             .map(|(di, &dev)| {
-                // Strided extraction: row r's d-th sub-run [di*rbd, di*rbd+rbd).
-                let mut w_d = vec![0u8; m * rbd];
-                for (r, chunk) in w_d.chunks_mut(rbd).enumerate() {
-                    let so = r * row_bytes + di * rbd;
-                    chunk.copy_from_slice(&w_bytes[so..so + rbd]);
-                }
+                let w_d = slices[di].clone();
                 let x_d = x[di * kd..(di + 1) * kd].to_vec();
                 // Per-(device-slice) key: distinct from the whole weight AND the
                 // column bands, stable so each slice re-hits its own cache entry.
@@ -2368,7 +2423,14 @@ fn tp_row_matvec_on(
                 s.spawn(move || {
                     let mut local = vec![0f32; m];
                     if try_matvec_packed_cuda_dev(
-                        dev, kind, band_key, &w_d, &x_d, &mut local, m, kd,
+                        dev,
+                        kind,
+                        band_key,
+                        w_d.as_slice(),
+                        &x_d,
+                        &mut local,
+                        m,
+                        kd,
                     ) {
                         Some(local)
                     } else {
@@ -4101,6 +4163,7 @@ pub fn reset_device_caches_for_new_model() {
     paged_mlx_mirror_reset();
     set_moe_tier_active(false);
     delta_net_reset_device();
+    tp_row_slice_cache_reset();
 }
 
 // ===========================================================================

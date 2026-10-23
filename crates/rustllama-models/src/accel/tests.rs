@@ -524,3 +524,48 @@ fn pp2_pipeline_gate_tracks_multi_device_stage_plan() {
     assert!(!multi_gpu_plan_active());
     assert!(!pipeline_active());
 }
+
+/// TP-4: the row-slice cache extracts the correct strided K-slice bytes, returns
+/// the SAME `Arc` on a hit (no re-extraction), and drops everything on reset. Pure
+/// host logic — no GPU needed.
+#[test]
+fn tp4_row_slice_extracts_strided_and_caches() {
+    // 4 rows × 8 bytes/row; a 2-way split → each slice is 4 bytes/row, taken from
+    // the row's first (di=0) or second (di=1) half.
+    let row_bytes = 8usize;
+    let rbd = 4usize;
+    let m = 4usize;
+    let w: Vec<u8> = (0..(m * row_bytes) as u8).collect(); // 0..32
+    let key = w.as_ptr() as usize;
+
+    tp_row_slice_cache_reset();
+    let s0 = tp_row_slice(key, &w, row_bytes, rbd, m, 0, 2);
+    let s1 = tp_row_slice(key, &w, row_bytes, rbd, m, 1, 2);
+
+    // Row r: di=0 ⇒ w[r*8 .. r*8+4]; di=1 ⇒ w[r*8+4 .. r*8+8].
+    let expect0: Vec<u8> = (0..m)
+        .flat_map(|r| (r * 8..r * 8 + 4).map(|i| i as u8))
+        .collect();
+    let expect1: Vec<u8> = (0..m)
+        .flat_map(|r| (r * 8 + 4..r * 8 + 8).map(|i| i as u8))
+        .collect();
+    assert_eq!(s0.as_slice(), &expect0[..]);
+    assert_eq!(s1.as_slice(), &expect1[..]);
+
+    // A cache HIT returns the same Arc (the strided gather did not re-run).
+    let s0b = tp_row_slice(key, &w, row_bytes, rbd, m, 0, 2);
+    assert!(
+        std::sync::Arc::ptr_eq(&s0, &s0b),
+        "cache hit must reuse the Arc"
+    );
+
+    // After a reset, a fresh extraction (distinct Arc).
+    tp_row_slice_cache_reset();
+    let s0c = tp_row_slice(key, &w, row_bytes, rbd, m, 0, 2);
+    assert!(
+        !std::sync::Arc::ptr_eq(&s0, &s0c),
+        "after reset the cache re-extracts"
+    );
+    assert_eq!(s0c.as_slice(), &expect0[..]);
+    tp_row_slice_cache_reset();
+}
