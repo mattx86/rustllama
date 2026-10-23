@@ -416,6 +416,21 @@ pub struct InferenceConfig {
     /// via `RUSTLLAMA_VRAM_ONLY=1` and the `serve --vram-only` flag.
     #[serde(default)]
     pub vram_only: bool,
+    /// TP-5 — multi-GPU execution mode across ≥2 usable GPUs. Fail-closed and
+    /// INERT on a single-GPU box regardless of value. Accepted values:
+    /// - unset / `None` (the default) — **auto**: the tensor-parallel dispatch
+    ///   (column/row-parallel matvec + head-parallel attention) engages
+    ///   automatically where its on-device self-checks pass; no pipeline split.
+    /// - `"off"` — disable all cross-GPU work (every tensor on one device).
+    /// - `"pp"` — **pipeline** parallelism: split the layers into contiguous
+    ///   per-GPU stages to run a model larger than one GPU's VRAM (capacity).
+    /// - `"tp"` — **tensor** parallelism (same as auto today; explicit opt-in).
+    ///
+    /// The `RUSTLLAMA_MULTI_GPU` env var OVERRIDES this at read time.
+    /// WRITE-BLIND: the real cross-GPU execution is validated on 2+ GPU hardware;
+    /// the measured PP-vs-TP auto-selection is deferred to that hardware.
+    #[serde(default)]
+    pub multi_gpu: Option<String>,
     pub placement: PlacementConfig,
     /// Reuse the previous generation's KV cache when the new prompt shares
     /// a prefix with the previous one. Huge speedup for chat / coding-tool
@@ -1090,6 +1105,7 @@ impl Default for InferenceConfig {
             disabled_npus: Vec::new(),
             npu_enabled: true,
             vram_only: false,
+            multi_gpu: None,
             placement: PlacementConfig::default(),
             prefix_cache: true,
             prefix_cache_max_snapshots: 4,
@@ -1690,6 +1706,15 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 .to_string(),
         ));
     }
+    // TP-5 — `[inference].multi_gpu`, when set, must be one of the known modes.
+    if let Some(m) = cfg.inference.multi_gpu.as_ref() {
+        let m = m.trim().to_ascii_lowercase();
+        if !matches!(m.as_str(), "off" | "pp" | "tp") {
+            return Err(ConfigError::Validation(format!(
+                "[inference].multi_gpu must be \"off\", \"pp\", or \"tp\" (got \"{m}\")"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2133,6 +2158,22 @@ mod tests {
         // Both off leaves no compute tier — rejected.
         c.inference.cpu_enabled = false;
         c.inference.gpu_enabled = false;
+        assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn validate_multi_gpu_mode() {
+        let mut c = Config::default();
+        // Default (unset) is valid.
+        assert!(c.inference.multi_gpu.is_none());
+        assert!(validate(&c).is_ok());
+        // Each known mode is accepted (case-insensitive).
+        for m in ["off", "pp", "tp", "PP", "Tp"] {
+            c.inference.multi_gpu = Some(m.into());
+            assert!(validate(&c).is_ok(), "mode {m} should be valid");
+        }
+        // An unknown mode is rejected.
+        c.inference.multi_gpu = Some("hybrid".into());
         assert!(validate(&c).is_err());
     }
 

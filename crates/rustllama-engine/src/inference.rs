@@ -4894,16 +4894,14 @@ impl ContiguousEngine {
                 .map(|t| t.per_device_perf)
                 .unwrap_or_default();
 
-        // PP-1: pipeline-stage mode (env `RUSTLLAMA_MULTI_GPU=pp`) splits the
-        // transformer layers into contiguous per-GPU stages (run a model bigger than
-        // one GPU's VRAM). Falls through to the per-tensor heat planner when not
-        // requested, or when <2 GPUs / no perf tiers make a stage plan impossible
-        // (`plan_pipeline_stages` returns None). WRITE-BLIND: execution validated on
-        // real multi-GPU HW; the forward's P2P handoff lands in PP-2.
-        if std::env::var("RUSTLLAMA_MULTI_GPU")
-            .map(|v| v.eq_ignore_ascii_case("pp"))
-            .unwrap_or(false)
-        {
+        // PP-1: pipeline-stage mode splits the transformer layers into contiguous
+        // per-GPU stages (run a model bigger than one GPU's VRAM). Selected by
+        // `[inference].multi_gpu = "pp"` or the `RUSTLLAMA_MULTI_GPU=pp` env override
+        // (TP-5 centralizes the resolution in `accel::multi_gpu_mode_is_pipeline`).
+        // Falls through to the per-tensor heat planner when not requested, or when
+        // <2 GPUs / no perf tiers make a stage plan impossible (`plan_pipeline_stages`
+        // returns None). WRITE-BLIND: execution validated on real multi-GPU HW.
+        if rustllama_models::accel::multi_gpu_mode_is_pipeline() {
             // PP-3: per-layer KV-mirror reserve (K+V × n_kv_heads × ctx × head_dim ×
             // kv_dtype bytes/elem) so each stage leaves VRAM headroom on its own GPU
             // for the KV its layers keep resident — the same geometry the MoE tier's

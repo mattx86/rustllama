@@ -2475,6 +2475,18 @@ fn promote_memory_env_from_config(
         std::env::set_var("RUSTLLAMA_DISABLED_NPUS", &list);
         tracing::info!(disabled_npus = %list, "NPU disable-list applied from config");
     }
+    // TP-5 — multi-GPU mode (off | pp | tp). Process-global DEVICE SELECTION, read
+    // by the planner (`accel::multi_gpu_mode_is_pipeline`) + the TP dispatch arms
+    // (`accel::multi_gpu_tp_allowed`) and inherited by the tune subprocess — so it
+    // stays env like the disable-lists. Already validated to a known mode by
+    // `rustllama_config::validate`; env wins so a sweep can override config.
+    if let Some(mode) = inference.multi_gpu.as_ref() {
+        if std::env::var_os("RUSTLLAMA_MULTI_GPU").is_none() {
+            let m = mode.trim().to_ascii_lowercase();
+            std::env::set_var("RUSTLLAMA_MULTI_GPU", &m);
+            tracing::info!(multi_gpu = %m, "multi-GPU mode applied from config");
+        }
+    }
     // CPU compute tier (disable-list + on/off + VRAM-only mode) — also env.
     promote_cpu_tier_env_from_config(inference);
 

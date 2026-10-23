@@ -2070,6 +2070,39 @@ fn multi_gpu_plan() -> Option<std::sync::Arc<MultiGpuPlan>> {
     MULTI_GPU_PLAN.read().ok().and_then(|g| g.clone())
 }
 
+/// TP-5 — resolved multi-GPU mode code from `RUSTLLAMA_MULTI_GPU`. The CLI promotes
+/// `[inference].multi_gpu` into this env var at startup (env winning, the same
+/// pattern as `disabled_gpus` / `cpu_enabled`), so this one read covers both the
+/// config key and the env override. 0 = unset/auto, 1 = off, 2 = pipeline, 3 =
+/// tensor.
+fn multi_gpu_mode_code() -> u8 {
+    match std::env::var("RUSTLLAMA_MULTI_GPU") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "off" => 1,
+            "pp" => 2,
+            "tp" => 3,
+            _ => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// TP-5 — is PIPELINE mode selected (config or env)? Read by the heat planner to
+/// choose the stage-split path. (Replaces the planner's inline env read.)
+pub fn multi_gpu_mode_is_pipeline() -> bool {
+    multi_gpu_mode_code() == 2
+}
+
+/// TP-5 — are the TENSOR-parallel dispatch arms (column/row-parallel matvec)
+/// allowed? True unless the mode is explicitly `off` (1) or `pp` (2) — pipeline
+/// already disables TP via `pipeline_active()`, and `off` disables all cross-GPU
+/// work. Default (auto/tensor) ⇒ true, preserving the auto-on-when-usable behavior.
+/// Cheap (env check + one atomic); the `tp_*_usable()` gates still require ≥2 GPUs,
+/// so this is inert on a single-GPU box.
+pub fn multi_gpu_tp_allowed() -> bool {
+    !matches!(multi_gpu_mode_code(), 1 | 2)
+}
+
 /// The default CUDA device index the single-device dispatch path uses (0).
 /// The proven `cuda_cache()` above is pinned to it and is left untouched; the
 /// per-device map below only ever constructs caches for OTHER indices, so the
@@ -17119,6 +17152,7 @@ pub fn try_matvec_tensor_usm_f32(
             // against the next stage's work).
             if m >= TP_MIN_ROWS
                 && !pipeline_active()
+                && multi_gpu_tp_allowed()
                 && tp_cuda_usable()
                 && try_matvec_tp_cuda(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k)
             {
@@ -17133,6 +17167,7 @@ pub fn try_matvec_tensor_usm_f32(
             // through to the single-device matvec below.
             if k >= TP_MIN_K_SPLIT
                 && !pipeline_active()
+                && multi_gpu_tp_allowed()
                 && tp_row_cuda_usable()
                 && try_matvec_tp_row_cuda(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k)
             {
