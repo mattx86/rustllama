@@ -8854,9 +8854,49 @@ fn run_tune_stage_subprocess(
     for a in extra_args {
         cmd.arg(a);
     }
-    let status = cmd
-        .status()
+    // Hard wall-clock BACKSTOP for a truly WEDGED stage — a forward that never
+    // returns (the spec-strategy stage 9b's historical failure under speculation) —
+    // which would block `.status()` FOREVER and stall the whole `tune --all`. This is
+    // ONLY for the infinite-hang case: the per-stage measurements now bound their own
+    // SLOW-but-progressing candidates themselves (e.g. `bench_spec_stream`'s timeout
+    // scales with the measured decode speed of THIS model+config), so a legit slow
+    // sweep on a big / CPU-placed / `--thorough` model stays under budget rather than
+    // being false-killed. The budget is AWARE of the tuning adjustments it can see:
+    // `--thorough` (more candidates + repeats) widens it. Overridable via
+    // `RUSTLLAMA_TUNE_STAGE_TIMEOUT_SECS` (0 = no limit, the old unbounded behavior) —
+    // raise it for an unusually slow setup; the kill message names the env var.
+    let budget_secs = std::env::var("RUSTLLAMA_TUNE_STAGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(if thorough { 3600 } else { 1800 });
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn `tune {stage_flag}` subprocess: {e}"))?;
+    let deadline = (budget_secs > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_secs(budget_secs));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if let Some(d) = deadline {
+                    if std::time::Instant::now() > d {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!(
+                            "`tune {stage_label}` subprocess exceeded the {budget_secs}s budget — \
+                             killed (likely wedged); continuing with the remaining stages \
+                             (raise/disable via RUSTLLAMA_TUNE_STAGE_TIMEOUT_SECS)"
+                        );
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                anyhow::bail!("failed waiting on `tune {stage_flag}` subprocess: {e}");
+            }
+        }
+    };
     if status.success() {
         Ok(())
     } else {

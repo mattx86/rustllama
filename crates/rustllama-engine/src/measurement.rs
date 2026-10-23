@@ -3107,6 +3107,30 @@ pub fn measure_spec_strategy(
         }
     };
 
+    // Per-candidate wall-clock timeout, AWARE of this (model, config)'s REAL decode
+    // speed rather than a fixed 20s. A large model, a CPU / low `n_gpu_layers`
+    // placement, or a slow KV dtype legitimately makes a 16-token spec decode take
+    // tens of seconds — far longer than the ~1s a fast GPU decode takes — so a flat
+    // `SPEC_CAND_TIMEOUT` would false-"timeout" a slow-but-HEALTHY candidate and drop
+    // a valid winner. Instead bound each candidate at a generous multiple of the
+    // measured `None` baseline (which already ran above), floored at
+    // `SPEC_CAND_TIMEOUT` for fast models and capped so an anomalous baseline can't
+    // make it effectively unbounded. A failed/zero baseline ⇒ a conservative
+    // fallback. NOTE: a truly WEDGED candidate — one forward that never returns —
+    // escapes this stream-level deadline (it is checked only between emitted items),
+    // regardless of its value; the CLI tune-stage subprocess backstop is the catch
+    // for that case.
+    let cand_timeout: std::time::Duration = {
+        let cap = std::time::Duration::from_secs(300);
+        match none_tps.0.filter(|t| *t > 0.0) {
+            Some(tps) => std::time::Duration::from_secs_f64((DECODE_TOKENS as f64 / tps) * 10.0)
+                .clamp(SPEC_CAND_TIMEOUT, cap),
+            // Baseline failed/unmeasured: assume a slow model and give each candidate
+            // a generous fixed budget rather than the tight 20s default.
+            None => std::time::Duration::from_secs(120),
+        }
+    };
+
     let mut candidates: Vec<SpecStrategyMeasurement> = Vec::new();
     candidates.push(SpecStrategyMeasurement {
         strategy: SpecStrategy::None,
@@ -3116,7 +3140,7 @@ pub fn measure_spec_strategy(
 
     // Self-contained drafters (always available).
     let ng = crate::speculative::NgramDrafterConfig::default();
-    let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
+    let r = bench_spec_stream(repeats, cand_timeout, || {
         cpu.clear_prefix_cache();
         cpu.speculate_ngram_stream_from_ids(prompt_ids.clone(), ng.clone(), sampling.clone())
     });
@@ -3127,7 +3151,7 @@ pub fn measure_spec_strategy(
     });
 
     let la = crate::speculative::LookaheadDrafterConfig::default();
-    let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
+    let r = bench_spec_stream(repeats, cand_timeout, || {
         cpu.clear_prefix_cache();
         cpu.speculate_lookahead_stream_from_ids(prompt_ids.clone(), la.clone(), sampling.clone())
     });
@@ -3139,7 +3163,7 @@ pub fn measure_spec_strategy(
 
     // NextN-head drafters.
     if mtp_capable {
-        let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
+        let r = bench_spec_stream(repeats, cand_timeout, || {
             cpu.clear_prefix_cache();
             cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None)
         });
@@ -3151,7 +3175,7 @@ pub fn measure_spec_strategy(
     }
     if tree_capable {
         let widths = widths_vec.clone();
-        let r = bench_spec_stream(repeats, SPEC_CAND_TIMEOUT, || {
+        let r = bench_spec_stream(repeats, cand_timeout, || {
             cpu.clear_prefix_cache();
             cpu.speculate_mtp_stream_from_ids(
                 prompt_ids.clone(),
