@@ -414,6 +414,22 @@ pub const VERDICT_SSM_DELTA_NET_STEP: &str = "ssm:delta_net_step";
 /// verifiable without a 2nd GPU — real P2P transport is confirmed on multi-GPU HW).
 /// Foundation for pipeline-stage activation handoff + the TP collectives.
 pub const VERDICT_PEER_COPY: &str = "peer:copy";
+/// TP-1 (multi-GPU) — the cross-GPU all-reduce (SUM) collective recombines
+/// correctly. Graded by `doctor --cuda-parity collective:all_reduce`: K partial
+/// buffers are summed via a star reduce (peer-copy + on-device `add_f32`) +
+/// broadcast, and every participant's result is checked against the CPU sum. On a
+/// single-GPU box the K buffers live on one device, so this validates the
+/// reduction ALGEBRA + the peer/add plumbing (self-copies) — the real P2P sum is
+/// confirmed on multi-GPU HW. Foundation for TP-2 row-parallel matmul (partials →
+/// all-reduce) + TP-3 attention. Hand-rolled (no NCCL).
+pub const VERDICT_COLLECTIVE_ALL_REDUCE: &str = "collective:all_reduce";
+/// TP-1 (multi-GPU) — the cross-GPU all-gather collective recombines correctly.
+/// Graded by `doctor --cuda-parity collective:all_gather`: K chunks are
+/// concatenated (chunk i at offset i*n) into every participant's slab via
+/// peer-copy and checked bit-exact against the host concatenation. Single-GPU =
+/// the concat-placement algebra + plumbing; real P2P gather on multi-GPU HW.
+/// Foundation for TP-3 head-parallel attention (per-head outputs → all-gather).
+pub const VERDICT_COLLECTIVE_ALL_GATHER: &str = "collective:all_gather";
 
 // --- P6-fusions: the three forward-path fusion verdicts ----------------
 //

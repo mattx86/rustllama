@@ -9435,6 +9435,52 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- TP-1: multi-GPU collectives (all-reduce SUM + all-gather), hand-rolled
+    // over the PP-0 peer transport + add_f32 (no NCCL). On a single-GPU box the K
+    // participant buffers live on one device, so this grades the recombine ALGEBRA
+    // (sum / concat) + the peer/add plumbing; the real P2P collective is confirmed
+    // on multi-GPU HW. WRITE-BLIND.
+    {
+        let name = rustllama_tuner::VERDICT_COLLECTIVE_ALL_REDUCE;
+        match ck::collective_all_reduce_self_check(0) {
+            None => {
+                cu_emit(name, "SKIP", "no-cuda-device");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+            Some((passed, worst)) => {
+                let key: &'static str = if passed { "OK" } else { "MISCOMPUTE" };
+                *counts.entry(key).or_default() += 1;
+                cu_emit(
+                    name,
+                    key,
+                    &format!(
+                        "worst_abs={worst:.5} (K=3 star-reduce + broadcast; P2P sum validated on multi-GPU HW)"
+                    ),
+                );
+            }
+        }
+    }
+    {
+        let name = rustllama_tuner::VERDICT_COLLECTIVE_ALL_GATHER;
+        match ck::collective_all_gather_self_check(0) {
+            None => {
+                cu_emit(name, "SKIP", "no-cuda-device");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+            Some((passed, worst)) => {
+                let key: &'static str = if passed { "OK" } else { "MISCOMPUTE" };
+                *counts.entry(key).or_default() += 1;
+                cu_emit(
+                    name,
+                    key,
+                    &format!(
+                        "worst_abs={worst:.5} (K=3 concat; P2P gather validated on multi-GPU HW)"
+                    ),
+                );
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

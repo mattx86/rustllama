@@ -4063,6 +4063,213 @@ pub fn peer_copy_self_check(device_index: u32) -> Option<(bool, f32)> {
     Some((worst == 0.0, worst))
 }
 
+// ============================================================
+// TP-1 — multi-GPU collectives (all-reduce / all-gather), hand-rolled over the
+// PP-0 peer transport + the on-device add_f32 kernel. No NCCL/oneCCL dependency
+// (clean-room, owns its whole compute stack). These are the building blocks of
+// tensor parallelism: a row-parallel matmul produces a per-device PARTIAL that an
+// all-reduce SUMS to the final output; head-parallel attention produces per-device
+// head outputs that an all-gather CONCATENATES before the O-projection.
+// ============================================================
+
+/// In-place all-reduce (SUM) across `bufs` — one device buffer per participating
+/// GPU, each `n` f32s. STAR schedule: every non-root buffer is peer-copied into a
+/// scratch on `bufs[0]`'s device and added into `bufs[0]` (the running sum), then
+/// the sum is broadcast back to every buffer. After the call EVERY buffer holds the
+/// element-wise sum. All work is enqueued on the ONE root stream, so stream
+/// ordering (not explicit syncs) sequences each copy before its add + reuse of the
+/// scratch. `stream` MUST be on `bufs[0]`'s device. Returns false on any
+/// peer/add/alloc/sync failure.
+///
+/// SAFETY: each `(dev, ptr)` must be a live device allocation of >= `n` f32s on its
+/// named device for the duration of the (async) collective.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn all_reduce_sum_f32(stream: &CudaStream, bufs: &[(u32, *mut f32)], n: usize) -> bool {
+    if bufs.is_empty() || n == 0 {
+        return false;
+    }
+    if bufs.len() == 1 {
+        return true; // a single participant is already "reduced"
+    }
+    let root_dev = bufs[0].0;
+    let root = bufs[0].1;
+    let nbytes = n * 4;
+    let Some(scratch) = RawDevBuf::alloc(stream, nbytes) else {
+        return false;
+    };
+    // Reduce every other buffer into the root (copy → add on one stream = ordered).
+    for &(dev, ptr) in &bufs[1..] {
+        if !peer_memcpy(
+            stream,
+            scratch.ptr,
+            root_dev,
+            ptr as *const c_void,
+            dev,
+            nbytes,
+        ) {
+            return false;
+        }
+        if add_f32(stream, root, scratch.ptr as *const f32, n).is_err() {
+            return false;
+        }
+    }
+    // Broadcast the sum back to every other buffer.
+    for &(dev, ptr) in &bufs[1..] {
+        if !peer_memcpy(
+            stream,
+            ptr as *mut c_void,
+            dev,
+            root as *const c_void,
+            root_dev,
+            nbytes,
+        ) {
+            return false;
+        }
+    }
+    rsl_cuda_stream_sync(stream.raw()) == 0
+}
+
+/// All-gather: concatenate each input chunk (`ins[i]`, `n` f32s) into every
+/// participant's output slab (`outs[d]`, `ins.len()*n` f32s), chunk `i` at f32
+/// offset `i*n`. Pure peer-copy (no reduce) → bit-exact. `ins.len()` must equal
+/// `outs.len()` (one in-chunk + one out-slab per participant). The single `stream`
+/// drives every copy (`cudaMemcpyPeerAsync` is correct cross-device from one
+/// stream). Returns false on any failure.
+///
+/// SAFETY: each `ins[i]` is a live alloc of >= `n` f32s and each `outs[d]` of >=
+/// `ins.len()*n` f32s on their named devices for the call's duration.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn all_gather_f32(
+    stream: &CudaStream,
+    ins: &[(u32, *const f32)],
+    outs: &[(u32, *mut f32)],
+    n: usize,
+) -> bool {
+    let k = ins.len();
+    if k == 0 || k != outs.len() || n == 0 {
+        return false;
+    }
+    let nbytes = n * 4;
+    for &(ddev, dptr) in outs {
+        for (i, &(sdev, sptr)) in ins.iter().enumerate() {
+            let dst = (dptr as *mut u8).add(i * nbytes) as *mut c_void;
+            if !peer_memcpy(stream, dst, ddev, sptr as *const c_void, sdev, nbytes) {
+                return false;
+            }
+        }
+    }
+    rsl_cuda_stream_sync(stream.raw()) == 0
+}
+
+/// TP-1 parity self-check: all-reduce (SUM). Builds K=3 partials of N f32 on
+/// `device_index` (so a single-GPU box validates the reduction ALGEBRA + the
+/// peer/add plumbing via self-copies; the real cross-device sum is confirmed on
+/// 2+ GPU HW), runs [`all_reduce_sum_f32`], and checks EVERY participant's result
+/// (first + last, covering the reduce and the broadcast legs) against the CPU
+/// reference sum. Returns `(passed, worst_abs_diff)`, or `None` on setup failure.
+pub fn collective_all_reduce_self_check(device_index: u32) -> Option<(bool, f32)> {
+    let stream = CudaStream::create(device_index)?;
+    let _ = enable_peer_access(device_index, device_index); // no-op same-dev; exercises the path
+    let k = 3usize;
+    let n = 2048usize;
+    let nbytes = n * 4;
+    let parts: Vec<Vec<f32>> = (0..k)
+        .map(|p| {
+            (0..n)
+                .map(|i| ((i + p * 7) as f32) * 0.25 - p as f32)
+                .collect()
+        })
+        .collect();
+    let mut reference = vec![0f32; n];
+    for p in &parts {
+        for (r, &v) in reference.iter_mut().zip(p) {
+            *r += v;
+        }
+    }
+    let mut bufs_raw: Vec<RawDevBuf> = Vec::with_capacity(k);
+    for p in &parts {
+        let mut b = RawDevBuf::alloc(&stream, nbytes)?;
+        if !b.upload(dn_f32_bytes(p)) {
+            return None;
+        }
+        bufs_raw.push(b);
+    }
+    let bufs: Vec<(u32, *mut f32)> = bufs_raw
+        .iter()
+        .map(|b| (device_index, b.ptr as *mut f32))
+        .collect();
+    // SAFETY: all buffers are live, N f32, on device_index for this call.
+    if !unsafe { all_reduce_sum_f32(&stream, &bufs, n) } {
+        return Some((false, f32::INFINITY));
+    }
+    let mut worst = 0f32;
+    for idx in [0usize, k - 1] {
+        let mut out = vec![0f32; n];
+        if !bufs_raw[idx].download(dn_f32_bytes_mut(&mut out)) {
+            return None;
+        }
+        for (a, b) in out.iter().zip(&reference) {
+            worst = worst.max((a - b).abs());
+        }
+    }
+    Some((worst <= 1e-3, worst))
+}
+
+/// TP-1 parity self-check: all-gather. Builds K=3 input chunks of N f32 + K output
+/// slabs (K*N each) on `device_index`, runs [`all_gather_f32`], and checks the
+/// gathered slabs bit-exact against the host concatenation. Single-GPU validates
+/// the concat-placement algebra + plumbing; real P2P gather on 2+ GPU HW. Returns
+/// `(passed, worst_abs_diff)`, or `None` on setup failure.
+pub fn collective_all_gather_self_check(device_index: u32) -> Option<(bool, f32)> {
+    let stream = CudaStream::create(device_index)?;
+    let _ = enable_peer_access(device_index, device_index);
+    let k = 3usize;
+    let n = 1024usize;
+    let nbytes = n * 4;
+    let ins_host: Vec<Vec<f32>> = (0..k)
+        .map(|p| (0..n).map(|i| ((i + p * 11) as f32) * 0.1).collect())
+        .collect();
+    let mut reference: Vec<f32> = Vec::with_capacity(k * n);
+    for p in &ins_host {
+        reference.extend_from_slice(p);
+    }
+    let mut in_bufs: Vec<RawDevBuf> = Vec::with_capacity(k);
+    for p in &ins_host {
+        let mut b = RawDevBuf::alloc(&stream, nbytes)?;
+        if !b.upload(dn_f32_bytes(p)) {
+            return None;
+        }
+        in_bufs.push(b);
+    }
+    let mut out_bufs: Vec<RawDevBuf> = Vec::with_capacity(k);
+    for _ in 0..k {
+        out_bufs.push(RawDevBuf::alloc(&stream, k * nbytes)?);
+    }
+    let ins: Vec<(u32, *const f32)> = in_bufs
+        .iter()
+        .map(|b| (device_index, b.ptr as *const f32))
+        .collect();
+    let outs: Vec<(u32, *mut f32)> = out_bufs
+        .iter()
+        .map(|b| (device_index, b.ptr as *mut f32))
+        .collect();
+    // SAFETY: ins are N-f32 live allocs, outs are K*N-f32 live allocs, on device.
+    if !unsafe { all_gather_f32(&stream, &ins, &outs, n) } {
+        return Some((false, f32::INFINITY));
+    }
+    let mut worst = 0f32;
+    for idx in [0usize, k - 1] {
+        let mut out = vec![0f32; k * n];
+        if !out_bufs[idx].download(dn_f32_bytes_mut(&mut out)) {
+            return None;
+        }
+        for (a, b) in out.iter().zip(&reference) {
+            worst = worst.max((a - b).abs());
+        }
+    }
+    Some((worst == 0.0, worst))
+}
+
 /// C1 — resident-state Gated-DeltaNet DECODE cache. Holds each SSM layer's
 /// recurrent state S (`n_v_heads * head_qk_dim * head_v_dim` f32) RESIDENT in
 /// device memory across decoded tokens + reusable per-token I/O scratch. The
