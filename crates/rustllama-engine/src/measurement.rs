@@ -3068,7 +3068,16 @@ pub fn measure_spec_strategy(
     use rustllama_tuner::{SpecStrategy, SpecStrategyMeasurement};
 
     const PROMPT_TOKENS: u32 = 64;
-    const DECODE_TOKENS: u32 = 16;
+    // Decode window for the spec sweep. A short window (the old 16) never lets
+    // recurring token sequences emerge, so the n-gram / lookahead drafters propose
+    // nothing and every spec candidate measures as pure overhead — the sweep could
+    // only ever pick `None`. A longer window both (a) reflects real decode lengths
+    // (production decodes hundreds-to-thousands of tokens, not 16) and (b) gives the
+    // drafters enough history to find matches — and enough room for repetition-prone
+    // generation to surface — so a spec strategy can actually win when it helps. The
+    // per-candidate timeout scales off the measured `None` baseline, so a slow model
+    // is bounded proportionally, not by a fixed wall clock.
+    const DECODE_TOKENS: u32 = 128;
     let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
 
     spec_dbg!("load start ({})", model_path.display());
