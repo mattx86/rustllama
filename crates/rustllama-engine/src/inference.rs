@@ -6770,6 +6770,31 @@ fn cacheblend_get_or_build_snapshot(
     snap
 }
 
+/// Whether the stage-9b (spec-strategy) fine-grained spin trace is on — opt-in via
+/// `RUSTLLAMA_DEBUG_SPEC_STAGE` (any non-empty, non-"0" value), the SAME gate the
+/// measurement-side `[spec-9b]` markers use. Cached. Used by the `spec_trace!`
+/// markers in the lookahead round + the shared prefill/forward core to localize an
+/// intra-round host spin (the LAST unpaired `begin`/`end` names the wedged call).
+fn spec_trace_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DEBUG_SPEC_STAGE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Emit a spin-trace marker to STDERR (unbuffered, flushed before any stall) when
+/// `RUSTLLAMA_DEBUG_SPEC_STAGE` is set; silent otherwise. Companion to
+/// `measurement::spec_dbg!` one level deeper (inside the round, not between runs).
+macro_rules! spec_trace {
+    ($($arg:tt)*) => {
+        if spec_trace_enabled() {
+            eprintln!("[spec-trace] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// Walk `prefill[effective..]` in chunks of `chunk_size` tokens, calling
 /// `forward_one` per token. After each chunk completes, snapshot the
 /// partial prefix into `state.last_ids` so a cancellation mid-prefill
@@ -7015,6 +7040,13 @@ fn spec_prefill_and_forward(
 
     let mut chrome = ChromeTracer::from_env();
     let (prefill, last) = prompt_ids.split_at(prompt_ids.len() - 1);
+    spec_trace!(
+        "spf prefill begin prefill_len={} effective={} chunk={} seq_len={}",
+        prefill.len(),
+        _effective,
+        prefill_chunk_size,
+        state.kv_backend.seq_len()
+    );
     let _ = run_chunked_prefill(
         model,
         state,
@@ -7026,6 +7058,7 @@ fn spec_prefill_and_forward(
         &mut chrome,
         || false,
     );
+    spec_trace!("spf prefill end seq_len={}", state.kv_backend.seq_len());
 
     let dn_replay_base = if want_dn_replay_base {
         dn_snapshot_synced(&mut state.delta_net_cache)
@@ -7038,6 +7071,12 @@ fn spec_prefill_and_forward(
         .collect();
     let n_pos = inputs.len();
     let mut dists: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
+    spec_trace!(
+        "spf forward begin n_pos={n_pos} base_pos={} cands={} seq_len={}",
+        prefill.len(),
+        candidates.len(),
+        state.kv_backend.seq_len()
+    );
 
     // Hybrid models get their own batched path regardless of KV
     // dtype: the dense BatchedSpec forwards walk `blocks`/`moe_blocks`
@@ -7078,6 +7117,7 @@ fn spec_prefill_and_forward(
                 ));
             }
         }
+        spec_trace!("spf forward end (hybrid) dists={}", dists.len());
         chrome.flush();
         return Ok((dists, dn_replay_base));
     }
@@ -7186,6 +7226,7 @@ fn spec_prefill_and_forward(
             });
         }
     }
+    spec_trace!("spf forward end dists={}", dists.len());
     chrome.flush();
     Ok((dists, dn_replay_base))
 }
@@ -9817,11 +9858,17 @@ impl ContiguousEngine {
                     .await;
             }
 
+            let mut round = 0usize;
             loop {
                 if total_emitted >= max_tokens {
                     return;
                 }
                 let remaining = max_tokens.saturating_sub(total_emitted);
+                round += 1;
+                spec_trace!(
+                    "[la] round {round} hist={} remaining={remaining} emitted={total_emitted}",
+                    current_prompt_ids.len()
+                );
 
                 // ---- Step 1: lookahead drafter proposes a Jacobi guess ----
                 let hist_u32: Vec<u32> =
@@ -9831,6 +9878,12 @@ impl ContiguousEngine {
                 if drafts.len() > round_cap {
                     drafts.truncate(round_cap);
                 }
+                spec_trace!(
+                    "[la] round {round} proposed drafts={} ids={:?} round_cap={round_cap}",
+                    drafts.len(),
+                    drafts.iter().map(|d| d.id).collect::<Vec<_>>()
+                );
+                spec_trace!("[la] round {round} verify begin");
                 // ---- Step 2+3: verify + accept + COMMIT (shared primitive) ----
                 let prompt_ids_for_verify = current_prompt_ids.clone();
                 let drafts_for_verify = drafts.clone();
@@ -9867,6 +9920,11 @@ impl ContiguousEngine {
                         return;
                     }
                 };
+                spec_trace!(
+                    "[la] round {round} verify end accepted={} repl={}",
+                    outcome.accepted.len(),
+                    outcome.replacement
+                );
                 cumulative_stats
                     .add_speculation(drafts.len() as u64, outcome.accepted.len() as u64);
                 let mut committed: Vec<u32> = outcome.accepted;
