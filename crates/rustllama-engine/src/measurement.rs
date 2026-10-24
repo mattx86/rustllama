@@ -3112,10 +3112,53 @@ pub fn measure_spec_strategy(
     cpu.set_tree_speculative(None);
     spec_dbg!("capability: mtp={mtp_capable} tree={tree_capable}");
 
+    // Representative sweep prompt: a short, ordinary code snippet. rustllama's
+    // primary use is coding assistants (LSP/FIM/RAG), and code is naturally
+    // self-similar (indentation, brackets, recurring identifiers/keywords), so the
+    // model's greedy continuation gives the n-gram / lookahead drafters REAL
+    // acceptances. The old synthetic `1..64` token ids produced unpredictable
+    // output the drafters never matched — they proposed empty guesses every round,
+    // so every spec candidate was pure overhead and the sweep could ONLY ever pick
+    // `None`, defeating its purpose. This is deliberately plain code, NOT
+    // pathologically repetitive, so a spec win here reflects a realistic best case
+    // rather than an inflated one. Encoded with the model's own tokenizer + BOS
+    // policy and truncated to `PROMPT_TOKENS`; any tokenizer failure falls back to
+    // the synthetic ids so the sweep still runs.
+    const SPEC_PROMPT_TEXT: &str = concat!(
+        "use std::collections::HashMap;\n\n",
+        "/// Tally how many times each word appears in the input.\n",
+        "fn word_counts(text: &str) -> HashMap<String, usize> {\n",
+        "    let mut counts: HashMap<String, usize> = HashMap::new();\n",
+        "    for word in text.split_whitespace() {\n",
+        "        let entry = counts.entry(word.to_string()).or_insert(0);\n",
+        "        *entry += 1;\n",
+        "    }\n",
+        "    counts\n",
+        "}\n\n",
+        "fn main() {\n",
+        "    let text = \"the quick brown fox jumps over the lazy dog\";\n",
+        "    let counts = word_counts(text);\n",
+        "    for (word, count) in &counts {\n",
+        "        println!(\"{}: {}\", word, count);\n",
+        "    }\n",
+        "}\n",
+    );
     let vocab = cpu.vocab_size() as i32;
-    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
-        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
-        .collect();
+    let prompt_ids: Vec<i32> = cpu
+        .tokenizer()
+        .and_then(|tok| tok.encode(SPEC_PROMPT_TEXT, tok.add_bos_token()).ok())
+        .map(|ids| {
+            ids.into_iter()
+                .take(PROMPT_TOKENS as usize)
+                .map(|t| t as i32)
+                .collect::<Vec<i32>>()
+        })
+        .filter(|ids| ids.len() >= 2)
+        .unwrap_or_else(|| {
+            (0..PROMPT_TOKENS as i32)
+                .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+                .collect()
+        });
     let sampling = SamplingParams {
         temperature: 0.0,
         top_p: 1.0,
