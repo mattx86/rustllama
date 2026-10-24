@@ -554,6 +554,33 @@ struct DriveGenJob {
     lora_adapter: Option<Arc<rustllama_models::lora::LoraAdapter>>,
 }
 
+/// Whether the stage-9b (spec-strategy) fine-grained spin trace is on — opt-in via
+/// `RUSTLLAMA_DEBUG_SPEC_STAGE` (any non-empty, non-"0" value), the SAME gate the
+/// measurement-side `[spec-9b]` markers use. Cached. Used by the `spec_trace!`
+/// markers in the lookahead round + the shared prefill/forward core + the worker
+/// handoff to localize an intra-round host spin (the LAST unpaired begin/end names
+/// the wedged call). Defined here (ahead of `WorkerSubmitter::run_blocking`) so the
+/// macro is in scope at every use site below.
+fn spec_trace_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DEBUG_SPEC_STAGE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Emit a spin-trace marker to STDERR (unbuffered, flushed before any stall) when
+/// `RUSTLLAMA_DEBUG_SPEC_STAGE` is set; silent otherwise. Companion to
+/// `measurement::spec_dbg!` one level deeper (inside the round, not between runs).
+macro_rules! spec_trace {
+    ($($arg:tt)*) => {
+        if spec_trace_enabled() {
+            eprintln!("[spec-trace] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// Captured arguments for a USM weight pre-upload dispatched through
 /// the worker thread. `done_tx` is signaled with the upload count
 /// once the work completes (0 on no-op or failure).
@@ -652,7 +679,10 @@ impl WorkerSubmitter {
     {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let job: Box<dyn FnOnce() + Send> = Box::new(move || {
-            let _ = done_tx.send(f());
+            let r = f();
+            spec_trace!("[rb] closure returned; sending result");
+            let _ = done_tx.send(r);
+            spec_trace!("[rb] result sent");
         });
         let _ = self.tx.send(SyclWorkItem::RunOnWorker(job));
         done_rx
@@ -6770,31 +6800,6 @@ fn cacheblend_get_or_build_snapshot(
     snap
 }
 
-/// Whether the stage-9b (spec-strategy) fine-grained spin trace is on — opt-in via
-/// `RUSTLLAMA_DEBUG_SPEC_STAGE` (any non-empty, non-"0" value), the SAME gate the
-/// measurement-side `[spec-9b]` markers use. Cached. Used by the `spec_trace!`
-/// markers in the lookahead round + the shared prefill/forward core to localize an
-/// intra-round host spin (the LAST unpaired `begin`/`end` names the wedged call).
-fn spec_trace_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| {
-        std::env::var("RUSTLLAMA_DEBUG_SPEC_STAGE")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    })
-}
-
-/// Emit a spin-trace marker to STDERR (unbuffered, flushed before any stall) when
-/// `RUSTLLAMA_DEBUG_SPEC_STAGE` is set; silent otherwise. Companion to
-/// `measurement::spec_dbg!` one level deeper (inside the round, not between runs).
-macro_rules! spec_trace {
-    ($($arg:tt)*) => {
-        if spec_trace_enabled() {
-            eprintln!("[spec-trace] {}", format!($($arg)*));
-        }
-    };
-}
-
 /// Walk `prefill[effective..]` in chunks of `chunk_size` tokens, calling
 /// `forward_one` per token. After each chunk completes, snapshot the
 /// partial prefix into `state.last_ids` so a cancellation mid-prefill
@@ -9900,6 +9905,7 @@ impl ContiguousEngine {
                         (out, rng_c)
                     })
                     .await;
+                spec_trace!("[la] round {round} await returned");
                 let outcome = match joined {
                     Ok((Ok(o), r)) => {
                         rng_slot = Some(r);
