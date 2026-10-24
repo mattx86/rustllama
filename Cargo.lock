@@ -4102,6 +4102,7 @@ dependencies = [
  "rustllama-kernels-mlx",
  "rustllama-kernels-sycl",
  "rustllama-lsp",
+ "rustllama-models",
  "rustllama-npu",
  "rustllama-runtime",
  "rustllama-safetensors",
