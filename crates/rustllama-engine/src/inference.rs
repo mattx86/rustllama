@@ -672,7 +672,13 @@ impl WorkerSubmitter {
     /// cancelled), the result send is a silent no-op; the work still
     /// ran to completion, which keeps the worker's KV/DN state
     /// consistent.
-    fn run_blocking<T, F>(&self, f: F) -> tokio::sync::oneshot::Receiver<T>
+    fn run_blocking<T, F>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<T, tokio::sync::oneshot::error::RecvError>,
+    > + Send
+           + 'static
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -685,7 +691,22 @@ impl WorkerSubmitter {
             spec_trace!("[rb] result sent");
         });
         let _ = self.tx.send(SyclWorkItem::RunOnWorker(job));
-        done_rx
+        // Stage-9b wedge fix. The spec-strategy sweep (and the other sync
+        // measurement drains) pump these streams with `futures::executor::block_on`
+        // while the `tune` command runs on a tokio runtime thread (app/desktop spins
+        // up a multi-thread runtime for the async CLI). Awaiting a tokio oneshot on
+        // that thread consumes the thread-local COOPERATIVE-SCHEDULING BUDGET, which
+        // `futures::block_on` never replenishes — it drives the future directly,
+        // bypassing the tokio scheduler that would reset the budget between polls.
+        // After ~128 round-trips the budget reaches zero and the oneshot's
+        // coop-aware poll self-wakes and returns `Pending` *instead of* the already-
+        // ready value; `block_on` re-polls immediately, the budget is still zero, and
+        // it busy-loops forever at 100% CPU (the deterministic, GPU-independent
+        // stage-9b hang, which landed inside the Lookahead candidate's run 2).
+        // `unconstrained` opts this await out of the coop budget so the handoff
+        // always observes the ready value. Harmless under the real server: it is a
+        // brief worker→caller handoff that need not yield for fairness.
+        tokio::task::unconstrained(done_rx)
     }
 }
 
