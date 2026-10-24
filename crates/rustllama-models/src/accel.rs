@@ -11068,7 +11068,20 @@ fn dev_attn_enabled() -> bool {
 fn dev_attn_cuda_graph_enabled() -> bool {
     // PP-2: off under a multi-device pipeline split — the captured graph is a
     // device-0 chain, so a stage on another GPU must take the host-staged path.
-    if pipeline_active() {
+    //
+    // SPEC-SAFETY: also OFF under speculation. Like the whole-step graph + the
+    // resident DeltaNet step (disabled under spec in `dev_step_cuda_graph_enabled` /
+    // `delta_net_step_enabled`), this per-layer attention graph captures device
+    // pointers and assumes a MONOTONIC decode position; a draft/verify ROLLBACK
+    // (`set_seq_len` rewinds the KV) plus the between-run cache reset wedge its
+    // REPLAY — the exact spec-strategy stage-9b hang seen on a Lookahead run (runs
+    // 0/1 replayed fine, run 2 wedged mid-forward). 47c69ff disabled the step graph
+    // but MISSED this one, and its "falls back to the proven per-layer graph" is
+    // wrong — this per-layer graph is what hangs. Spec now falls back to the EAGER
+    // device-resident block, which re-reads the cache's CURRENT device pointers
+    // every call, so there is no captured graph to wedge (and it matches what spec
+    // runs in production, where the graph is likewise unavailable under rollback).
+    if pipeline_active() || spec_active() {
         return false;
     }
     match DEV_ATTN_GRAPH_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -11092,9 +11105,13 @@ fn dev_attn_cuda_graph_enabled() -> bool {
 fn dev_layer_cuda_graph_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // PP-2: off under a multi-device pipeline split (the captured FFN-in-graph
-    // chain is a device-0 chain).
+    // chain is a device-0 chain). SPEC-SAFETY: also off under speculation (it is
+    // part of the same captured attention graph that wedges under rollback — see
+    // `dev_attn_cuda_graph_enabled`); defensive, since that gate already declines
+    // the whole graph block under spec.
     *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH))
         && !pipeline_active()
+        && !spec_active()
 }
 
 /// T2 (B1) WHOLE-DECODE-STEP graph gate — perf-gated on
