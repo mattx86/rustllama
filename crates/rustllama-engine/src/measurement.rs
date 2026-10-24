@@ -3080,7 +3080,20 @@ pub fn measure_spec_strategy(
         &cfg.kv_cache_layout,
     )
     .map_err(|e| format!("load failed: {e}"))?;
-    cpu.set_prefix_cache(false);
+    // Prefix cache ON for the spec sweep — unlike the other measurement commands,
+    // which disable it to force a fresh prefill. Speculative decode's verify
+    // primitive (`verify_and_commit_speculation` → `spec_prefill_and_forward`)
+    // re-presents the whole running sequence each round and relies on live-prefix
+    // KV reuse (`prepare_prefix_reuse`) to skip re-prefilling everything but the new
+    // tokens — exactly as production serves it (config default `prefix_cache = true`).
+    // With it OFF, every round `kv.reset()`s and re-prefills the full growing context
+    // (the trace shows `effective=0 seq_len=0` each round), making every spec
+    // candidate ~80x slower than the classic `None` baseline (which decodes
+    // incrementally via `generate_token_ids` and never re-prefills). That handicap is
+    // pure measurement artifact: it made the sweep ALWAYS pick `None`, defeating its
+    // purpose. Matching production here lets the candidates be compared on real decode
+    // throughput.
+    cpu.set_prefix_cache(true);
     cpu.set_flash_attention(cfg.flash_attention);
     apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
     spec_dbg!("load done");
