@@ -4893,9 +4893,11 @@ fn cu_grade(
 /// `|g-c| / (|c| + 1e-3)` false-trips (cos high, but one ref≈0 element reads
 /// rel≈1) — the SAME artifact the whole-layer graph grade avoids, and exactly
 /// what flagged `mxfp8_tc` / `mxfp6_tc` (cos=0.986) as MISCOMPUTE on real sm_120.
-/// `abs_tol` scales to 2% of the output peak so a GROSS layout bug (nvfp4/mxfp4
-/// cos≈0.5, sp24 cos≈0.12) still fails while quant noise on a near-zero element
-/// passes; `rel_tol` stays loose (the CPU ref is W4A16, the kernel W4A4).
+/// `abs_tol` scales to 2% of the output peak so a GROSS layout bug (a real
+/// scale/fragment TV-layout error) still fails while quant noise on a near-zero
+/// element passes; `rel_tol` stays loose to absorb the residual rounding between
+/// the kernel's and the reference's (now matched, W4A4/W8A8/W6A6 — see
+/// `fair_tc_activation`) per-block activation quant.
 ///
 /// Also LOCALIZES the worst element → (output row m, token col n): for a scale /
 /// fragment TV-layout bug this shows WHICH rows are wrong (e.g. only rows 8..15
@@ -4984,6 +4986,52 @@ enum TcGemm {
     Fp8Wgmma,
 }
 
+/// Round-trip `x` (N×K row-major) through the SAME per-block activation
+/// quantization the Blackwell/MX TC kernels apply on the fly, so the CPU
+/// reference is a FAIR W4A4 / W8A8 / W6A6 comparand instead of W4A16 (full-
+/// precision activations). Grading a lossy-activation kernel against a full-
+/// precision reference conflated the format's inherent activation loss (NVFP4
+/// E2M1 is 1-bit-mantissa → cos≈0.5 even for a CORRECT kernel; E4M3/E3M2 trip
+/// the abs-floor on large elements → mxfp8/mxfp6 cos≈0.986) with a kernel bug —
+/// the same unfairness the Q8_0/Q4_K W8A8 probes already avoid with an int8
+/// activation round-trip. The TC kernels' codecs are ports of these CPU codecs
+/// (per rsl_blackwell.cuh) with the same block size + scale convention, so the
+/// round-trip reproduces the kernel's effective activations.
+fn fair_tc_activation(which: TcGemm, x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0f32; x.len()];
+    match which {
+        TcGemm::Nvfp4 | TcGemm::Nvfp4Tma => {
+            let mut pk = [0u8; 9]; // NVFP4: per-16, 8 code + 1 E4M3 scale
+            for base in (0..x.len()).step_by(16) {
+                k::nvfp4::quantize_block(&x[base..base + 16], &mut pk);
+                k::nvfp4::dequantize_block(&pk, &mut out[base..base + 16]);
+            }
+        }
+        TcGemm::Mxfp4 => {
+            let mut pk = [0u8; 17]; // MXFP4: per-32, 16 code + 1 E8M0 scale
+            for base in (0..x.len()).step_by(32) {
+                k::mxfp_kv::quantize_block_mxfp4(&x[base..base + 32], &mut pk);
+                k::mxfp_kv::dequantize_row_mxfp4(&pk, &mut out[base..base + 32]);
+            }
+        }
+        TcGemm::Mxfp8 | TcGemm::Fp8Wgmma => {
+            let mut pk = [0u8; 33]; // MXFP8: per-32, 32 E4M3 + 1 E8M0 scale
+            for base in (0..x.len()).step_by(32) {
+                k::mxfp_kv::quantize_block_mxfp8(&x[base..base + 32], &mut pk);
+                k::mxfp_kv::dequantize_row_mxfp8(&pk, &mut out[base..base + 32]);
+            }
+        }
+        TcGemm::Mxfp6 => {
+            let mut pk = [0u8; 25]; // MXFP6: per-32, 24 code bytes + 1 E8M0 scale
+            for base in (0..x.len()).step_by(32) {
+                k::mxfp_kv::quantize_block_mxfp6(&x[base..base + 32], &mut pk);
+                k::mxfp_kv::dequantize_row_mxfp6(&pk, &mut out[base..base + 32]);
+            }
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cu_tc_gemm_probe(
     stream: &ck::CudaStream,
@@ -4997,12 +5045,17 @@ fn cu_tc_gemm_probe(
     counts: &mut std::collections::BTreeMap<&'static str, usize>,
 ) {
     let x = gen_x(n * k, 123);
+    // FAIR reference: feed `cpu_row` the activations round-tripped through the
+    // kernel's own per-block quant (W4A4 / W8A8 / W6A6), NOT raw f32 (W4A16) —
+    // otherwise the format's activation loss reads as a kernel MISCOMPUTE. The
+    // GEMM still gets the raw `x` (it quantizes internally).
+    let x_ref = fair_tc_activation(which, &x);
     // Batched reference: out[n*M + m] = row_n · W[m] (col-major in M, as the
     // GEMM writes it).
     let mut cpu = vec![0f32; n * m];
     for ni in 0..n {
         let mut row = vec![0f32; m];
-        cpu_row(w, &x[ni * k..(ni + 1) * k], &mut row, m, k);
+        cpu_row(w, &x_ref[ni * k..(ni + 1) * k], &mut row, m, k);
         cpu[ni * m..(ni + 1) * m].copy_from_slice(&row);
     }
     let (Some(wb), Some(xb), Some(mut ob)) = (
