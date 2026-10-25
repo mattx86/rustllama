@@ -5310,6 +5310,88 @@ fn fp4_rowcol_probe(stream: &ck::CudaStream) {
     );
 }
 
+/// On-device diagnostic (same env gate): pin the within-microblock A↔B K-element
+/// pairing — the last unconfirmed suspect for cos≈0.49 (scale, row/col and the A
+/// data layout are all confirmed correct, but every other probe used
+/// within-block-UNIFORM data, so element-level K pairing was never exercised).
+/// Weight row 0, microblock 0 (K0-15) = a distinct recoverable ramp (max 6 →
+/// block scale 1 → dequant = the values); all other weight 0. Sweep an activation
+/// delta at K=j (j=0..15, value 6.0, else 0): out[0,0] = W[0, A-element the HW
+/// paired with B-position j] · 6. So out/6 identifies that A-element; the map
+/// B-j → A-index should be identity. A permutation IS the bug and names the fix
+/// (reorder the B-fragment K fill in rsl_bw_gemm_nvfp4_kernel).
+fn fp4_kpair_probe(stream: &ck::CudaStream) {
+    let (m, n, kd) = (16usize, 8usize, 64usize);
+    let blocks = kd / 16;
+    // 16 recoverable weight values (positions 0..13 distinct; 14,15 reuse 0.5/1.0).
+    let wvals: [f32; 16] = [
+        6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.5, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, 0.25, 0.75,
+    ];
+    let mut w = vec![0u8; m * blocks * 9];
+    k::nvfp4::quantize_block(&wvals, &mut w[0..9]); // row 0, microblock 0; rest stays 0
+    let Some(wb) = ck::CudaDeviceBuffer::from_host(stream, &w) else {
+        cu_emit("fp4:kpair_probe", "KERNEL_ERR", "w-alloc");
+        return;
+    };
+    let mut paired = [0f32; 16];
+    for j in 0..16usize {
+        let mut x = vec![0f32; n * kd];
+        for ni in 0..n {
+            x[ni * kd + j] = 6.0; // delta at K=j
+        }
+        let (Some(xb), Some(mut ob)) = (
+            cu_upload_f32(stream, &x),
+            ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+        ) else {
+            cu_emit("fp4:kpair_probe", "KERNEL_ERR", "xo-alloc");
+            return;
+        };
+        // SAFETY: live device buffers on `stream`.
+        let res = unsafe {
+            ck::gemm_fp4_tc_f32(
+                ck::CudaFp4TcKind::Nvfp4,
+                stream,
+                wb.as_ptr(),
+                xb.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                m,
+                n,
+                kd,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit("fp4:kpair_probe", "KERNEL_ERR", &format!("j={j}: {e}"));
+            return;
+        }
+        paired[j] = cu_download_f32(&ob, n * m)[0] / 6.0; // = W[0, HW-paired A-index]
+    }
+    // Recover the A-index each B-position paired with (nearest wvals entry).
+    let a_idx: Vec<i32> = paired
+        .iter()
+        .map(|&v| {
+            wvals
+                .iter()
+                .position(|&w| (w - v).abs() < 0.2)
+                .map(|p| p as i32)
+                .unwrap_or(-1)
+        })
+        .collect();
+    let identity = (0..14).all(|j| a_idx[j] == j as i32); // positions 0..13 are unambiguous
+    let detail = format!(
+        "B-pos→A-idx = {a_idx:?} (identity=ok); paired(out/6)={paired:?} — {}",
+        if identity {
+            "WITHIN-BLOCK OK (pairing fine)"
+        } else {
+            "PERMUTED → reorder the B-fragment K fill to match"
+        }
+    );
+    cu_emit(
+        "fp4:kpair_probe",
+        if identity { "OK" } else { "MISCOMPUTE" },
+        &detail,
+    );
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -7164,6 +7246,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         if std::env::var("RUSTLLAMA_FP4_LAYOUT_PROBE").is_ok() {
             fp4_scale_byte_probe(&stream);
             fp4_rowcol_probe(&stream);
+            fp4_kpair_probe(&stream);
         }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
