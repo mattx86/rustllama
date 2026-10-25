@@ -1639,16 +1639,12 @@ extern "C" int rsl_cuda_delta_net_step_f32(
 // x[N,K]·W[M,K]^T, K % 256 == 0.
 // ============================================================
 #define RSL_Q4K_TC_BM 64
-#define RSL_Q4K_TC_BN 128
-#define RSL_Q4K_TC_WARPS 32 // 4x8 grid of 16x16 sub-tiles -> 64x128 tile, 1024 threads
-// Wider N-tile (128): the weight tile for these 64 rows is now re-staged N/128
-// times instead of N/64 — HALF the redundant weight reads from global. Cost: 1024
-// threads/block → 1 block/SM (67% occupancy, down from 100%), a deliberate trade of
-// occupancy for memory traffic. A/B'd on the probe; revert if it's a wash.
+#define RSL_Q4K_TC_BN 64
+#define RSL_Q4K_TC_WARPS 16 // 4x4 grid of 16x16 sub-tiles -> 512 threads
 // 32-K sub-blocks staged per round in the W8A8 TC GEMM. >1 amortizes the global
 // staging + the two __syncthreads over KT sub-blocks (the kernel is overhead-bound,
-// not TC-bound). KT=2 (64-K tile). Static shared at BN=128/WARPS=32 is As 4K + Bs
-// 8K + Cs 32K + scales 1.5K ≈ 45.5 KB (< the 48 KB static-shared cap; 1 block/SM).
+// not TC-bound). KT=2 (64-K tile): shared = As 4K + Bs 4K + Cs 16K + scales 1K ≈
+// 25 KB → still 3 blocks/SM (×3 = 75 KB < 100 KB), so 100% occupancy is preserved.
 #define RSL_Q4K_TC_KT 2
 
 __global__ void gemm_q4_k_w8a8_tc_kernel(const unsigned char *w,
@@ -1823,12 +1819,13 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
 //   y = Σ_b xs[b]·d[b]·S[b]. Graded vs the FAIR W8A8 reference (int8 TC math is
 // exact; only activation rounding differs). out[N,M] = x[N,K]·W[M,K]^T, K%32==0.
 // ============================================================
-// `__launch_bounds__(1024, 1)`: the 64x128 tile uses 1024 threads (32 warps), which
-// caps the SM at 1 resident block (2x1024 > 1536 max threads/SM) → 67% occupancy.
-// The hint lets nvcc use the full register budget (65536/1024 = 64 regs/thread) at
-// that 1 block/SM without spilling. The bigger tile trades this occupancy for halved
-// weight re-reads; A/B'd on the `tc X.XXX ms/call` verdict timing.
-__global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 1)
+// `__launch_bounds__(512, 3)`: this GEMM is overhead-bound (per-32-K staging + two
+// __syncthreads + a 16 KB Cs round-trip dwarf the two tiny MMAs), and the occupancy
+// diagnostic showed 67% (2 blocks/SM, capped by 46 regs/thread). Forcing nvcc to fit
+// 3 blocks/SM (<=42 regs/thread → 100% theoretical occupancy) lets a second block's
+// warps run while the first is parked at a barrier, hiding the sync stalls. Lossless
+// (a scheduling/register hint only); A/B'd on the `tc X.XXX ms/call` verdict timing.
+__global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
     gemm_q8_0_w8a8_tc_kernel(const unsigned char *w, const signed char *xq,
                              const float *xs, float *out, int M, int K, int N) {
     __shared__ signed char As[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT * 32]; // int8 weights   [m][k-tile]
@@ -1843,8 +1840,8 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 1)
     const int lane = threadIdx.x;   // 0..31
     const int tid = warpId * 32 + lane;
     const int nthreads = RSL_Q4K_TC_WARPS * 32; // 512
-    const int wr = warpId >> 3;     // 0..3 (4 row-tiles of 16 → 64 rows)
-    const int wc = warpId & 7;      // 0..7 (8 col-tiles of 16 → 128 tokens)
+    const int wr = warpId >> 2;     // 0..3
+    const int wc = warpId & 3;      // 0..3
     const int m0 = rowBase + wr * 16;
     const int n0 = tokBase + wc * 16;
     const int spr = K / 32;              // 32-blocks per row
