@@ -1641,6 +1641,11 @@ extern "C" int rsl_cuda_delta_net_step_f32(
 #define RSL_Q4K_TC_BM 64
 #define RSL_Q4K_TC_BN 64
 #define RSL_Q4K_TC_WARPS 16 // 4x4 grid of 16x16 sub-tiles -> 512 threads
+// 32-K sub-blocks staged per round in the W8A8 TC GEMM. >1 amortizes the global
+// staging + the two __syncthreads over KT sub-blocks (the kernel is overhead-bound,
+// not TC-bound). KT=2 (64-K tile): shared = As 4K + Bs 4K + Cs 16K + scales 1K ≈
+// 25 KB → still 3 blocks/SM (×3 = 75 KB < 100 KB), so 100% occupancy is preserved.
+#define RSL_Q4K_TC_KT 2
 
 __global__ void gemm_q4_k_w8a8_tc_kernel(const unsigned char *w,
                                          const signed char *xq, const float *xs,
@@ -1823,11 +1828,11 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
 __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
     gemm_q8_0_w8a8_tc_kernel(const unsigned char *w, const signed char *xq,
                              const float *xs, float *out, int M, int K, int N) {
-    __shared__ signed char As[RSL_Q4K_TC_BM][32]; // int8 weights   [m][k]
-    __shared__ signed char Bs[RSL_Q4K_TC_BN][32]; // int8 activations [n][k]
-    __shared__ float dw[RSL_Q4K_TC_BM];           // per-row block scale d
-    __shared__ float xscl[RSL_Q4K_TC_BN];         // per-token activation scale
-    __shared__ int Cs[RSL_Q4K_TC_WARPS][16][16];  // per-warp int32 MMA result
+    __shared__ signed char As[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT * 32]; // int8 weights   [m][k-tile]
+    __shared__ signed char Bs[RSL_Q4K_TC_BN][RSL_Q4K_TC_KT * 32]; // int8 acts      [n][k-tile]
+    __shared__ float dw[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT];            // per-row scale d, per sub-block
+    __shared__ float xscl[RSL_Q4K_TC_BN][RSL_Q4K_TC_KT];          // per-token act scale, per sub-block
+    __shared__ int Cs[RSL_Q4K_TC_WARPS][16][16];                  // per-warp int32 MMA result
 
     const int rowBase = blockIdx.x * RSL_Q4K_TC_BM;
     const int tokBase = blockIdx.y * RSL_Q4K_TC_BN;
@@ -1839,88 +1844,111 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
     const int wc = warpId & 3;      // 0..3
     const int m0 = rowBase + wr * 16;
     const int n0 = tokBase + wc * 16;
-    const int spr = K / 32; // 32-blocks per row
+    const int spr = K / 32;              // 32-blocks per row
+    const int KW = RSL_Q4K_TC_KT * 32;   // staged K width
 
     float cacc[8];
 #pragma unroll
     for (int c = 0; c < 8; ++c) cacc[c] = 0.0f;
 
-    for (int g = 0; g < spr; ++g) {
-        // Per-row block scale d (f16) — one thread per row.
-        if (tid < RSL_Q4K_TC_BM) {
-            int mg = rowBase + tid;
+    // K-tile loop: stage RSL_Q4K_TC_KT 32-blocks (KW wide) per round so the global
+    // staging + the two __syncthreads amortize over KT sub-blocks instead of firing
+    // per 32 (the kernel is overhead-bound, not TC-bound). The per-32-block scale
+    // fold stays inside the sub-loop (Q8_0 scales are per-32).
+    for (int gt = 0; gt < spr; gt += RSL_Q4K_TC_KT) {
+        const int nsub = (spr - gt < RSL_Q4K_TC_KT) ? (spr - gt) : RSL_Q4K_TC_KT;
+        // Per-row block scale d (f16) for each staged sub-block.
+        for (int e = tid; e < RSL_Q4K_TC_BM * RSL_Q4K_TC_KT; e += nthreads) {
+            int rl = e / RSL_Q4K_TC_KT;
+            int sub = e % RSL_Q4K_TC_KT;
+            int mg = rowBase + rl;
             float d = 0.0f;
-            if (mg < M) {
-                const unsigned char *blk = w + ((size_t)mg * spr + g) * 34;
+            if (mg < M && sub < nsub) {
+                const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
                 d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
             }
-            dw[tid] = d;
+            dw[rl][sub] = d;
         }
-        // Stage int8 weights -> As[m][k] (already int8, no unpack).
-        for (int e = tid; e < RSL_Q4K_TC_BM * 32; e += nthreads) {
-            int rl = e >> 5;
-            int kk = e & 31;
+        // Stage int8 weights -> As[m][k-tile] (already int8, no unpack).
+        for (int e = tid; e < RSL_Q4K_TC_BM * KW; e += nthreads) {
+            int rl = e / KW;
+            int kk = e % KW; // 0..KW-1
+            int sub = kk >> 5;
+            int kloc = kk & 31;
             int mg = rowBase + rl;
             signed char ww = 0;
-            if (mg < M) {
-                const unsigned char *blk = w + ((size_t)mg * spr + g) * 34;
-                ww = (signed char)blk[2 + kk];
+            if (mg < M && sub < nsub) {
+                const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
+                ww = (signed char)blk[2 + kloc];
             }
             As[rl][kk] = ww;
         }
-        // Stage int8 activations -> Bs[n][k].
-        for (int e = tid; e < RSL_Q4K_TC_BN * 32; e += nthreads) {
-            int tl = e >> 5;
-            int kk = e & 31;
+        // Stage int8 activations -> Bs[n][k-tile].
+        for (int e = tid; e < RSL_Q4K_TC_BN * KW; e += nthreads) {
+            int tl = e / KW;
+            int kk = e % KW;
+            int sub = kk >> 5;
+            int kloc = kk & 31;
             int ng = tokBase + tl;
-            Bs[tl][kk] = (ng < N) ? xq[(size_t)ng * K + (size_t)g * 32 + kk] : (signed char)0;
+            signed char bb = 0;
+            if (ng < N && sub < nsub) {
+                bb = xq[(size_t)ng * K + (size_t)(gt + sub) * 32 + kloc];
+            }
+            Bs[tl][kk] = bb;
         }
-        // Per-token activation scale.
-        if (tid < RSL_Q4K_TC_BN) {
-            int ng = tokBase + tid;
-            xscl[tid] = (ng < N) ? xs[(size_t)ng * spr + g] : 0.0f;
+        // Per-token activation scale for each staged sub-block.
+        for (int e = tid; e < RSL_Q4K_TC_BN * RSL_Q4K_TC_KT; e += nthreads) {
+            int tl = e / RSL_Q4K_TC_KT;
+            int sub = e % RSL_Q4K_TC_KT;
+            int ng = tokBase + tl;
+            xscl[tl][sub] =
+                (ng < N && sub < nsub) ? xs[(size_t)ng * spr + (gt + sub)] : 0.0f;
         }
         __syncthreads();
 
-        // S = Σ_k(w_i8 · q_x) over the 32-wide block, into Cs[warpId].
+        for (int sub = 0; sub < nsub; ++sub) {
+            const int kbase = sub * 32;
+            // S = Σ_k(w_i8 · q_x) over this 32-wide sub-block, into Cs[warpId].
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, signed char,
-                               nvcuda::wmma::row_major> a_frag;
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, signed char,
-                               nvcuda::wmma::col_major> b_frag;
-        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
-        nvcuda::wmma::fill_fragment(acc_frag, 0);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, signed char,
+                                   nvcuda::wmma::row_major> a_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, signed char,
+                                   nvcuda::wmma::col_major> b_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
+            nvcuda::wmma::fill_fragment(acc_frag, 0);
 #pragma unroll
-        for (int kk = 0; kk < 32; kk += 16) {
-            nvcuda::wmma::load_matrix_sync(a_frag, &As[wr * 16][kk], 32);
-            nvcuda::wmma::load_matrix_sync(b_frag, &Bs[wc * 16][kk], 32);
-            nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-        }
-        nvcuda::wmma::store_matrix_sync(&Cs[warpId][0][0], acc_frag, 16,
-                                        nvcuda::wmma::mem_row_major);
+            for (int kk = 0; kk < 32; kk += 16) {
+                nvcuda::wmma::load_matrix_sync(a_frag, &As[wr * 16][kbase + kk], KW);
+                nvcuda::wmma::load_matrix_sync(b_frag, &Bs[wc * 16][kbase + kk], KW);
+                nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+            nvcuda::wmma::store_matrix_sync(&Cs[warpId][0][0], acc_frag, 16,
+                                            nvcuda::wmma::mem_row_major);
 #else
-        // Scalar fallback (arch < sm_72, never in the release list): same int32 dot.
+            // Scalar fallback (arch < sm_72, never in the release list).
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            int e = lane + c * 32;
-            int mi = e >> 4, nj = e & 15;
-            int acc_i = 0;
-            for (int kk = 0; kk < 32; ++kk)
-                acc_i += (int)As[wr * 16 + mi][kk] * (int)Bs[wc * 16 + nj][kk];
-            Cs[warpId][mi][nj] = acc_i;
-        }
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32;
+                int mi = e >> 4, nj = e & 15;
+                int acc_i = 0;
+                for (int kk = 0; kk < 32; ++kk)
+                    acc_i += (int)As[wr * 16 + mi][kbase + kk] * (int)Bs[wc * 16 + nj][kbase + kk];
+                Cs[warpId][mi][nj] = acc_i;
+            }
 #endif
-        __syncwarp();
-        // Fold the f32 scales into the running accumulator (symmetric — no Σ term).
+            __syncwarp();
+            // Fold the f32 scales (per-32-sub-block) into the running accumulator.
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            int e = lane + c * 32;
-            int mi = e >> 4, nj = e & 15;
-            int row = wr * 16 + mi;
-            int tok = wc * 16 + nj;
-            cacc[c] += xscl[tok] * dw[row] * (float)Cs[warpId][mi][nj];
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32;
+                int mi = e >> 4, nj = e & 15;
+                int row = wr * 16 + mi;
+                int tok = wc * 16 + nj;
+                cacc[c] += xscl[tok][sub] * dw[row][sub] * (float)Cs[warpId][mi][nj];
+            }
+            __syncwarp(); // before this warp reuses Cs[warpId] for the next sub-block
         }
-        __syncthreads(); // before the next block overwrites shared
+        __syncthreads(); // before the next K-tile overwrites shared
     }
 
     // Write out[token][row].
