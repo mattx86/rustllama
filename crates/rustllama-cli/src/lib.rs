@@ -7263,13 +7263,28 @@ fn cmd_tune_kv_dtype(
     let kv_budget_bytes: u64 = if f16_base_for_fit == 0 {
         0
     } else {
-        let avail = rustllama_runtime::memory_info().available_bytes;
-        let budget = avail / 2;
         let mib = |b: u64| (b as f64) / (1024.0 * 1024.0);
+        let ram_budget = rustllama_runtime::memory_info().available_bytes / 2;
+        // Budget against where the KV cache will ACTUALLY live. On a
+        // dedicated-VRAM dispatch GPU the placement stage makes the KV
+        // device-resident, so budgeting against host RAM wrongly excludes a fast
+        // dtype on a RAM-starved box fronting a big GPU — e.g. a 9 GB container
+        // on a 24 GB card picked the 1.7x-slower f16 over f32 at ctx=32768 purely
+        // because f32's KV didn't fit ½ of 9 GB of RAM it was never going to use.
+        // Budget against VRAM there (coarse guard; the placement stage remains the
+        // authoritative VRAM fit check), and fall back to RAM/2 for CPU-only /
+        // unified-memory iGPU hosts where the KV really does live in shared RAM.
+        let (budget, pool) = if dispatch_gpu_has_dedicated_vram() {
+            match detect_dispatch_gpu_vram_mb() {
+                Some(vram_mb) => (ram_budget.max(vram_mb * 1024 * 1024), "dispatch GPU VRAM"),
+                None => (ram_budget, "½ available RAM"),
+            }
+        } else {
+            (ram_budget, "½ available RAM")
+        };
         println!(
-            "  fit budget    = {:.0} MiB (½ of {:.0} MiB available RAM); KV@ctx{} f16 base {:.0} MiB",
+            "  fit budget    = {:.0} MiB ({pool}); KV@ctx{} f16 base {:.0} MiB",
             mib(budget),
-            mib(avail),
             deploy_ctx,
             mib(f16_base_for_fit),
         );
@@ -9387,11 +9402,22 @@ fn cmd_tune_all(
     if skip(has_kv_layout) {
         println!("(skipped: kv_cache_layout winner already cached)");
     } else {
+        // Measure this A/B at a REPRESENTATIVE context, not the tiny default
+        // decode-sweep size. The paged engine's attention still falls back to the
+        // HOST at both prefill and decode (GPU paged attention is Phase A), so
+        // paged only beats contiguous at a ~64-token context where that fallback
+        // is cheap — at a real prompt it is far slower (observed ~22x on a
+        // 512-token prefill, and decode 57 vs 99 tok/s). A tiny-context sweep
+        // therefore MIS-PICKS paged for single-stream serving; a 512/128 window
+        // exposes the host-fallback penalty so the decode-tok/s metric favors
+        // contiguous until the GPU paged-attention path lands.
+        let kvl_prompt = kv_layout_prompt_tokens.max(512);
+        let kvl_decode = kv_layout_decode_tokens.max(128);
         let args_4 = vec![
             "--prompt-tokens".to_string(),
-            kv_layout_prompt_tokens.to_string(),
+            kvl_prompt.to_string(),
             "--decode-tokens".to_string(),
-            kv_layout_decode_tokens.to_string(),
+            kvl_decode.to_string(),
             "--repeats".to_string(),
             kv_layout_repeats.to_string(),
             "--kv-layout-candidates".to_string(),
