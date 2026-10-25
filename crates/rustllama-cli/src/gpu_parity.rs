@@ -5183,6 +5183,102 @@ fn fp4_scale_byte_probe(stream: &ck::CudaStream) {
     );
 }
 
+/// On-device diagnostic (same env gate): pin the NVFP4 output-fragment ROW (M)
+/// and COLUMN (N) assignment — the suspect for cos≈0.49 with ALL rows bad, which
+/// is the signature of a row-pair swap (output rows g ↔ g+8 mislabeled → half the
+/// rows land wrong → cos ~0.5). The scale probe missed it (uniform-across-rows
+/// weights). Controlled input, M=16 N=8 K=64:
+///   ROW test: weight row r = (r+1) everywhere (per-16-block uniform → dequant
+///     r+1), activation = 6.0 everywhere → out[row r] = 64·(r+1)·6 = 384·(r+1).
+///     out[*,0] reads which weight-row landed at each output row.
+///   COL test: weight = 1.0, activation col c = (c+1) everywhere → out[*,col c]
+///     = 64·(c+1). out[0,*] reads the column assignment.
+/// Identity maps = fragment layout correct; a permutation IS the bug.
+fn fp4_rowcol_probe(stream: &ck::CudaStream) {
+    let (m, n, kd) = (16usize, 8usize, 64usize);
+    let blocks = kd / 16;
+    let run = |w: &[u8], x: &[f32]| -> Option<Vec<f32>> {
+        let (wb, xb, mut ob) = (
+            ck::CudaDeviceBuffer::from_host(stream, w)?,
+            cu_upload_f32(stream, x)?,
+            ck::CudaDeviceBuffer::alloc(stream, n * m * 4)?,
+        );
+        // SAFETY: wb (M×K nvfp4), xb (N·K f32), ob (N·M f32) live on `stream`.
+        let r = unsafe {
+            ck::gemm_fp4_tc_f32(
+                ck::CudaFp4TcKind::Nvfp4,
+                stream,
+                wb.as_ptr(),
+                xb.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                m,
+                n,
+                kd,
+            )
+        };
+        r.ok().map(|()| cu_download_f32(&ob, n * m))
+    };
+    // ROW test.
+    let mut wrow = vec![0u8; m * blocks * 9];
+    for r in 0..m {
+        for b in 0..blocks {
+            let off = (r * blocks + b) * 9;
+            k::nvfp4::quantize_block(&vec![(r + 1) as f32; 16], &mut wrow[off..off + 9]);
+        }
+    }
+    let Some(orow) = run(&wrow, &vec![6.0f32; n * kd]) else {
+        cu_emit("fp4:rowcol_probe", "KERNEL_ERR", "row-run-failed");
+        return;
+    };
+    // out[*,0] = indices 0..m. applied weight-row at output-row p = out/384 - 1.
+    let row_raw: Vec<f32> = (0..m).map(|p| orow[p]).collect();
+    let row_map: Vec<i32> = row_raw
+        .iter()
+        .map(|&v| ((v as f64 / 384.0).round() as i32) - 1)
+        .collect();
+    // COL test.
+    let mut wone = vec![0u8; m * blocks * 9];
+    for r in 0..m {
+        for b in 0..blocks {
+            let off = (r * blocks + b) * 9;
+            k::nvfp4::quantize_block(&vec![1.0f32; 16], &mut wone[off..off + 9]);
+        }
+    }
+    let mut xcol = vec![0f32; n * kd];
+    for c in 0..n {
+        for v in xcol[c * kd..(c + 1) * kd].iter_mut() {
+            *v = (c + 1) as f32;
+        }
+    }
+    let Some(ocol) = run(&wone, &xcol) else {
+        cu_emit("fp4:rowcol_probe", "KERNEL_ERR", "col-run-failed");
+        return;
+    };
+    // out[0,c] = index c*M. applied activation-col at output-col c = out/64 - 1.
+    let col_raw: Vec<f32> = (0..n).map(|c| ocol[c * m]).collect();
+    let col_map: Vec<i32> = col_raw
+        .iter()
+        .map(|&v| ((v as f64 / 64.0).round() as i32) - 1)
+        .collect();
+    let row_ok = (0..m).all(|p| row_map[p] == p as i32);
+    let col_ok = (0..n).all(|c| col_map[c] == c as i32);
+    let detail = format!(
+        "ROW out-row→weight-row = {row_map:?} (ident=ok; raw={row_raw:?}); \
+         COL out-col→act-col = {col_map:?} (ident=ok; raw={col_raw:?}) — {}",
+        match (row_ok, col_ok) {
+            (true, true) => "BOTH OK (row/col fragment layout fine; bug is in K routing)",
+            (false, true) => "ROW PERMUTED → fix the d[]→row map (likely g↔g+8)",
+            (true, false) => "COL PERMUTED → fix the d[]→col map",
+            (false, false) => "ROW+COL PERMUTED",
+        }
+    );
+    cu_emit(
+        "fp4:rowcol_probe",
+        if row_ok && col_ok { "OK" } else { "MISCOMPUTE" },
+        &detail,
+    );
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -7036,6 +7132,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         // nvfp4/mxfp4 cos≈0.49). One pod run reads back the byte permutation.
         if std::env::var("RUSTLLAMA_FP4_LAYOUT_PROBE").is_ok() {
             fp4_scale_byte_probe(&stream);
+            fp4_rowcol_probe(&stream);
         }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
