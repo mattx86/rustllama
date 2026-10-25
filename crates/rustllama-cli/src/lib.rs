@@ -9445,12 +9445,19 @@ fn cmd_tune_all(
         // (continuous-batching) engine vs the contiguous engine and persists
         // the faster one under `batching_engine`. The serve path reads it to
         // decide whether default-on continuous batching regresses the
-        // single-user case. Reuse the decode-sweep sizing.
+        // single-user case. Measure at a REPRESENTATIVE context (like the
+        // kv-layout stage), not the tiny decode-sweep size: the paged engine's
+        // attention still falls back to the HOST (GPU paged attention is Phase A),
+        // so at a ~64-token prompt the penalty is invisible and paged is
+        // mis-picked, but at a real prompt it is far slower (~22x on a 512-token
+        // prefill). A 512/128 window exposes that so the single-user guard is honest.
+        let b_prompt = measure_prompt_tokens.max(512);
+        let b_decode = measure_decode_tokens.max(128);
         let args_4b = vec![
             "--prompt-tokens".to_string(),
-            measure_prompt_tokens.to_string(),
+            b_prompt.to_string(),
             "--decode-tokens".to_string(),
-            measure_decode_tokens.to_string(),
+            b_decode.to_string(),
             "--repeats".to_string(),
             measure_repeats.to_string(),
         ];
