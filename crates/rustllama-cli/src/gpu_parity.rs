@@ -5091,7 +5091,38 @@ fn cu_tc_gemm_probe(
             cu_emit(name, "KERNEL_ERR", &format!("{e}"));
             *counts.entry("KERNEL_ERR").or_default() += 1;
         }
-        Ok(()) => cu_tc_grade(name, &cu_download_f32(&ob, n * m), &cpu, m, counts),
+        Ok(()) => {
+            let gpu = cu_download_f32(&ob, n * m);
+            // Opt-in element-by-element dump of the REAL (random-data) output vs the
+            // fair reference, so the error STRUCTURE is visible (ratio≈-1 ⇒ sign
+            // flip; ≈const ⇒ scale; wild ⇒ K-routing/data). The controlled probes
+            // all pass on positive uniform data, so this looks at what random signed
+            // data actually does.
+            if std::env::var("RUSTLLAMA_FP4_LAYOUT_PROBE").is_ok() {
+                fp4_dump_tile(name, &gpu, &cpu, m, n);
+            }
+            cu_tc_grade(name, &gpu, &cpu, m, counts);
+        }
+    }
+}
+
+/// Print the first elements of a TC-GEMM output next to the fair reference, with
+/// the gpu/cpu ratio — the quickest read of an error's STRUCTURE (sign flip vs
+/// scale vs permutation vs noise) when the controlled layout probes all pass.
+fn fp4_dump_tile(name: &str, gpu: &[f32], cpu: &[f32], m: usize, _n: usize) {
+    let lim = gpu.len().min(cpu.len()).min(24);
+    println!("  [fp4-tile] {name}: first {lim} out elems (idx r,c | cpu gpu ratio)");
+    for i in 0..lim {
+        let (r, c) = (i % m, i / m);
+        let ratio = if cpu[i].abs() > 1e-5 {
+            format!("{:+.3}", gpu[i] / cpu[i])
+        } else {
+            "  n/a".to_string()
+        };
+        println!(
+            "    [{i:3}] r{r:<2} c{c:<2} cpu={:+.5} gpu={:+.5} ratio={ratio}",
+            cpu[i], gpu[i]
+        );
     }
 }
 
