@@ -5095,6 +5095,94 @@ fn cu_tc_gemm_probe(
     }
 }
 
+/// On-device diagnostic (env `RUSTLLAMA_FP4_LAYOUT_PROBE=1`): pin the NVFP4
+/// `scale_vec::4X` scale-byte → K-microblock order that Colfax/PTX leave
+/// undocumented (the prime suspect for nvfp4/mxfp4 cos≈0.49 while the 1-byte
+/// `scale_vec::1X` mxfp8/mxfp6 are nearly right). Controlled input, M=16 N=8
+/// K=64 (one `m16n8k64` atom = 4 per-16 microblocks):
+///   - weight microblock `b` of every row = 2^b (quantize_block([2^b;16]) →
+///     codes all encode 6.0, block-scale 2^b/6, so the dequantized element = 2^b);
+///   - activations = 6.0 in exactly ONE K-microblock `t` per run, 0 elsewhere
+///     (so the kernel's per-16 activation scale = 1.0 for every block).
+/// Then out[m,n] = Σ over block t's 16 elems of 2^applied · 6.0 = 96·2^applied,
+/// where `applied` is the scale byte the kernel actually used for block t. The
+/// four single-block runs read back the byte→block map: correct is
+/// out_t = 96·2^t; any permutation IS the layout bug (fix = reorder the `sfa`
+/// byte packing in rsl_bw_gemm_nvfp4_kernel). Pure controlled input + readback —
+/// no kernel change, so it can't perturb the real path.
+fn fp4_scale_byte_probe(stream: &ck::CudaStream) {
+    let (m, n, kd) = (16usize, 8usize, 64usize);
+    let blocks = kd / 16; // 4 per-16 microblocks in the atom
+    // Controlled weight: row-major [m][blocks][9]; block b = quantize_block([2^b;16]).
+    let mut w = vec![0u8; m * blocks * 9];
+    for r in 0..m {
+        for b in 0..blocks {
+            let v = (1u32 << b) as f32; // 1, 2, 4, 8
+            let blk = vec![v; 16];
+            let off = (r * blocks + b) * 9;
+            k::nvfp4::quantize_block(&blk, &mut w[off..off + 9]);
+        }
+    }
+    let Some(wb) = ck::CudaDeviceBuffer::from_host(stream, &w) else {
+        cu_emit("fp4:scale_byte_probe", "KERNEL_ERR", "w-alloc-failed");
+        return;
+    };
+    let mut applied = [-1i32; 4];
+    let mut raw = [0f32; 4];
+    for t in 0..blocks {
+        let mut x = vec![0f32; n * kd]; // zero everywhere; 6.0 only in microblock t
+        for ni in 0..n {
+            for j in 0..16 {
+                x[ni * kd + t * 16 + j] = 6.0;
+            }
+        }
+        let (Some(xb), Some(mut ob)) = (
+            cu_upload_f32(stream, &x),
+            ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+        ) else {
+            cu_emit("fp4:scale_byte_probe", "KERNEL_ERR", "xo-alloc-failed");
+            return;
+        };
+        // SAFETY: wb (M×K nvfp4), xb (N·K f32), ob (N·M f32) are live on `stream`.
+        let res = unsafe {
+            ck::gemm_fp4_tc_f32(
+                ck::CudaFp4TcKind::Nvfp4,
+                stream,
+                wb.as_ptr(),
+                xb.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                m,
+                n,
+                kd,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit("fp4:scale_byte_probe", "KERNEL_ERR", &format!("run t={t}: {e}"));
+            return;
+        }
+        let out = cu_download_f32(&ob, n * m);
+        raw[t] = out[0]; // out[n=0, m=0]
+        // out_t = 96 · 2^applied → applied = round(log2(out_t / 96)).
+        let a = ((out[0] as f64 / 96.0).max(1e-9)).log2().round() as i32;
+        applied[t] = a;
+    }
+    let correct = (0..blocks).all(|t| applied[t] == t as i32);
+    let detail = format!(
+        "byte applied to K-microblock[0,1,2,3] = {applied:?} (correct=[0,1,2,3]); \
+         raw out[0]={raw:?} (expect [96,192,384,768]) — {}",
+        if correct {
+            "ORDER OK (scale layout fine; bug is elsewhere)"
+        } else {
+            "ORDER WRONG → reorder the sfa byte packing to this permutation"
+        }
+    );
+    cu_emit(
+        "fp4:scale_byte_probe",
+        if correct { "OK" } else { "MISCOMPUTE" },
+        &detail,
+    );
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -6943,6 +7031,12 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             *counts.entry("SKIP").or_default() += 1;
         }
     } else {
+        // Opt-in on-device layout diagnostic: pin the NVFP4 scale_vec::4X
+        // scale-byte → K-microblock order (the undocumented suspect for the
+        // nvfp4/mxfp4 cos≈0.49). One pod run reads back the byte permutation.
+        if std::env::var("RUSTLLAMA_FP4_LAYOUT_PROBE").is_ok() {
+            fp4_scale_byte_probe(&stream);
+        }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
         let wsrc = gen_x(m * kd, 77);
