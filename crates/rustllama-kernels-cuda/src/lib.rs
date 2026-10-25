@@ -92,6 +92,8 @@ extern "C" {
     // Device-resident path.
     fn rsl_cuda_stream_create(device_index: c_int) -> *mut RslCudaStreamRaw;
     fn rsl_cuda_stream_destroy(s: *mut RslCudaStreamRaw);
+    // Free the stream's cached Q8_0 prefill-GEMM weight repacks (model-reload hook).
+    fn rsl_cuda_q8_0_repack_reset(s: *mut RslCudaStreamRaw);
     fn rsl_cuda_malloc_from_host(
         s: *mut RslCudaStreamRaw,
         src: *const c_void,
@@ -1762,6 +1764,14 @@ impl CudaStream {
     }
     fn raw(&self) -> *mut RslCudaStreamRaw {
         self.raw
+    }
+    /// Free this stream's cached Q8_0 prefill-GEMM weight repacks. Call on model
+    /// reload: the repack cache keys on the weight device pointer, which the
+    /// allocator reuses across model loads, so a stale entry must not survive.
+    /// Idempotent (empty cache → no-op).
+    pub fn q8_0_repack_reset(&self) {
+        // SAFETY: FFI; frees + clears the stream's repack cache.
+        unsafe { rsl_cuda_q8_0_repack_reset(self.raw) };
     }
 }
 
@@ -4168,6 +4178,10 @@ pub unsafe fn all_gather_f32(
 /// (first + last, covering the reduce and the broadcast legs) against the CPU
 /// reference sum. Returns `(passed, worst_abs_diff)`, or `None` on setup failure.
 pub fn collective_all_reduce_self_check(device_index: u32) -> Option<(bool, f32)> {
+    // Drain any stale cudaGetLastError latch (e.g. cudaErrorInvalidDevice from an
+    // enumeration probe on this thread) so it isn't misattributed to the add/sync
+    // inside the reduce → a false MISCOMPUTE (worst_abs=inf) on a 1-GPU box.
+    clear_last_error();
     let stream = CudaStream::create(device_index)?;
     let _ = enable_peer_access(device_index, device_index); // no-op same-dev; exercises the path
     let k = 3usize;
@@ -4221,6 +4235,7 @@ pub fn collective_all_reduce_self_check(device_index: u32) -> Option<(bool, f32)
 /// the concat-placement algebra + plumbing; real P2P gather on 2+ GPU HW. Returns
 /// `(passed, worst_abs_diff)`, or `None` on setup failure.
 pub fn collective_all_gather_self_check(device_index: u32) -> Option<(bool, f32)> {
+    clear_last_error(); // drop a stale latch (see all_reduce self-check) → no false inf
     let stream = CudaStream::create(device_index)?;
     let _ = enable_peer_access(device_index, device_index);
     let k = 3usize;
@@ -4804,6 +4819,10 @@ impl CudaMatvecCache {
     pub fn clear(&mut self) {
         self.weights.clear();
         self.used_bytes = 0;
+        // Free the per-stream Q8_0 prefill-GEMM weight repacks: like `weights`,
+        // they are keyed on a device address the allocator reuses across model
+        // loads, so a stale entry would serve the wrong weight to the next model.
+        self.stream.q8_0_repack_reset();
         // B2 rmsfold: the device scratch + the host-addr cache keys are per-model
         // (keyed like `weights`), so a reload must drop them — otherwise a reused
         // host address could skip the re-upload of a DIFFERENT model's norm/signs.
