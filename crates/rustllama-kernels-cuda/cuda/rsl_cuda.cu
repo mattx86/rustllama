@@ -1814,9 +1814,15 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
 //   y = Σ_b xs[b]·d[b]·S[b]. Graded vs the FAIR W8A8 reference (int8 TC math is
 // exact; only activation rounding differs). out[N,M] = x[N,K]·W[M,K]^T, K%32==0.
 // ============================================================
-__global__ void gemm_q8_0_w8a8_tc_kernel(const unsigned char *w,
-                                         const signed char *xq, const float *xs,
-                                         float *out, int M, int K, int N) {
+// `__launch_bounds__(512, 3)`: this GEMM is overhead-bound (per-32-K staging + two
+// __syncthreads + a 16 KB Cs round-trip dwarf the two tiny MMAs), and the occupancy
+// diagnostic showed 67% (2 blocks/SM, capped by 46 regs/thread). Forcing nvcc to fit
+// 3 blocks/SM (<=42 regs/thread → 100% theoretical occupancy) lets a second block's
+// warps run while the first is parked at a barrier, hiding the sync stalls. Lossless
+// (a scheduling/register hint only); A/B'd on the `tc X.XXX ms/call` verdict timing.
+__global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
+    gemm_q8_0_w8a8_tc_kernel(const unsigned char *w, const signed char *xq,
+                             const float *xs, float *out, int M, int K, int N) {
     __shared__ signed char As[RSL_Q4K_TC_BM][32]; // int8 weights   [m][k]
     __shared__ signed char Bs[RSL_Q4K_TC_BN][32]; // int8 activations [n][k]
     __shared__ float dw[RSL_Q4K_TC_BM];           // per-row block scale d
