@@ -1827,9 +1827,15 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
 // (a scheduling/register hint only); A/B'd on the `tc X.XXX ms/call` verdict timing.
 template <bool PROF>
 __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
-    gemm_q8_0_w8a8_tc_kernel(const unsigned char *w, const signed char *xq,
-                             const float *xs, float *out, int M, int K, int N,
-                             unsigned long long *prof) {
+    gemm_q8_0_w8a8_tc_kernel(const unsigned char *__restrict__ w,
+                             const signed char *__restrict__ xq,
+                             const float *__restrict__ xs, float *__restrict__ out,
+                             int M, int K, int N, unsigned long long *prof) {
+    // `__restrict__` on the read-only inputs lets nvcc issue `ld.global.nc` (the
+    // read-only data cache, separate from L1). The weight tile for a row-block is
+    // re-read ~8x across the N-tiles, so caching those re-reads attacks the 51%
+    // staging phase (the clock64 profiler's dominant cost). Reads unchanged → parity
+    // intact. The 20% barrier (sync1) is untouched here — that needs double-buffering.
     __shared__ signed char As[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT * 32]; // int8 weights   [m][k-tile]
     __shared__ signed char Bs[RSL_Q4K_TC_BN][RSL_Q4K_TC_KT * 32]; // int8 acts      [n][k-tile]
     __shared__ float dw[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT];            // per-row scale d, per sub-block
