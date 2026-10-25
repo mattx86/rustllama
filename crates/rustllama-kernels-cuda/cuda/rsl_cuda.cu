@@ -1895,18 +1895,28 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
             }
             As[rl][kk] = ww;
         }
-        // Stage int8 activations -> Bs[n][k-tile].
-        for (int e = tid; e < RSL_Q4K_TC_BN * KW; e += nthreads) {
-            int tl = e / KW;
-            int kk = e % KW;
-            int sub = kk >> 5;
-            int kloc = kk & 31;
+        // Stage int8 activations -> Bs[n][k-tile] via 16-byte (int4) vector copies.
+        // Staging is the kernel's dominant cost (57% by the clock64 profiler). The
+        // activation half is contiguous int8 over K per token and 16-byte-aligned
+        // (xq is cudaMalloc'd, K%32==0), and Bs rows are KW-wide (16-aligned) — so an
+        // aligned int4 load moves 16 B/thread in one transaction instead of 1 B/thread
+        // across 16. (The Q8_0 weights can't do this — their 34-byte blocks =
+        // 2-byte f16 scale + 32 int8 are not 16-aligned — so As stays byte-staged.)
+        // Byte contents are identical, so the MMA + parity are unchanged.
+        for (int e = tid; e < RSL_Q4K_TC_BN * (KW / 16); e += nthreads) {
+            int tl = e / (KW / 16);
+            int kk = (e % (KW / 16)) * 16; // 16-byte-aligned offset within the KW tile
+            int sub = kk >> 5;             // which 32-block this chunk falls in
             int ng = tokBase + tl;
-            signed char bb = 0;
+            int4 v;
             if (ng < N && sub < nsub) {
-                bb = xq[(size_t)ng * K + (size_t)(gt + sub) * 32 + kloc];
+                // (gt+sub)*32 + (kk&31) == gt*32 + kk, so index the flat K directly.
+                v = *reinterpret_cast<const int4 *>(
+                    &xq[(size_t)ng * K + (size_t)gt * 32 + kk]);
+            } else {
+                v = make_int4(0, 0, 0, 0);
             }
-            Bs[tl][kk] = bb;
+            *reinterpret_cast<int4 *>(&Bs[tl][kk]) = v;
         }
         // Per-token activation scale for each staged sub-block.
         for (int e = tid; e < RSL_Q4K_TC_BN * RSL_Q4K_TC_KT; e += nthreads) {
