@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // getenv — opt-in kernel diagnostics
 #include <cmath>
 #include <new>
 
@@ -1946,6 +1947,40 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
     dim3 block(32, RSL_Q4K_TC_WARPS);
     dim3 grid((unsigned)((M + RSL_Q4K_TC_BM - 1) / RSL_Q4K_TC_BM),
               (unsigned)((N + RSL_Q4K_TC_BN - 1) / RSL_Q4K_TC_BN));
+    // One-time occupancy/resource diagnostic (opt-in: RUSTLLAMA_GEMM_DIAG=1). Uses
+    // only cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor —
+    // NO GPU perf counters — so it works where `ncu` hits ERR_NVGPUCTRPERM (locked
+    // containers / MIG). Tells us whether this W8A8 TC GEMM is occupancy-limited and
+    // by what (registers vs the ~20.5 KB static shared As/Bs/Cs/scales), to steer
+    // the tiling fix without a profiler.
+    {
+        static int diag_done = 0;
+        if (!diag_done && std::getenv("RUSTLLAMA_GEMM_DIAG")) {
+            diag_done = 1;
+            const int threads = (int)RSL_Q4K_TC_WARPS * 32;
+            cudaFuncAttributes fa;
+            if (cudaFuncGetAttributes(&fa, gemm_q8_0_w8a8_tc_kernel) == cudaSuccess) {
+                int nsm = 0, maxThreadsSM = 0, maxSharedSM = 0, active = 0;
+                cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+                cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor,
+                                       s->device);
+                cudaDeviceGetAttribute(&maxSharedSM, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                                       s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active, gemm_q8_0_w8a8_tc_kernel, threads, 0);
+                double occ =
+                    maxThreadsSM > 0 ? (double)(active * threads) / (double)maxThreadsSM : 0.0;
+                std::fprintf(
+                    stderr,
+                    "[gemm-diag] q8_0_w8a8_tc: regs/thread=%d static_smem=%zu B/block "
+                    "maxThreads/block=%d | SMs=%d maxThreads/SM=%d maxSmem/SM=%dB | "
+                    "block=%dthr activeBlocks/SM=%d -> theoretical occupancy=%.0f%% "
+                    "(grid=%ux%u for M=%d N=%d K=%d)\n",
+                    fa.numRegs, fa.sharedSizeBytes, fa.maxThreadsPerBlock, nsm, maxThreadsSM,
+                    maxSharedSM, threads, active, occ * 100.0, grid.x, grid.y, M, N, K);
+            }
+        }
+    }
     gemm_q8_0_w8a8_tc_kernel<<<grid, block, 0, s->stream>>>(
         (const unsigned char *)w, xq, xs, out, M, K, N);
     return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
