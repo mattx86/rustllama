@@ -1825,9 +1825,11 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
 // 3 blocks/SM (<=42 regs/thread → 100% theoretical occupancy) lets a second block's
 // warps run while the first is parked at a barrier, hiding the sync stalls. Lossless
 // (a scheduling/register hint only); A/B'd on the `tc X.XXX ms/call` verdict timing.
+template <bool PROF>
 __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
     gemm_q8_0_w8a8_tc_kernel(const unsigned char *w, const signed char *xq,
-                             const float *xs, float *out, int M, int K, int N) {
+                             const float *xs, float *out, int M, int K, int N,
+                             unsigned long long *prof) {
     __shared__ signed char As[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT * 32]; // int8 weights   [m][k-tile]
     __shared__ signed char Bs[RSL_Q4K_TC_BN][RSL_Q4K_TC_KT * 32]; // int8 acts      [n][k-tile]
     __shared__ float dw[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT];            // per-row scale d, per sub-block
@@ -1850,6 +1852,16 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
     float cacc[8];
 #pragma unroll
     for (int c = 0; c < 8; ++c) cacc[c] = 0.0f;
+
+    // In-kernel cycle profiler. Templated: for PROF=false `P` folds to a compile-time
+    // false, so every `if (P)` block and the accumulators below are dead-code-
+    // eliminated — the normal kernel is byte-identical with no extra registers.
+    // `clock64()` reads the SM cycle counter from inside the kernel (NO perf counters),
+    // so it profiles where `ncu` is locked (RunPod/MIG). One representative thread
+    // (block 0, thread 0) sums cycles per phase.
+    const bool P = PROF && blockIdx.x == 0 && blockIdx.y == 0 && tid == 0;
+    unsigned long long cStage = 0, cSync1 = 0, cCompute = 0, cSync2 = 0;
+    long long pt = P ? clock64() : 0;
 
     // K-tile loop: stage RSL_Q4K_TC_KT 32-blocks (KW wide) per round so the global
     // staging + the two __syncthreads amortize over KT sub-blocks instead of firing
@@ -1904,7 +1916,9 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
             xscl[tl][sub] =
                 (ng < N && sub < nsub) ? xs[(size_t)ng * spr + (gt + sub)] : 0.0f;
         }
+        if (P) { long long n = clock64(); cStage += (unsigned long long)(n - pt); pt = n; }
         __syncthreads();
+        if (P) { long long n = clock64(); cSync1 += (unsigned long long)(n - pt); pt = n; }
 
         for (int sub = 0; sub < nsub; ++sub) {
             const int kbase = sub * 32;
@@ -1948,7 +1962,16 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
             }
             __syncwarp(); // before this warp reuses Cs[warpId] for the next sub-block
         }
+        if (P) { long long n = clock64(); cCompute += (unsigned long long)(n - pt); pt = n; }
         __syncthreads(); // before the next K-tile overwrites shared
+        if (P) { long long n = clock64(); cSync2 += (unsigned long long)(n - pt); pt = n; }
+    }
+
+    if (P) {
+        prof[0] = cStage;   // global staging (As/Bs/scales loads)
+        prof[1] = cSync1;   // barrier wait after staging
+        prof[2] = cCompute; // MMA + Cs round-trip + scale fold
+        prof[3] = cSync2;   // barrier wait before next K-tile
     }
 
     // Write out[token][row].
@@ -1993,7 +2016,7 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             diag_done = 1;
             const int threads = (int)RSL_Q4K_TC_WARPS * 32;
             cudaFuncAttributes fa;
-            if (cudaFuncGetAttributes(&fa, gemm_q8_0_w8a8_tc_kernel) == cudaSuccess) {
+            if (cudaFuncGetAttributes(&fa, gemm_q8_0_w8a8_tc_kernel<false>) == cudaSuccess) {
                 int nsm = 0, maxThreadsSM = 0, maxSharedSM = 0, active = 0;
                 cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
                 cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor,
@@ -2001,7 +2024,7 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                 cudaDeviceGetAttribute(&maxSharedSM, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
                                        s->device);
                 cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &active, gemm_q8_0_w8a8_tc_kernel, threads, 0);
+                    &active, gemm_q8_0_w8a8_tc_kernel<false>, threads, 0);
                 double occ =
                     maxThreadsSM > 0 ? (double)(active * threads) / (double)maxThreadsSM : 0.0;
                 std::fprintf(
@@ -2015,8 +2038,40 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             }
         }
     }
-    gemm_q8_0_w8a8_tc_kernel<<<grid, block, 0, s->stream>>>(
-        (const unsigned char *)w, xq, xs, out, M, K, N);
+    // In-kernel cycle profiler (opt-in: RUSTLLAMA_GEMM_CYCLES=1). Launch the PROF
+    // instantiation ONCE with a tiny device buffer (it still computes `out`
+    // correctly), print the per-phase cycle breakdown, then fall through to the
+    // normal PROF=false kernel for every subsequent call. No perf counters — works
+    // where `ncu` hits ERR_NVGPUCTRPERM (RunPod/MIG).
+    {
+        static int cyc_done = 0;
+        if (!cyc_done && std::getenv("RUSTLLAMA_GEMM_CYCLES") != nullptr) {
+            cyc_done = 1;
+            unsigned long long *prof = nullptr;
+            if (cudaMalloc(&prof, 4 * sizeof(unsigned long long)) == cudaSuccess) {
+                cudaMemset(prof, 0, 4 * sizeof(unsigned long long));
+                gemm_q8_0_w8a8_tc_kernel<true><<<grid, block, 0, s->stream>>>(
+                    (const unsigned char *)w, xq, xs, out, M, K, N, prof);
+                unsigned long long h[4] = {0, 0, 0, 0};
+                cudaStreamSynchronize(s->stream);
+                if (cudaMemcpy(h, prof, sizeof(h), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    unsigned long long tot = h[0] + h[1] + h[2] + h[3];
+                    double pct = tot > 0 ? 100.0 / (double)tot : 0.0;
+                    std::fprintf(stderr,
+                                 "[gemm-cyc] q8_0_w8a8_tc phase cycles (block0 thread0): "
+                                 "stage=%llu (%.0f%%) | sync1=%llu (%.0f%%) | "
+                                 "compute=%llu (%.0f%%) | sync2=%llu (%.0f%%)  "
+                                 "[sync1+sync2 = barrier wait]\n",
+                                 h[0], (double)h[0] * pct, h[1], (double)h[1] * pct, h[2],
+                                 (double)h[2] * pct, h[3], (double)h[3] * pct);
+                }
+                cudaFree(prof);
+                return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
+            }
+        }
+    }
+    gemm_q8_0_w8a8_tc_kernel<false><<<grid, block, 0, s->stream>>>(
+        (const unsigned char *)w, xq, xs, out, M, K, N, nullptr);
     return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
 }
 
