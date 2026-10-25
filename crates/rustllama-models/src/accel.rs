@@ -4261,10 +4261,15 @@ struct PagedKvDeviceMirror {
     page_size: u32,
     n_layers: u32,
     total_pages: u32,
-    // Owning stream declared LAST: declaration-order field drop frees `slab`
-    // (which borrows it) before the stream. Held only to keep it alive.
+    // Owning stream, declared LAST so declaration-order field drop frees `slab`
+    // (and the scratch buffers, which all borrow it) BEFORE the stream. HEAP-BOXED
+    // so its address is PINNED across the moves of this mirror (into the struct
+    // below, then into the global `Mutex`): `CudaDeviceBuffer` stores a back-
+    // reference to the stream it was allocated against, and a by-value `CudaStream`
+    // would be RELOCATED by those moves, dangling that reference → use-after-move
+    // SIGSEGV on the first device copy. The box pins the stream so the ref survives.
     #[allow(dead_code)]
-    stream: ck::CudaStream,
+    stream: Box<ck::CudaStream>,
 }
 
 // SAFETY: like `CudaMatvecCache`, the mirror's raw device pointers are only ever
@@ -4309,12 +4314,20 @@ pub fn paged_mirror_init(
     let Some(stream) = ck::CudaStream::create(0) else {
         return false;
     };
+    // HEAP-BOX the stream BEFORE allocating `slab` against it. `CudaDeviceBuffer`
+    // stores a back-reference to the stream it was allocated on, and this mirror is
+    // MOVED twice after construction (into the struct, then into the global
+    // `Mutex`). A by-value `CudaStream` would be relocated by those moves, dangling
+    // `slab`'s reference → SIGSEGV on the first H2D copy of the warmup prefill (the
+    // Phase-A paged-mirror crash). The box's heap address survives every move.
+    let stream = Box::new(stream);
     let Some(buf) = ck::CudaDeviceBuffer::alloc(&stream, n_bytes) else {
         return false;
     };
-    // SAFETY: the `'_`→`'static` widening is the same lifetime lie
-    // `ensure_cuda_dev` tells — the buffer borrows `stream`, owned in the same
-    // struct and declared LAST, so it outlives the buffer via field-drop order.
+    // SAFETY: the `'_`→`'static` widening is sound because `buf` borrows the
+    // HEAP-BOXED `stream` (a stable address), which this mirror owns and drops LAST
+    // (declaration order) — so the stream outlives `slab` in BOTH address and
+    // lifetime, across every move of the mirror.
     let slab = unsafe {
         std::mem::transmute::<ck::CudaDeviceBuffer<'_>, ck::CudaDeviceBuffer<'static>>(buf)
     };
@@ -4664,7 +4677,11 @@ struct PagedKvSyclMirror {
     total_pages: u32,
     // Owning stream declared LAST: declaration-order field drop frees the
     // buffers (which borrow it via the `'static` lifetime lie) before the stream.
-    stream: sk::SyclStream,
+    // HEAP-BOXED so its address is pinned across the move of this mirror into its
+    // thread-local slot — a by-value stream would be relocated by that move,
+    // dangling the buffers' back-references. (Same use-after-move the CUDA
+    // `PagedKvDeviceMirror` had; see `paged_mirror_init`.)
+    stream: Box<sk::SyclStream>,
 }
 
 impl PagedKvSyclMirror {
@@ -4686,12 +4703,16 @@ impl PagedKvSyclMirror {
         let layer_stride = 2usize * kv_stride;
         let page_stride = (n_layers as usize) * layer_stride;
         let total_elems = (total_pages as usize).checked_mul(page_stride)?;
-        let stream = sk::create_stream(0).ok()?;
+        // HEAP-BOX the stream before allocating `slab`: the buffer stores a back-
+        // reference to it and the mirror is MOVED into its thread-local slot after
+        // construction. A by-value stream would be relocated by that move, dangling
+        // the reference → use-after-move on the first device access (the same bug
+        // the CUDA `paged_mirror_init` had). The box's heap address survives it.
+        let stream = Box::new(sk::create_stream(0).ok()?);
         let buf = sk::SyclSharedBuffer::<f32>::alloc(&stream, total_elems).ok()?;
-        // SAFETY: the `'_`→`'static` widening is the same lifetime lie the
-        // `UsmAttnContext` scratch tells — the buffer borrows `stream`, owned in
-        // this struct and declared LAST, so it outlives the buffer via field-drop
-        // order. The mirror is never moved across threads (it is a thread-local).
+        // SAFETY: the `'_`→`'static` widening is sound because `buf` borrows the
+        // HEAP-BOXED `stream` (stable address), owned in this struct and declared
+        // LAST, so it outlives `slab` in both address and lifetime across the move.
         let slab = unsafe {
             std::mem::transmute::<sk::SyclSharedBuffer<'_, f32>, sk::SyclSharedBuffer<'static, f32>>(
                 buf,
@@ -5020,7 +5041,11 @@ struct PagedKvMlxMirror {
     n_layers: u32,
     total_pages: u32,
     // Owning stream declared LAST (buffers borrow it; field-drop frees them first).
-    stream: mk::MlxStream,
+    // HEAP-BOXED so its address is pinned across the move of this mirror into its
+    // thread-local slot: the buffers store a back-reference to it, and a by-value
+    // stream would be relocated by that move, dangling the reference. (Same
+    // use-after-move the CUDA `PagedKvDeviceMirror` had; see `paged_mirror_init`.)
+    stream: Box<mk::MlxStream>,
 }
 
 impl PagedKvMlxMirror {
@@ -5043,12 +5068,16 @@ impl PagedKvMlxMirror {
         let page_stride = (n_layers as usize) * layer_stride;
         let total_elems = (total_pages as usize).checked_mul(page_stride)?;
         let n_bytes = total_elems.checked_mul(std::mem::size_of::<f32>())?;
-        let stream = mk::MlxStream::create(0)?;
+        // HEAP-BOX the stream before allocating `slab`: the buffer stores a back-
+        // reference to it and the mirror is MOVED into its thread-local slot after
+        // construction. A by-value stream would be relocated by that move, dangling
+        // the reference → use-after-move on the first device copy (the same bug the
+        // CUDA `paged_mirror_init` had). The box's heap address survives the move.
+        let stream = Box::new(mk::MlxStream::create(0)?);
         let buf = mk::MlxDeviceBuffer::alloc(&stream, n_bytes)?;
-        // SAFETY: the `'_`→`'static` widening is the same lifetime lie the
-        // `MlxAttnContext` buffers tell — the buffer borrows `stream`, owned in
-        // this struct and declared LAST, so it outlives the buffer via field-drop
-        // order. The mirror is a thread-local; it is never moved across threads.
+        // SAFETY: the `'_`→`'static` widening is sound because `buf` borrows the
+        // HEAP-BOXED `stream` (stable address), owned in this struct and declared
+        // LAST, so it outlives `slab` in both address and lifetime across the move.
         let slab = unsafe {
             std::mem::transmute::<mk::MlxDeviceBuffer<'_>, mk::MlxDeviceBuffer<'static>>(buf)
         };
