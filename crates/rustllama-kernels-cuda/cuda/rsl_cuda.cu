@@ -1818,29 +1818,91 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
 // per-32 weight scale d (f16) × per-token activation scale xs in f32:
 //   y = Σ_b xs[b]·d[b]·S[b]. Graded vs the FAIR W8A8 reference (int8 TC math is
 // exact; only activation rounding differs). out[N,M] = x[N,K]·W[M,K]^T, K%32==0.
+// Stage one K-tile (RSL_Q4K_TC_KT 32-blocks, KW wide) of the weight + activation
+// operands into the shared buffers pointed at by As_b/Bs_b/dw_b/xscl_b (flat,
+// row-major: As_b[rl*KW+kk], Bs_b[tl*KW+kk], dw_b[rl*KT+sub], xscl_b[tl*KT+sub]).
+// Factored out of the K-loop so the double-buffered pipeline can prefetch tile
+// g+1 into the OFF buffer while the MMA consumes tile g from the ON buffer — this
+// body is byte-for-byte the staging the single-buffer loop did, so the result
+// (and parity) is unchanged; only WHEN the loads are issued changes.
+__device__ __forceinline__ void rsl_gemm_q8_0_stage_tile(
+    int gt, int spr, int M, int N, int K, int rowBase, int tokBase, int tid,
+    int nthreads, const unsigned char *__restrict__ w,
+    const signed char *__restrict__ xq, const float *__restrict__ xs,
+    signed char *As_b, signed char *Bs_b, float *dw_b, float *xscl_b) {
+    const int KT = RSL_Q4K_TC_KT;
+    const int KW = KT * 32;
+    const int BM = RSL_Q4K_TC_BM;
+    const int BN = RSL_Q4K_TC_BN;
+    const int nsub = (spr - gt < KT) ? (spr - gt) : KT;
+    // Per-row block scale d (f16) for each staged sub-block.
+    for (int e = tid; e < BM * KT; e += nthreads) {
+        int rl = e / KT, sub = e % KT, mg = rowBase + rl;
+        float d = 0.0f;
+        if (mg < M && sub < nsub) {
+            const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
+            d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        }
+        dw_b[rl * KT + sub] = d;
+    }
+    // Stage int8 weights -> As_b[m][k-tile] (already int8, no unpack). Byte-loaded:
+    // the 34-byte Q8_0 blocks (2-byte f16 scale + 32 int8) aren't 16-aligned, so
+    // no vector load here (the activation half below is).
+    for (int e = tid; e < BM * KW; e += nthreads) {
+        int rl = e / KW, kk = e % KW, sub = kk >> 5, kloc = kk & 31, mg = rowBase + rl;
+        signed char ww = 0;
+        if (mg < M && sub < nsub) {
+            const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
+            ww = (signed char)blk[2 + kloc];
+        }
+        As_b[rl * KW + kk] = ww;
+    }
+    // Stage int8 activations -> Bs_b[n][k-tile] via 16-byte (int4) aligned vector
+    // copies (xq is cudaMalloc'd + K%32==0, Bs rows KW-wide → 16-aligned).
+    for (int e = tid; e < BN * (KW / 16); e += nthreads) {
+        int tl = e / (KW / 16), kk = (e % (KW / 16)) * 16, sub = kk >> 5, ng = tokBase + tl;
+        int4 v;
+        if (ng < N && sub < nsub) {
+            v = *reinterpret_cast<const int4 *>(&xq[(size_t)ng * K + (size_t)gt * 32 + kk]);
+        } else {
+            v = make_int4(0, 0, 0, 0);
+        }
+        *reinterpret_cast<int4 *>(Bs_b + tl * KW + kk) = v;
+    }
+    // Per-token activation scale for each staged sub-block.
+    for (int e = tid; e < BN * KT; e += nthreads) {
+        int tl = e / KT, sub = e % KT, ng = tokBase + tl;
+        xscl_b[tl * KT + sub] = (ng < N && sub < nsub) ? xs[(size_t)ng * spr + (gt + sub)] : 0.0f;
+    }
+}
+
 // ============================================================
-// `__launch_bounds__(512, 3)`: this GEMM is overhead-bound (per-32-K staging + two
-// __syncthreads + a 16 KB Cs round-trip dwarf the two tiny MMAs), and the occupancy
-// diagnostic showed 67% (2 blocks/SM, capped by 46 regs/thread). Forcing nvcc to fit
-// 3 blocks/SM (<=42 regs/thread → 100% theoretical occupancy) lets a second block's
-// warps run while the first is parked at a barrier, hiding the sync stalls. Lossless
-// (a scheduling/register hint only); A/B'd on the `tc X.XXX ms/call` verdict timing.
+// `__launch_bounds__(512, 2)`: this GEMM is memory-latency/overhead-bound (the
+// clock64 profiler showed ~48% global staging + ~22% barrier wait vs ~26% MMA).
+// The staging is now DOUBLE-BUFFERED (ping-pong As/Bs/scales, 2x shared ≈ 34 KB):
+// tile g+1's global loads are issued into the off buffer while the MMA consumes
+// tile g from the on buffer, so the per-tile staging→compute barrier (the old
+// `sync1`) is dissolved and the load latency overlaps compute across warps. The
+// 2x shared caps occupancy at 2 blocks/SM (67%), so `launch_bounds(…, 2)` matches
+// (regs → 64 budget, no spill). Lossless (pure scheduling of identical loads);
+// A/B'd on the `tc X.XXX ms/call` verdict timing + the cycle breakdown.
 template <bool PROF>
-__global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
+__global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 2)
     gemm_q8_0_w8a8_tc_kernel(const unsigned char *__restrict__ w,
                              const signed char *__restrict__ xq,
                              const float *__restrict__ xs, float *__restrict__ out,
                              int M, int K, int N, unsigned long long *prof) {
-    // `__restrict__` on the read-only inputs lets nvcc issue `ld.global.nc` (the
-    // read-only data cache, separate from L1). The weight tile for a row-block is
-    // re-read ~8x across the N-tiles, so caching those re-reads attacks the 51%
-    // staging phase (the clock64 profiler's dominant cost). Reads unchanged → parity
-    // intact. The 20% barrier (sync1) is untouched here — that needs double-buffering.
-    __shared__ signed char As[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT * 32]; // int8 weights   [m][k-tile]
-    __shared__ signed char Bs[RSL_Q4K_TC_BN][RSL_Q4K_TC_KT * 32]; // int8 acts      [n][k-tile]
-    __shared__ float dw[RSL_Q4K_TC_BM][RSL_Q4K_TC_KT];            // per-row scale d, per sub-block
-    __shared__ float xscl[RSL_Q4K_TC_BN][RSL_Q4K_TC_KT];          // per-token act scale, per sub-block
-    __shared__ int Cs[RSL_Q4K_TC_WARPS][16][16];                  // per-warp int32 MMA result
+    // Ping-pong (double-buffered) staging operands: [2] = on/off buffer. The MMA
+    // reads buffer `t&1` while the next tile is prefetched into `(t&1)^1`.
+    // `__align__(16)`: the activation half is staged with 16-byte (int4) vector
+    // stores, which fault on a misaligned shared address — a `signed char` array
+    // only needs 1-byte alignment, so with the doubled/reordered layout we pin the
+    // base to 16 B explicitly rather than rely on nvcc's incidental placement.
+    __shared__ __align__(16) signed char As[2][RSL_Q4K_TC_BM][RSL_Q4K_TC_KT * 32]; // int8 weights [m][k-tile]
+    __shared__ __align__(16) signed char Bs[2][RSL_Q4K_TC_BN][RSL_Q4K_TC_KT * 32]; // int8 acts    [n][k-tile]
+    __shared__ float dw[2][RSL_Q4K_TC_BM][RSL_Q4K_TC_KT];            // per-row scale d, per sub-block
+    __shared__ float xscl[2][RSL_Q4K_TC_BN][RSL_Q4K_TC_KT];          // per-token act scale, per sub-block
+    __shared__ int Cs[RSL_Q4K_TC_WARPS][16][16];                     // per-warp int32 MMA result
 
     const int rowBase = blockIdx.x * RSL_Q4K_TC_BM;
     const int tokBase = blockIdx.y * RSL_Q4K_TC_BN;
@@ -1869,72 +1931,36 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
     unsigned long long cStage = 0, cSync1 = 0, cCompute = 0, cSync2 = 0;
     long long pt = P ? clock64() : 0;
 
-    // K-tile loop: stage RSL_Q4K_TC_KT 32-blocks (KW wide) per round so the global
-    // staging + the two __syncthreads amortize over KT sub-blocks instead of firing
-    // per 32 (the kernel is overhead-bound, not TC-bound). The per-32-block scale
-    // fold stays inside the sub-loop (Q8_0 scales are per-32).
-    for (int gt = 0; gt < spr; gt += RSL_Q4K_TC_KT) {
+    // Double-buffered K-tile pipeline. The prologue stages tile 0; each iteration
+    // prefetches tile t+1 into the OFF buffer (its global loads in flight) while
+    // the MMA consumes tile t from the ON buffer — so the staging→compute barrier
+    // is hoisted out of the loop (only the prologue pays `sync1`) and the per-tile
+    // load latency overlaps compute across warps. Each round stages RSL_Q4K_TC_KT
+    // 32-blocks (KW wide); the per-32 scale fold stays in the sub-loop (Q8_0
+    // scales are per-32). The ping-pong means buffer `t&1` is read by the MMA and
+    // buffer `(t&1)^1` is written by the prefetch (disjoint → no barrier between
+    // them); the single end-of-iteration __syncthreads makes the prefetched tile
+    // visible for the next iteration AND fences the current buffer before iter t+1
+    // reuses it.
+    const int nTiles = (spr + RSL_Q4K_TC_KT - 1) / RSL_Q4K_TC_KT;
+    rsl_gemm_q8_0_stage_tile(0, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, xq, xs,
+                             &As[0][0][0], &Bs[0][0][0], &dw[0][0][0], &xscl[0][0][0]);
+    if (P) { long long n = clock64(); cStage += (unsigned long long)(n - pt); pt = n; }
+    __syncthreads();
+    if (P) { long long n = clock64(); cSync1 += (unsigned long long)(n - pt); pt = n; }
+
+    for (int t = 0; t < nTiles; ++t) {
+        const int cur = t & 1;
+        const int gt = t * RSL_Q4K_TC_KT;
         const int nsub = (spr - gt < RSL_Q4K_TC_KT) ? (spr - gt) : RSL_Q4K_TC_KT;
-        // Per-row block scale d (f16) for each staged sub-block.
-        for (int e = tid; e < RSL_Q4K_TC_BM * RSL_Q4K_TC_KT; e += nthreads) {
-            int rl = e / RSL_Q4K_TC_KT;
-            int sub = e % RSL_Q4K_TC_KT;
-            int mg = rowBase + rl;
-            float d = 0.0f;
-            if (mg < M && sub < nsub) {
-                const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
-                d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
-            }
-            dw[rl][sub] = d;
-        }
-        // Stage int8 weights -> As[m][k-tile] (already int8, no unpack).
-        for (int e = tid; e < RSL_Q4K_TC_BM * KW; e += nthreads) {
-            int rl = e / KW;
-            int kk = e % KW; // 0..KW-1
-            int sub = kk >> 5;
-            int kloc = kk & 31;
-            int mg = rowBase + rl;
-            signed char ww = 0;
-            if (mg < M && sub < nsub) {
-                const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
-                ww = (signed char)blk[2 + kloc];
-            }
-            As[rl][kk] = ww;
-        }
-        // Stage int8 activations -> Bs[n][k-tile] via 16-byte (int4) vector copies.
-        // Staging is the kernel's dominant cost (57% by the clock64 profiler). The
-        // activation half is contiguous int8 over K per token and 16-byte-aligned
-        // (xq is cudaMalloc'd, K%32==0), and Bs rows are KW-wide (16-aligned) — so an
-        // aligned int4 load moves 16 B/thread in one transaction instead of 1 B/thread
-        // across 16. (The Q8_0 weights can't do this — their 34-byte blocks =
-        // 2-byte f16 scale + 32 int8 are not 16-aligned — so As stays byte-staged.)
-        // Byte contents are identical, so the MMA + parity are unchanged.
-        for (int e = tid; e < RSL_Q4K_TC_BN * (KW / 16); e += nthreads) {
-            int tl = e / (KW / 16);
-            int kk = (e % (KW / 16)) * 16; // 16-byte-aligned offset within the KW tile
-            int sub = kk >> 5;             // which 32-block this chunk falls in
-            int ng = tokBase + tl;
-            int4 v;
-            if (ng < N && sub < nsub) {
-                // (gt+sub)*32 + (kk&31) == gt*32 + kk, so index the flat K directly.
-                v = *reinterpret_cast<const int4 *>(
-                    &xq[(size_t)ng * K + (size_t)gt * 32 + kk]);
-            } else {
-                v = make_int4(0, 0, 0, 0);
-            }
-            *reinterpret_cast<int4 *>(&Bs[tl][kk]) = v;
-        }
-        // Per-token activation scale for each staged sub-block.
-        for (int e = tid; e < RSL_Q4K_TC_BN * RSL_Q4K_TC_KT; e += nthreads) {
-            int tl = e / RSL_Q4K_TC_KT;
-            int sub = e % RSL_Q4K_TC_KT;
-            int ng = tokBase + tl;
-            xscl[tl][sub] =
-                (ng < N && sub < nsub) ? xs[(size_t)ng * spr + (gt + sub)] : 0.0f;
+        // Prefetch tile t+1 into the off buffer (overlaps the MMA below).
+        if (t + 1 < nTiles) {
+            const int nxt = cur ^ 1;
+            rsl_gemm_q8_0_stage_tile((t + 1) * RSL_Q4K_TC_KT, spr, M, N, K, rowBase, tokBase,
+                                     tid, nthreads, w, xq, xs, &As[nxt][0][0], &Bs[nxt][0][0],
+                                     &dw[nxt][0][0], &xscl[nxt][0][0]);
         }
         if (P) { long long n = clock64(); cStage += (unsigned long long)(n - pt); pt = n; }
-        __syncthreads();
-        if (P) { long long n = clock64(); cSync1 += (unsigned long long)(n - pt); pt = n; }
 
         for (int sub = 0; sub < nsub; ++sub) {
             const int kbase = sub * 32;
@@ -1948,8 +1974,8 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
             nvcuda::wmma::fill_fragment(acc_frag, 0);
 #pragma unroll
             for (int kk = 0; kk < 32; kk += 16) {
-                nvcuda::wmma::load_matrix_sync(a_frag, &As[wr * 16][kbase + kk], KW);
-                nvcuda::wmma::load_matrix_sync(b_frag, &Bs[wc * 16][kbase + kk], KW);
+                nvcuda::wmma::load_matrix_sync(a_frag, &As[cur][wr * 16][kbase + kk], KW);
+                nvcuda::wmma::load_matrix_sync(b_frag, &Bs[cur][wc * 16][kbase + kk], KW);
                 nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
             nvcuda::wmma::store_matrix_sync(&Cs[warpId][0][0], acc_frag, 16,
@@ -1962,7 +1988,8 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
                 int mi = e >> 4, nj = e & 15;
                 int acc_i = 0;
                 for (int kk = 0; kk < 32; ++kk)
-                    acc_i += (int)As[wr * 16 + mi][kbase + kk] * (int)Bs[wc * 16 + nj][kbase + kk];
+                    acc_i += (int)As[cur][wr * 16 + mi][kbase + kk] *
+                             (int)Bs[cur][wc * 16 + nj][kbase + kk];
                 Cs[warpId][mi][nj] = acc_i;
             }
 #endif
@@ -1974,12 +2001,12 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 3)
                 int mi = e >> 4, nj = e & 15;
                 int row = wr * 16 + mi;
                 int tok = wc * 16 + nj;
-                cacc[c] += xscl[tok][sub] * dw[row][sub] * (float)Cs[warpId][mi][nj];
+                cacc[c] += xscl[cur][tok][sub] * dw[cur][row][sub] * (float)Cs[warpId][mi][nj];
             }
             __syncwarp(); // before this warp reuses Cs[warpId] for the next sub-block
         }
         if (P) { long long n = clock64(); cCompute += (unsigned long long)(n - pt); pt = n; }
-        __syncthreads(); // before the next K-tile overwrites shared
+        __syncthreads(); // prefetched tile visible + current buffer free to reuse
         if (P) { long long n = clock64(); cSync2 += (unsigned long long)(n - pt); pt = n; }
     }
 
@@ -2024,8 +2051,8 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
     // only cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor —
     // NO GPU perf counters — so it works where `ncu` hits ERR_NVGPUCTRPERM (locked
     // containers / MIG). Tells us whether this W8A8 TC GEMM is occupancy-limited and
-    // by what (registers vs the ~20.5 KB static shared As/Bs/Cs/scales), to steer
-    // the tiling fix without a profiler.
+    // by what (registers vs the ~34 KB static shared: double-buffered As/Bs/scales
+    // + the Cs round-trip), to steer the tiling fix without a profiler.
     {
         static int diag_done = 0;
         if (!diag_done && std::getenv("RUSTLLAMA_GEMM_DIAG")) {
