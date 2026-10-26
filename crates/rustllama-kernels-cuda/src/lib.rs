@@ -8133,22 +8133,35 @@ impl CudaMatvecCache {
         {
             return false;
         }
+        let prof = phase_prof::enabled();
         let x_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        let t_h2d = prof.then(std::time::Instant::now);
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
+        let h2d_ns = t_h2d.map_or(0, |t| t.elapsed().as_nanos() as u64);
         let w_ptr = self.weights[&weight_key].ptr;
         let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
         let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        let t_ker = prof.then(std::time::Instant::now);
         // SAFETY: device buffers sized for N rows, as `gemm_packed_batched_q4k_w8a8_tc`.
         let res = unsafe { gemm_q8_0_w8a8_tc(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+        }
+        let ker_ns = t_ker.map_or(0, |t| t.elapsed().as_nanos() as u64);
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
-        self.out_scratch.as_ref().unwrap().download(out_bytes)
+        let t_d2h = prof.then(std::time::Instant::now);
+        let ok = self.out_scratch.as_ref().unwrap().download(out_bytes);
+        if prof {
+            phase_prof::add_batched(h2d_ns, ker_ns, t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64));
+        }
+        ok
     }
 
     /// Device-resident Q4_K int8 tensor-core prefill GEMM (W8A8, lossy) — the
