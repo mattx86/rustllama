@@ -1751,6 +1751,16 @@ pub mod phase_prof {
     static B_KER: AtomicU64 = AtomicU64::new(0);
     static B_D2H: AtomicU64 = AtomicU64::new(0);
     static B_CALLS: AtomicU64 = AtomicU64::new(0);
+    // Prefill GEMM total (the USM/TC batched path `try_matvec_tensor_batched_usm_f32`,
+    // which the batched matvec_packed buckets above do NOT see): whole-call wall
+    // time incl. its internal transfers+kernel.
+    static PG_NS: AtomicU64 = AtomicU64::new(0);
+    static PG_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Record one prefill USM/TC GEMM call's total nanoseconds.
+    pub fn add_prefill_gemm(ns: u64) {
+        PG_NS.fetch_add(ns, Ordering::Relaxed);
+        PG_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     /// Record one decode (single-row) matvec's H2D/kernel/D2H nanoseconds.
     pub fn add_single(h2d: u64, ker: u64, d2h: u64) {
         S_H2D.fetch_add(h2d, Ordering::Relaxed);
@@ -1766,19 +1776,28 @@ pub mod phase_prof {
         B_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     pub fn reset() {
-        for c in [&S_H2D, &S_KER, &S_D2H, &S_CALLS, &B_H2D, &B_KER, &B_D2H, &B_CALLS] {
+        for c in [
+            &S_H2D, &S_KER, &S_D2H, &S_CALLS, &B_H2D, &B_KER, &B_D2H, &B_CALLS, &PG_NS, &PG_CALLS,
+        ] {
             c.store(0, Ordering::Relaxed);
         }
     }
     /// Formatted us-per-call breakdown (empty string if nothing recorded).
     pub fn dump() -> String {
         let ld = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        let (sc, bc) = (ld(&S_CALLS), ld(&B_CALLS));
-        if sc == 0 && bc == 0 {
+        let (sc, bc, pg) = (ld(&S_CALLS), ld(&B_CALLS), ld(&PG_CALLS));
+        if sc == 0 && bc == 0 && pg == 0 {
             return String::new();
         }
         let per = |n: u64, calls: u64| if calls > 0 { n as f64 / 1e3 / calls as f64 } else { 0.0 };
         let mut s = String::from("[phase] matvec H2D / kernel / D2H, us per call:\n");
+        if pg > 0 {
+            s += &format!(
+                "  prefill GEMM (usm/TC, whole call): calls={pg} total={:.1} us/call ({:.1} ms all)\n",
+                per(ld(&PG_NS), pg),
+                ld(&PG_NS) as f64 / 1e6
+            );
+        }
         if bc > 0 {
             s += &format!(
                 "  prefill(batched): calls={bc} h2d={:.1} kernel={:.1} d2h={:.1} total={:.1}\n",

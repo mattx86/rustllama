@@ -173,10 +173,17 @@ pub(crate) fn matvec_tensor_batched_dispatch(
     // selected in `apply_delta`. Non-adapted tensors (and the no-LoRA case)
     // keep the fast paths, so default behavior is byte-identical.
     let lora_adapted = crate::lora::lora_adapts(&w.name) || crate::lora::row_lora_adapts(&w.name);
-    if !lora_adapted
-        && crate::accel::try_matvec_tensor_batched_usm_f32(w, x, out, m_dim, k_dim, n_rows)
-    {
-        return;
+    if !lora_adapted {
+        // Phase profiler: time the whole USM/TC batched-GEMM call (the prefill
+        // GEMM path the matvec_packed buckets don't observe).
+        let t_pg = rustllama_kernels_cuda::phase_prof::enabled().then(std::time::Instant::now);
+        let hit = crate::accel::try_matvec_tensor_batched_usm_f32(w, x, out, m_dim, k_dim, n_rows);
+        if hit {
+            if let Some(t) = t_pg {
+                rustllama_kernels_cuda::phase_prof::add_prefill_gemm(t.elapsed().as_nanos() as u64);
+            }
+            return;
+        }
     }
     // PTQ1_0 (the 27B's every projection/FFN/LM-head dtype): the CPU
     // batched kernel decodes each weight row's trits once and replays
