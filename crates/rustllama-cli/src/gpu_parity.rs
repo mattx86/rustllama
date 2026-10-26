@@ -5144,7 +5144,7 @@ fn fp4_dump_tile(name: &str, gpu: &[f32], cpu: &[f32], m: usize, _n: usize) {
 fn fp4_scale_byte_probe(stream: &ck::CudaStream) {
     let (m, n, kd) = (16usize, 8usize, 64usize);
     let blocks = kd / 16; // 4 per-16 microblocks in the atom
-    // Controlled weight: row-major [m][blocks][9]; block b = quantize_block([2^b;16]).
+                          // Controlled weight: row-major [m][blocks][9]; block b = quantize_block([2^b;16]).
     let mut w = vec![0u8; m * blocks * 9];
     for r in 0..m {
         for b in 0..blocks {
@@ -5188,12 +5188,16 @@ fn fp4_scale_byte_probe(stream: &ck::CudaStream) {
             )
         };
         if let Err(e) = res {
-            cu_emit("fp4:scale_byte_probe", "KERNEL_ERR", &format!("run t={t}: {e}"));
+            cu_emit(
+                "fp4:scale_byte_probe",
+                "KERNEL_ERR",
+                &format!("run t={t}: {e}"),
+            );
             return;
         }
         let out = cu_download_f32(&ob, n * m);
         raw[t] = out[0]; // out[n=0, m=0]
-        // out_t = 96 · 2^applied → applied = round(log2(out_t / 96)).
+                         // out_t = 96 · 2^applied → applied = round(log2(out_t / 96)).
         let a = ((out[0] as f64 / 96.0).max(1e-9)).log2().round() as i32;
         applied[t] = a;
     }
@@ -5536,7 +5540,10 @@ fn fp4_atom0_sweep(stream: &ck::CudaStream) {
     cu_emit(
         "fp4:atom0_sweep",
         if ident { "OK" } else { "MISCOMPUTE" },
-        &format!("B-K → A-K (64): {map:?} — {}", if ident { "identity" } else { "PERMUTED" }),
+        &format!(
+            "B-K → A-K (64): {map:?} — {}",
+            if ident { "identity" } else { "PERMUTED" }
+        ),
     );
 }
 
