@@ -5392,6 +5392,72 @@ fn fp4_kpair_probe(stream: &ck::CudaStream) {
     );
 }
 
+/// On-device diagnostic (same env gate): localize the nvfp4 bug to one atom vs
+/// across atoms. Every other probe used K=64 (ONE m16n8k64 atom) and passed, but
+/// the real failing probe is K=128 (TWO atoms). Run random data at K=64 and
+/// K=128 and report cos vs the fair reference:
+///   K64 ~1.0 but K128 ~0.5  ⇒ the SECOND-atom / multi-atom accumulation path;
+///   both ~0.5               ⇒ within atom 0 (microblocks 1-3, since mb0 is
+///                             confirmed correct by the K-pair probe).
+fn fp4_atom_probe(stream: &ck::CudaStream) {
+    let (m, n) = (16usize, 8usize);
+    for &kd in &[64usize, 128usize] {
+        let wsrc = gen_x(m * kd, 77);
+        let mut w = vec![0u8; m * (kd / 16) * 9];
+        k::nvfp4::quantize_matrix(m, kd, &wsrc, &mut w);
+        let x = gen_x(n * kd, 123);
+        let x_ref = fair_tc_activation(TcGemm::Nvfp4, &x);
+        let mut cpu = vec![0f32; n * m];
+        for ni in 0..n {
+            let mut row = vec![0f32; m];
+            k::nvfp4::matvec_nvfp4_w_f32_a(&w, &x_ref[ni * kd..(ni + 1) * kd], &mut row, m, kd);
+            cpu[ni * m..(ni + 1) * m].copy_from_slice(&row);
+        }
+        let (Some(wb), Some(xb), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(stream, &w),
+            cu_upload_f32(stream, &x),
+            ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+        ) else {
+            cu_emit("fp4:atom_probe", "KERNEL_ERR", "alloc");
+            return;
+        };
+        // SAFETY: live device buffers on `stream`.
+        let res = unsafe {
+            ck::gemm_fp4_tc_f32(
+                ck::CudaFp4TcKind::Nvfp4,
+                stream,
+                wb.as_ptr(),
+                xb.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                m,
+                n,
+                kd,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit("fp4:atom_probe", "KERNEL_ERR", &format!("K{kd}: {e}"));
+            return;
+        }
+        let gpu = cu_download_f32(&ob, n * m);
+        let (mut dot, mut ng, mut nc) = (0f64, 0f64, 0f64);
+        for i in 0..n * m {
+            dot += gpu[i] as f64 * cpu[i] as f64;
+            ng += (gpu[i] as f64).powi(2);
+            nc += (cpu[i] as f64).powi(2);
+        }
+        let cos = if ng > 0.0 && nc > 0.0 {
+            dot / (ng.sqrt() * nc.sqrt())
+        } else {
+            0.0
+        };
+        cu_emit(
+            &format!("fp4:atom_probe:K{kd}"),
+            if cos > 0.99 { "OK" } else { "MISCOMPUTE" },
+            &format!("cos={cos:.4} ({} atom(s))", kd / 64),
+        );
+    }
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -7247,6 +7313,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             fp4_scale_byte_probe(&stream);
             fp4_rowcol_probe(&stream);
             fp4_kpair_probe(&stream);
+            fp4_atom_probe(&stream);
         }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
