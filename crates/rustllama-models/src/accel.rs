@@ -11110,7 +11110,16 @@ fn dev_attn_enabled() -> bool {
         _ => {}
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK))
+    // RUSTLLAMA_DEV_ATTN forces the eager device-resident decode block on/off —
+    // the lever for the decode-block phase profiler (run with DEV_STEP_GRAPH=0 so
+    // the eager block runs instead of the whole-step graph). Else the verdict.
+    *ON.get_or_init(
+        || match std::env::var("RUSTLLAMA_DEV_ATTN").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK),
+        },
+    )
 }
 
 /// Whether the device-resident PREFILL block is enabled — the prefill twin of

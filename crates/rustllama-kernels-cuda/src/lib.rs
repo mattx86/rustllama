@@ -1810,6 +1810,24 @@ pub mod phase_prof {
         PB_D2H.fetch_add(d2h, Ordering::Relaxed);
         PB_CALLS.fetch_add(1, Ordering::Relaxed);
     }
+    // Device-resident DECODE block (`decode_attn_block_f32`, eager path —
+    // RUSTLLAMA_DEV_STEP_GRAPH=0 + dev-attn on) per-LAYER phase split: the 7
+    // matvecs (qkv/o/gate/up/down), the flash-decode attention (+ mirror write),
+    // the glue (rmsnorm/qk-norm/rope/silu/residual), and H2D/D2H. Localizes the
+    // decode bottleneck (matvec bandwidth vs attn vs the many-small-kernels glue).
+    static DB_MATVEC: AtomicU64 = AtomicU64::new(0);
+    static DB_ATTN: AtomicU64 = AtomicU64::new(0);
+    static DB_GLUE: AtomicU64 = AtomicU64::new(0);
+    static DB_XFER: AtomicU64 = AtomicU64::new(0);
+    static DB_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Record one eager decode-block layer's matvec/attn/glue/transfer ns.
+    pub fn add_decode_block(matvec: u64, attn: u64, glue: u64, xfer: u64) {
+        DB_MATVEC.fetch_add(matvec, Ordering::Relaxed);
+        DB_ATTN.fetch_add(attn, Ordering::Relaxed);
+        DB_GLUE.fetch_add(glue, Ordering::Relaxed);
+        DB_XFER.fetch_add(xfer, Ordering::Relaxed);
+        DB_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     /// Record one decode (single-row) matvec's H2D/kernel/D2H nanoseconds.
     pub fn add_single(h2d: u64, ker: u64, d2h: u64) {
         S_H2D.fetch_add(h2d, Ordering::Relaxed);
@@ -1841,6 +1859,11 @@ pub mod phase_prof {
             &PB_ATTN,
             &PB_D2H,
             &PB_CALLS,
+            &DB_MATVEC,
+            &DB_ATTN,
+            &DB_GLUE,
+            &DB_XFER,
+            &DB_CALLS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1849,7 +1872,8 @@ pub mod phase_prof {
     pub fn dump() -> String {
         let ld = |c: &AtomicU64| c.load(Ordering::Relaxed);
         let (sc, bc, pg, pb) = (ld(&S_CALLS), ld(&B_CALLS), ld(&PG_CALLS), ld(&PB_CALLS));
-        if sc == 0 && bc == 0 && pg == 0 && pb == 0 {
+        let db = ld(&DB_CALLS);
+        if sc == 0 && bc == 0 && pg == 0 && pb == 0 && db == 0 {
             return String::new();
         }
         let per = |n: u64, calls: u64| {
@@ -1860,6 +1884,19 @@ pub mod phase_prof {
             }
         };
         let mut s = String::from("[phase] matvec H2D / kernel / D2H, us per call:\n");
+        if db > 0 {
+            s += &format!(
+                "  dev-decode block (per layer): calls={db} matvec={:.1} attn={:.1} glue={:.1} xfer={:.1} total={:.1}\n",
+                per(ld(&DB_MATVEC), db),
+                per(ld(&DB_ATTN), db),
+                per(ld(&DB_GLUE), db),
+                per(ld(&DB_XFER), db),
+                per(
+                    ld(&DB_MATVEC) + ld(&DB_ATTN) + ld(&DB_GLUE) + ld(&DB_XFER),
+                    db
+                )
+            );
+        }
         if pb > 0 {
             s += &format!(
                 "  dev-prefill block (per layer): calls={pb} h2d={:.1} compute={:.1} attn={:.1} d2h={:.1} total={:.1}\n",
@@ -2642,10 +2679,13 @@ pub unsafe fn matvec_q8_0_repacked(
 /// engages where the prefill already built the repack.
 fn q8_repack_decode_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Default ON: the on-device A/B measured a consistent ~+10% decode and it is
+    // bit-equal + lookup-only + fallback-safe (no repack cached ⇒ byte-packed
+    // matvec). RUSTLLAMA_Q8_REPACK_DECODE=0 disables it for an A/B.
     *EN.get_or_init(|| {
         std::env::var("RUSTLLAMA_Q8_REPACK_DECODE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
@@ -6348,17 +6388,33 @@ impl CudaMatvecCache {
                 n.f32_ptr_at(no_if),
             )
         };
+        // Decode-block phase profiler (RUSTLLAMA_PHASE_PROFILE): per-layer
+        // matvec / attn / glue / xfer split, sync-isolated (abs is perturbed; the
+        // RATIO is the signal). db = [matvec, attn, glue, xfer] ns.
+        let prof = phase_prof::enabled();
+        let mut db = [0u64; 4];
+        let mut tmark = std::time::Instant::now();
         // 1. attn RMSNorm; 2. q/k/v projections (device-I/O, no copy).
         unsafe {
             if rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_err() {
                 return false;
             }
         }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[2] += tmark.elapsed().as_nanos() as u64; // glue (rmsnorm)
+            tmark = std::time::Instant::now();
+        }
         if !unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) }
             || !unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) }
             || !unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) }
         {
             return false;
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[0] += tmark.elapsed().as_nanos() as u64; // matvec (qkv)
+            tmark = std::time::Instant::now();
         }
         // 3. Qwen3 qk-head-norm; 4. RoPE (both device, in place).
         unsafe {
@@ -6377,6 +6433,11 @@ impl CudaMatvecCache {
             {
                 return false;
             }
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[2] += tmark.elapsed().as_nanos() as u64; // glue (qk-norm + rope)
+            tmark = std::time::Instant::now();
         }
         // 5. Download post-RoPE K/V into the caller's host KV-cache row, then
         //    scatter the SAME post-RoPE device K/V into the F32 mirror at `pos`,
@@ -6418,6 +6479,11 @@ impl CudaMatvecCache {
         if pos as u32 == valid {
             self.attn_valid_len[layer_idx] = pos as u32 + 1;
         }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[3] += tmark.elapsed().as_nanos() as u64; // xfer (K/V download + mirror)
+            tmark = std::time::Instant::now();
+        }
         // 6. Flash decode over [0, pos+1) against the mirror → attn_out (device).
         let km_ptr = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
         let vm_ptr = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
@@ -6442,14 +6508,29 @@ impl CudaMatvecCache {
                 return false;
             }
         }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[1] += tmark.elapsed().as_nanos() as u64; // attn (flash-decode)
+            tmark = std::time::Instant::now();
+        }
         // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
         if !unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) } {
             return false;
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[0] += tmark.elapsed().as_nanos() as u64; // matvec (o-proj)
+            tmark = std::time::Instant::now();
         }
         unsafe {
             if add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_err() {
                 return false;
             }
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[2] += tmark.elapsed().as_nanos() as u64; // glue (residual + post-attn rmsnorm)
+            tmark = std::time::Instant::now();
         }
         // 8b. Optional dense SwiGLU FFN, device-resident: gate/up = W·h_norm2,
         // act = silu(gate)⊙up, ffn_out = W_down·act, hidden += ffn_out. Reads
@@ -6473,6 +6554,11 @@ impl CudaMatvecCache {
                     return false;
                 }
             }
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[0] += tmark.elapsed().as_nanos() as u64; // matvec (FFN gate/up/down; silu+add negligible)
+            tmark = std::time::Instant::now();
         }
         // 9. Download the updated hidden (hidden += o [+ ffn_out]). The post-attn
         // norm (h_norm2) is downloaded only when the FFN ran on the HOST — when
@@ -6499,6 +6585,11 @@ impl CudaMatvecCache {
                     return false;
                 }
             }
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            db[3] += tmark.elapsed().as_nanos() as u64; // xfer (hidden/h_norm2 download)
+            phase_prof::add_decode_block(db[0], db[1], db[2], db[3]);
         }
         consume_error_count() == 0
     }
