@@ -128,6 +128,26 @@ __device__ __forceinline__ unsigned char rsl_f32_to_e8m0(float x) {
     return (unsigned char)biased;
 }
 
+// OCP MX block-scale byte for an absmax + the element format's MAX EXPONENT
+// (E2M1→2, E3M2→4, E4M3→8): value = 2^(floor(log2 absmax) - emax). This is the
+// exact convention `rustllama_kernels_cpu::mxfp_kv::block_scale_byte` uses for
+// the weights + the parity reference. The old activation path called
+// `rsl_f32_to_e8m0(mx / elem_max_VALUE)`, i.e. floor(log2(mx) - log2(elem_max)),
+// which is ~1 exponent too small ~58% of the time (log2(6)=2.585≠2 etc.) →
+// mx/scale ∈ [elem_max, 2·elem_max) → the block max always OVER-SATURATES, and
+// the activations no longer match the OCP-quantized weights/reference (the
+// mxfp4/mxfp8/mxfp6 cos≈0.97-0.99 residual). Use this for the on-the-fly act
+// scale so the kernel is OCP-consistent with its weights.
+__device__ __forceinline__ unsigned char rsl_f32_to_e8m0_ocp(float absmax, int emax) {
+    if (!(absmax > 0.0f)) return 127; // 2^0
+    int e;
+    frexpf(absmax, &e);               // absmax in [0.5,1)*2^e => floor(log2)=e-1
+    int biased = (e - 1) - emax + 127;
+    if (biased < 0) biased = 0;
+    if (biased > 254) biased = 254;
+    return (unsigned char)biased;
+}
+
 // f32 -> OCP E3M2 (MXFP6 element): 6-bit `s eee mm` (1 sign, 3 exp bias 3,
 // 2 mantissa). Bit-compatible with rsl_e3m2_to_f32's decode. No Inf/NaN;
 // saturates at 28 = (1+3/4)*2^4. Used to quantize activations for the W6A6
@@ -464,7 +484,7 @@ __global__ void rsl_bw_gemm_mxfp4_kernel(
             float mx = 0.f;
             #pragma unroll
             for (int t = 0; t < 32; ++t) mx = fmaxf(mx, fabsf(xs[g][j * 32 + t]));
-            unsigned char e8 = rsl_f32_to_e8m0(mx > 0.f ? mx / 6.0f : 1.0f);
+            unsigned char e8 = rsl_f32_to_e8m0_ocp(mx, 2); // E2M1 max exponent
             bscale[j] = rsl_e8m0_to_f32(e8);
             sfb |= (unsigned)e8 << (8 * j);
         }
@@ -613,7 +633,7 @@ __global__ void rsl_bw_gemm_mxfp8_kernel(const unsigned char* __restrict__ w, co
         float mx = 0.f;
         #pragma unroll
         for (int t = 0; t < 32; ++t) mx = fmaxf(mx, fabsf(xs[g][t]));
-        unsigned char e8 = rsl_f32_to_e8m0(mx > 0.f ? mx / 448.0f : 1.0f); float bs = rsl_e8m0_to_f32(e8); unsigned sfb = e8;
+        unsigned char e8 = rsl_f32_to_e8m0_ocp(mx, 8); float bs = rsl_e8m0_to_f32(e8); unsigned sfb = e8; // E4M3 max exp 8
         unsigned b[2] = {0, 0};
         #pragma unroll
         for (int i = 0; i < 4; ++i) { b[0] |= (unsigned)rsl_f32_to_e4m3(xs[g][q * 4 + i] / bs) << (8 * i); b[1] |= (unsigned)rsl_f32_to_e4m3(xs[g][16 + q * 4 + i] / bs) << (8 * i); }
@@ -644,7 +664,7 @@ __global__ void rsl_bw_gemm_mxfp6_kernel(const unsigned char* __restrict__ w, co
         float mx = 0.f;
         #pragma unroll
         for (int t = 0; t < 32; ++t) mx = fmaxf(mx, fabsf(xs[g][t]));
-        unsigned char e8 = rsl_f32_to_e8m0(mx > 0.f ? mx / 28.0f : 1.0f); float bs = rsl_e8m0_to_f32(e8); unsigned sfb = e8;
+        unsigned char e8 = rsl_f32_to_e8m0_ocp(mx, 4); float bs = rsl_e8m0_to_f32(e8); unsigned sfb = e8; // E3M2 max exp 4
         unsigned b[2] = {0, 0};
         #pragma unroll
         for (int i = 0; i < 4; ++i) { b[0] |= (unsigned)rsl_f32_to_e3m2(xs[g][q * 4 + i] / bs) << (8 * i); b[1] |= (unsigned)rsl_f32_to_e3m2(xs[g][16 + q * 4 + i] / bs) << (8 * i); }
