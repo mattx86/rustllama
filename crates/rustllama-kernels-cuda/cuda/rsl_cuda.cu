@@ -2368,6 +2368,17 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
         }
     }
     const bool repacked = (wq != nullptr);
+    // 128x128 tile: DEFAULT OFF (RUSTLLAMA_GEMM_128=1 to opt in). The pod roofline
+    // showed it HALVES the re-reads (8x→4x, parity OK) but is NET SLOWER (199 vs
+    // 130 us): its 34KB shared (mostly the 16KB Cs round-trip) caps it at 1 block/SM
+    // vs the 64x64's 2, halving the resident warps → latency-bound (eff-BW 85%→31%).
+    // The bigger-tile lever is right but register-blocking self-defeats via occupancy;
+    // the real fix is cp.async staging (hides latency without occupancy). Kept +
+    // env-gated for that follow-up rather than shipping the prefill regression.
+    static int use128_env = -1;
+    if (use128_env < 0)
+        use128_env = (std::getenv("RUSTLLAMA_GEMM_128") != nullptr) ? 1 : 0;
+    const bool use128 = (N >= 128) && use128_env;
     // One-time occupancy/resource diagnostic (opt-in: RUSTLLAMA_GEMM_DIAG=1). Uses
     // only cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor —
     // NO GPU perf counters — so it works where `ncu` hits ERR_NVGPUCTRPERM (locked
@@ -2493,7 +2504,7 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             dim3 b128(32, 16);
 #define RSL_RL_GEMM()                                                                      \
     do {                                                                                   \
-        if (N >= 128) {                                                                    \
+        if (use128) {                                                                      \
             if (repacked)                                                                  \
                 gemm_q8_0_w8a8_tc_128_kernel<true>                                         \
                     <<<g128, b128, 0, s->stream>>>(nullptr, wq, wd, xq, xs, out, M, K, N); \
@@ -2528,8 +2539,8 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             double w_bytes = (double)M * K + (double)M * (K / 32) * 2.0;
             double a_bytes = (double)N * K + (double)N * (K / 32) * 2.0;
             double o_bytes = (double)M * N * 4.0;
-            double bn = (N >= 128) ? 128.0 : (double)RSL_Q4K_TC_BN;
-            double bm = (N >= 128) ? 128.0 : (double)RSL_Q4K_TC_BM;
+            double bn = use128 ? 128.0 : (double)RSL_Q4K_TC_BN;
+            double bm = use128 ? 128.0 : (double)RSL_Q4K_TC_BM;
             double min_bytes = w_bytes + a_bytes + o_bytes;
             double eff_bytes =
                 w_bytes * ((double)N / bn) + a_bytes * ((double)M / bm) + o_bytes;
@@ -2554,11 +2565,9 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
         }
     }
-    // Shape-gated 128x128 (roofline: the 64x64 is DRAM-bandwidth-bound on ~8x
-    // weight re-reads; the 128x128 tile halves both re-read factors). Large-N
-    // prefill only — N<128 (the speculative batched path) keeps the un-padded
-    // 64x64 kernel, which a 128-wide tile would over-pad.
-    if (N >= 128) {
+    // 128x128 tile — opt-in (RUSTLLAMA_GEMM_128=1) + N>=128, via `use128`. Default
+    // OFF: it's correct but net-slower (occupancy-limited — see the note above).
+    if (use128) {
         dim3 g128((unsigned)((M + 127) / 128), (unsigned)((N + 127) / 128));
         dim3 b128(32, 16);
         if (repacked)
