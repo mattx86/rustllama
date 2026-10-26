@@ -773,10 +773,16 @@ __global__ void rsl_bw_gemm_nvfp4_tma_kernel(
         // non-TMA nvfp4 kernel): a[1]/a[2] swapped from the old wrong order.
         a[0] = rsl_pack_a_nvfp4(w, rA0, M, k0 + q * 8, K); a[1] = rsl_pack_a_nvfp4(w, rA1, M, k0 + q * 8, K);
         a[2] = rsl_pack_a_nvfp4(w, rA0, M, k0 + 32 + q * 8, K); a[3] = rsl_pack_a_nvfp4(w, rA1, M, k0 + 32 + q * 8, K);
+        // SFA (scale_vec::4X): lane q=0 carries rowG's 4 K-block scales, q=1
+        // carries rowG+8's (the non-TMA nvfp4 kernel's layout). The old TMA code
+        // packed rA0 for EVERY lane → the g+8 output rows got rowG's scale, so
+        // errors were confined to the hi rows (the 0.997 residual, hi8>>lo8).
         unsigned sfa = 0u;
-        if (rA0 < M) {
+        int sfa_row = (q == 0) ? rA0 : (q == 1) ? rA1 : -1;
+        if (sfa_row >= 0 && sfa_row < M) {
             #pragma unroll
-            for (int j = 0; j < 4; ++j) sfa |= (unsigned)rsl_nvfp4_scale(w, rA0, (k0 >> 4) + j, K) << (8 * j);
+            for (int j = 0; j < 4; ++j)
+                sfa |= (unsigned)rsl_nvfp4_scale(w, sfa_row, (k0 >> 4) + j, K) << (8 * j);
         }
         float bscale[4]; unsigned sfb = 0u;
         #pragma unroll
