@@ -4163,7 +4163,13 @@ extern "C" int rsl_cuda_flash_attn_decode_paged_f32(
 // Shared use = 2*BK*head_dim*4 B = 16 KB at head_dim 128, 32 KB at 256 — under
 // the 48 KB per-block floor guaranteed on every CUDA arch, so no opt-in / no
 // device capability query is needed. Block = 128 threads (<< the 1024 cap).
-#define RSL_FLASH_PREFILL_BQ 4   // query rows (warps) per block
+// BQ (query rows / warps per block) is a TEMPLATE param — the launcher picks it
+// (default 16; env RUSTLLAMA_FLASH_BQ ∈ {8,16,32} for the on-device A/B). It sets
+// how many query rows share each staged K/V tile: total K/V global reads scale as
+// n_new^2 / BQ, so a BIGGER BQ cuts the redundant K/V streaming that dominates the
+// (memory-bound) prefill attention. Bit-identical across BQ — each warp still owns
+// one query and runs the same online-softmax recurrence; only the block/grid
+// partition changes, so `doctor --cuda-parity attn:prefill*` stays OK.
 #define RSL_FLASH_PREFILL_BK 16  // KV positions staged per shared tile
 // `window` (0 = full causal) + `softcap` (0 = off) mirror the CPU reference
 // `gqa_attention_flash_prefill_capped_windowed`: a query at absolute position
@@ -4174,6 +4180,7 @@ extern "C" int rsl_cuda_flash_attn_decode_paged_f32(
 // walks from t0=0 (its bound is block-uniform so every warp reaches the shared
 // __syncthreads); the per-query window is a per-position skip in the active
 // inner loop, exactly like the SYCL v3 prefill helper.
+template <int BQ>
 __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
                                               const float *v, float *out,
                                               int n_heads, int n_gqa,
@@ -4191,14 +4198,14 @@ __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
     const int nthreads = blockDim.x * blockDim.y;
 
     const int hh = blockIdx.y;                 // attention head
-    const int q_base = blockIdx.x * RSL_FLASH_PREFILL_BQ;
+    const int q_base = blockIdx.x * BQ;
     const int q_pos = q_base + warp;           // this warp's query row
     const int kv_h = hh / n_gqa;
 
     const bool active = (q_pos < n_new);
     // Absolute KV position this query attends up to, inclusive (causal). The
     // tile loop bound uses the block's MAX q_pos so it is warp-uniform.
-    const int q_last = min(q_base + RSL_FLASH_PREFILL_BQ - 1, n_new - 1);
+    const int q_last = min(q_base + BQ - 1, n_new - 1);
     const int p_self = kv_len_base + q_pos;    // meaningful only if active
     const int p_block_max = kv_len_base + q_last;
     // SWA per-query lower bound: query at abs pos p_self attends `[t_start, p_self]`.
@@ -4291,14 +4298,36 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
     cudaSetDevice(s->device);
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-    dim3 block(32, RSL_FLASH_PREFILL_BQ);  // 128 threads, 1 warp per query row
-    dim3 grid((n_new + RSL_FLASH_PREFILL_BQ - 1) / RSL_FLASH_PREFILL_BQ,
-              (unsigned)n_heads);
-    size_t shmem =
-        (size_t)2 * RSL_FLASH_PREFILL_BK * head_dim * sizeof(float);
-    flash_attn_prefill_f32_kernel<<<grid, block, shmem, s->stream>>>(
-        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new,
-        scale, window, softcap);
+    size_t shmem = (size_t)2 * RSL_FLASH_PREFILL_BK * head_dim * sizeof(float);
+    // BQ query rows / warps per block (default 16; RUSTLLAMA_FLASH_BQ overrides for
+    // the on-device A/B). Bigger BQ = more queries share each staged K/V tile =
+    // fewer redundant global K/V reads (the prefill-attention bottleneck). Read
+    // once (per-process).
+    static int bq = -1;
+    if (bq < 0) {
+        bq = 16;
+        const char *e = getenv("RUSTLLAMA_FLASH_BQ");
+        if (e) {
+            int v = atoi(e);
+            if (v == 8 || v == 16 || v == 32) bq = v;
+        }
+    }
+#define RSL_LAUNCH_FLASH_PREFILL(BQV)                                           \
+    do {                                                                       \
+        dim3 block(32, (BQV));                                                 \
+        dim3 grid((n_new + (BQV) - 1) / (BQV), (unsigned)n_heads);             \
+        flash_attn_prefill_f32_kernel<(BQV)><<<grid, block, shmem, s->stream>>>( \
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base,       \
+            n_new, scale, window, softcap);                                    \
+    } while (0)
+    if (bq == 8) {
+        RSL_LAUNCH_FLASH_PREFILL(8);
+    } else if (bq == 32) {
+        RSL_LAUNCH_FLASH_PREFILL(32);
+    } else {
+        RSL_LAUNCH_FLASH_PREFILL(16);
+    }
+#undef RSL_LAUNCH_FLASH_PREFILL
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_f32");
 }
 
