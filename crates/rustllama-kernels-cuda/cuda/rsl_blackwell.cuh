@@ -881,13 +881,39 @@ __global__ void rsl_bw_gemm_fp8_sp24_kernel(
         // Thread (g,q) owns rows {g,g+8} and logical cols [q*16,q*16+16) per row
         // = 4 2:4-groups/row; 4 groups/row x 2 rows = 8 groups -> 16 kept bytes.
         // SPARK-VALIDATE: (thread -> logical col) map + ordered_metadata order.
+        // Compressed A + metadata — the hardware-validated mma.sp m16n8k64 8-bit
+        // layout (per the pantheonsim sm_120 reference, cross-checked on an
+        // RTX PRO 6000). A chunk = one dense 4-element group pruned 2:4.
+        // A register r (0..3): row = g + (r&1)*8 (r even→rA0, odd→rA1), K-half
+        // r>>1; its 4 E4M3 bytes are 2 chunks [q*2 + (r>>1)*8 + {0,1}], each 2
+        // kept bytes (byte index = chunk*2 + stored). (The OLD packing put both
+        // chunks of one ROW in a register → the 16→8 output-row collapse.)
         unsigned a[4] = {0, 0, 0, 0}, e = 0u;
         #pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            int m = (half == 0) ? rA0 : rA1;
+        for (int r = 0; r < 4; ++r) {
+            int m = (r & 1) ? rA1 : rA0;
             #pragma unroll
-            for (int grp = 0; grp < 4; ++grp) {
-                int base = q * 16 + grp * 4;
+            for (int cc = 0; cc < 2; ++cc) {
+                int base = (q * 2 + (r >> 1) * 8 + cc) * 4; // dense K of this chunk
+                unsigned char kept[2] = {0, 0}, gb[4];
+                if (m < M) {
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) gb[t] = w[(long long)m * K + k0 + base + t];
+                    (void)rsl_bw_prune24_group(gb, kept);
+                }
+                a[r] |= ((unsigned)kept[0] | ((unsigned)kept[1] << 8)) << (cc * 16);
+            }
+        }
+        // Metadata: 8-bit sparse is ONE ROW PER LANE. Lane (g,q) holds row
+        // g+(q&1)*8, chunks (q>>1)*8 + i (i=0..7), nibble for chunk i at bit i*4
+        // (src = 4*group + 2*sel + half + 2*(chunk/8), sel=0). (The OLD code packed
+        // BOTH rows' metadata into every lane → wrong row selection.)
+        {
+            int m = (q & 1) ? rA1 : rA0;
+            int cbase = (q >> 1) * 8;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int base = (cbase + i) * 4;
                 unsigned char kept[2] = {0, 0}, gb[4];
                 unsigned md = 0u;
                 if (m < M) {
@@ -895,25 +921,24 @@ __global__ void rsl_bw_gemm_fp8_sp24_kernel(
                     for (int t = 0; t < 4; ++t) gb[t] = w[(long long)m * K + k0 + base + t];
                     md = rsl_bw_prune24_group(gb, kept);
                 }
-                int reg = half * 2 + (grp >> 1);
-                int shift = (grp & 1) * 16;
-                a[reg] |= ((unsigned)kept[0] | ((unsigned)kept[1] << 8)) << shift;
-                e |= md << ((half * 4 + grp) * 4);
+                e |= md << (i * 4);
             }
         }
-        // Full B (64x8 = 16 E4M3/thread = 4 regs), cols n=g, logical K
-        // [q*16,q*16+16) matching A. Quantized to E4M3, one scale per row/K-step.
+        // Full dense B (64x8 → 4 regs): b[r] byte j = X[col g, K = q*4 + r*16 + j].
+        // (The OLD packing used K=q*16+chunk*4, which mispaired against the real
+        // B fragment K-layout.) Quantized to E4M3, one f32 scale per token/K-step.
         float mx = 0.f;
         #pragma unroll
         for (int t = 0; t < 64; ++t) mx = fmaxf(mx, fabsf(xs[g][t]));
         float bs = mx > 0.f ? mx / 448.0f : 1.0f;
         unsigned b[4] = {0, 0, 0, 0};
         #pragma unroll
-        for (int chunk = 0; chunk < 4; ++chunk) {
-            unsigned r = 0u;
+        for (int r = 0; r < 4; ++r) {
+            unsigned rb = 0u;
             #pragma unroll
-            for (int t = 0; t < 4; ++t) r |= (unsigned)rsl_f32_to_e4m3(xs[g][q * 16 + chunk * 4 + t] / bs) << (8 * t);
-            b[chunk] = r;
+            for (int j = 0; j < 4; ++j)
+                rb |= (unsigned)rsl_f32_to_e4m3(xs[g][q * 4 + r * 16 + j] / bs) << (8 * j);
+            b[r] = rb;
         }
         float z[4] = {0, 0, 0, 0}, d[4];
         rsl_bw_mma_sp_f8(d, a, b, z, e);
