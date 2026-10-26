@@ -17101,6 +17101,13 @@ impl LlamaModel {
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
+        // P1b cross-layer residency: true while the device activation slab holds
+        // the current `hidden` and the HOST `hidden` is stale. The device-resident
+        // prefill block keeps `hidden` on device across consecutive qualifying
+        // layers (upload once on entry, download only when the resident run ends —
+        // before a host layer, on a block failure, or after the loop), mirroring
+        // the decode `hidden_dev_resident` plumbing.
+        let mut hidden_dev_resident = false;
         for (layer_idx, block) in attn_views.iter().take(n_layers_used).enumerate() {
             // Hybrid placement: tell the `try_*_usm_f32` dispatch
             // ladder which layer we're on. Helpers consult
@@ -17110,16 +17117,16 @@ impl LlamaModel {
             // cutoff.
             crate::accel::set_current_layer_idx(layer_idx as u32);
 
-            // Device-resident PREFILL block (P1): run the WHOLE dense layer
+            // Device-resident PREFILL block (P1 + P1b): run the WHOLE dense layer
             // (attention + FFN) GPU-resident, keeping activations on device across
             // every op so the ~7 batched GEMMs per layer stop paying an
-            // H2D(x)+D2H(out) each (the measured prefill transfer bottleneck).
-            // Per-layer drain (hidden uploaded + downloaded each layer) so a
-            // non-qualifying layer or any failure falls straight through to the
-            // host body below with a coherent host `hidden` — correct by
-            // construction, cross-layer residency is a follow-up. F32 KV + dense
-            // + no-bias + no-tree + no-rope-scaling only; every other case
-            // declines and runs the proven host path unchanged.
+            // H2D(x)+D2H(out) each (the measured prefill transfer bottleneck). P1b:
+            // `hidden` also stays resident ACROSS layers (upload only when it isn't
+            // already on device; never download inside the block), so interior
+            // layers pay no hidden H2D/D2H. A non-qualifying layer or a block
+            // failure drains the resident `hidden` to host first (below), so the
+            // host body always sees a coherent `hidden`. F32 KV + dense + no-bias +
+            // no-tree + no-rope-scaling only; every other case runs the host path.
             let dev_ran = 'dev: {
                 if moe_cfg.is_some()
                     || tree.is_some()
@@ -17189,13 +17196,21 @@ impl LlamaModel {
                     cfg.rms_eps,
                     window,
                     softcap,
-                    true, // upload hidden (per-layer drain)
-                    true, // download hidden
+                    !hidden_dev_resident, // upload hidden only if not already resident
+                    false,                // keep hidden resident for the next layer
                 );
                 ran
             };
             if dev_ran {
+                // `hidden` is now resident on device (not written back to host).
+                hidden_dev_resident = true;
                 continue;
+            }
+            // This layer runs on the host path. If a prior layer left `hidden`
+            // resident on device, drain it first so the host body sees it.
+            if hidden_dev_resident {
+                crate::accel::fetch_resident_prefill_hidden_cuda_f32(&mut hidden, n_new, d);
+                hidden_dev_resident = false;
             }
 
             // ---- attention ----
@@ -17366,6 +17381,11 @@ impl LlamaModel {
             // The serial path bumps `kv.seq_len` per token inside
             // forward_one (at the very end); we do it once after
             // the batched layer so the invariants line up.
+        }
+        // P1b: if the last layers ran device-resident, `hidden` is still on device
+        // — drain it to host before the final norm / LM head read it.
+        if hidden_dev_resident {
+            crate::accel::fetch_resident_prefill_hidden_cuda_f32(&mut hidden, n_new, d);
         }
         kv.seq_len = kv.seq_len.max(kv_len_base + n_new);
 

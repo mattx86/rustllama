@@ -12625,6 +12625,29 @@ pub fn fetch_resident_hidden_cuda_f32(hidden: &mut [f32], d_model: usize, device
     g.download_resident_hidden_f32(hidden, d_model)
 }
 
+/// PREFILL twin of [`fetch_resident_hidden_cuda_f32`] — drain the cross-layer-
+/// resident prefill `hidden` (`[n_new, d_model]`) from the device activation slab
+/// to the host. The device-resident prefill loop uses it when the resident run
+/// ends (before the final norm / LM head) or must fall back to a host layer.
+/// Returns false (caller keeps its host `hidden`) when CUDA is inactive, the
+/// cache is unavailable, or the copy failed.
+pub fn fetch_resident_prefill_hidden_cuda_f32(
+    hidden: &mut [f32],
+    n_new: usize,
+    d_model: usize,
+) -> bool {
+    if !cuda_active() {
+        return false;
+    }
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(g) = cache.lock() else {
+        return false;
+    };
+    g.download_prefill_resident_hidden_f32(hidden, n_new, d_model)
+}
+
 /// Seed the native-CUDA F32 decode KV mirror with the prefill history for a
 /// layer — upload the rows `[valid..pos)` that aren't resident yet from the
 /// host KV cache. Without this, [`try_flash_attn_decode_cuda_f32`]'s

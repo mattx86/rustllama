@@ -1782,6 +1782,24 @@ pub mod phase_prof {
         PG_NS.fetch_add(ns, Ordering::Relaxed);
         PG_CALLS.fetch_add(1, Ordering::Relaxed);
     }
+    // Device-resident PREFILL block (`prefill_attn_block_f32`) per-LAYER phase
+    // split: hidden/norm H2D, on-device matmul+glue compute (rmsnorm/QKV/qk-norm/
+    // RoPE/O/residual/FFN), attention (KV-scatter + flash-prefill), K/V + hidden
+    // D2H. Isolated with a stream sync per phase (perturbs absolute time, but the
+    // RATIO is the signal) — the device block bypasses the matvec buckets above.
+    static PB_H2D: AtomicU64 = AtomicU64::new(0);
+    static PB_COMPUTE: AtomicU64 = AtomicU64::new(0);
+    static PB_ATTN: AtomicU64 = AtomicU64::new(0);
+    static PB_D2H: AtomicU64 = AtomicU64::new(0);
+    static PB_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Record one device-resident prefill-block layer's H2D/compute/attn/D2H ns.
+    pub fn add_prefill_block(h2d: u64, compute: u64, attn: u64, d2h: u64) {
+        PB_H2D.fetch_add(h2d, Ordering::Relaxed);
+        PB_COMPUTE.fetch_add(compute, Ordering::Relaxed);
+        PB_ATTN.fetch_add(attn, Ordering::Relaxed);
+        PB_D2H.fetch_add(d2h, Ordering::Relaxed);
+        PB_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     /// Record one decode (single-row) matvec's H2D/kernel/D2H nanoseconds.
     pub fn add_single(h2d: u64, ker: u64, d2h: u64) {
         S_H2D.fetch_add(h2d, Ordering::Relaxed);
@@ -1798,7 +1816,21 @@ pub mod phase_prof {
     }
     pub fn reset() {
         for c in [
-            &S_H2D, &S_KER, &S_D2H, &S_CALLS, &B_H2D, &B_KER, &B_D2H, &B_CALLS, &PG_NS, &PG_CALLS,
+            &S_H2D,
+            &S_KER,
+            &S_D2H,
+            &S_CALLS,
+            &B_H2D,
+            &B_KER,
+            &B_D2H,
+            &B_CALLS,
+            &PG_NS,
+            &PG_CALLS,
+            &PB_H2D,
+            &PB_COMPUTE,
+            &PB_ATTN,
+            &PB_D2H,
+            &PB_CALLS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -1806,8 +1838,8 @@ pub mod phase_prof {
     /// Formatted us-per-call breakdown (empty string if nothing recorded).
     pub fn dump() -> String {
         let ld = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        let (sc, bc, pg) = (ld(&S_CALLS), ld(&B_CALLS), ld(&PG_CALLS));
-        if sc == 0 && bc == 0 && pg == 0 {
+        let (sc, bc, pg, pb) = (ld(&S_CALLS), ld(&B_CALLS), ld(&PG_CALLS), ld(&PB_CALLS));
+        if sc == 0 && bc == 0 && pg == 0 && pb == 0 {
             return String::new();
         }
         let per = |n: u64, calls: u64| {
@@ -1818,6 +1850,16 @@ pub mod phase_prof {
             }
         };
         let mut s = String::from("[phase] matvec H2D / kernel / D2H, us per call:\n");
+        if pb > 0 {
+            s += &format!(
+                "  dev-prefill block (per layer): calls={pb} h2d={:.1} compute={:.1} attn={:.1} d2h={:.1} total={:.1}\n",
+                per(ld(&PB_H2D), pb),
+                per(ld(&PB_COMPUTE), pb),
+                per(ld(&PB_ATTN), pb),
+                per(ld(&PB_D2H), pb),
+                per(ld(&PB_H2D) + ld(&PB_COMPUTE) + ld(&PB_ATTN) + ld(&PB_D2H), pb)
+            );
+        }
         if pg > 0 {
             s += &format!(
                 "  prefill GEMM (usm/TC, whole call): calls={pg} total={:.1} us/call ({:.1} ms all)\n",
@@ -6556,6 +6598,12 @@ impl CudaMatvecCache {
         let fb = |s: &[f32]| -> &[u8] {
             unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
         };
+        // Per-layer phase profiling (RUSTLLAMA_PHASE_PROFILE): H2D / compute / attn
+        // / D2H, each isolated by a stream sync (perturbs absolute time; the RATIO
+        // is the signal). pb = [h2d, compute, attn, d2h] ns.
+        let prof = phase_prof::enabled();
+        let mut pb = [0u64; 4];
+        let mut tmark = std::time::Instant::now();
         if upload_hidden
             && !self
                 .prefill_act
@@ -6583,6 +6631,11 @@ impl CudaMatvecCache {
                     return false;
                 }
             }
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            pb[0] += tmark.elapsed().as_nanos() as u64;
+            tmark = std::time::Instant::now();
         }
         let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
             let a = self.prefill_act.as_ref().unwrap();
@@ -6655,21 +6708,18 @@ impl CudaMatvecCache {
                 return false;
             }
         }
-        // 5. Download post-RoPE K/V rows (token-major) for the host KV cache, then
-        //    scatter the SAME device K/V into the head-major mirror at col
-        //    kv_len_base (device→device, one launch), and advance valid_len.
-        {
-            let a = self.prefill_act.as_ref().unwrap();
-            let kb: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(k_rows_out.as_mut_ptr() as *mut u8, n_new * d_kv * 4)
-            };
-            let vb: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(v_rows_out.as_mut_ptr() as *mut u8, n_new * d_kv * 4)
-            };
-            if !a.download_at(o_k * 4, kb) || !a.download_at(o_v * 4, vb) {
-                return false;
-            }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            pb[1] += tmark.elapsed().as_nanos() as u64; // compute (pre-attn)
+            tmark = std::time::Instant::now();
         }
+        // 5. Scatter the post-RoPE device K/V into the head-major mirror at col
+        //    kv_len_base (device→device, one launch) and advance valid_len. P1c:
+        //    the host-cache K/V download is DEFERRED to step 9 (after the FFN) so
+        //    the whole attention+FFN chain runs as one async stream segment with no
+        //    mid-layer D2H sync; the o_k/o_v slab regions are untouched by the
+        //    o-proj/residual/FFN below, so the deferred read is still the post-RoPE
+        //    K/V.
         {
             let km = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
             let vm = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
@@ -6728,6 +6778,11 @@ impl CudaMatvecCache {
                 return false;
             }
         }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            pb[2] += tmark.elapsed().as_nanos() as u64; // attention (scatter + flash)
+            tmark = std::time::Instant::now();
+        }
         // 7. o projection (batched device-I/O); 8. fused residual + post-attn RMSNorm.
         if !unsafe {
             self.matvec_packed_batched_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q, n_new)
@@ -6762,10 +6817,27 @@ impl CudaMatvecCache {
                 }
             }
         }
-        // 9. Download the updated hidden (unless it stays resident for the next
-        //    layer). h_norm2 is downloaded only when the FFN runs on the HOST.
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            pb[1] += tmark.elapsed().as_nanos() as u64; // compute (post-attn: o + FFN)
+            tmark = std::time::Instant::now();
+        }
+        // 9. Deferred K/V host-cache download (P1c, post-RoPE from the preserved
+        //    o_k/o_v slab regions) + the updated hidden (unless it stays resident
+        //    for the next layer). h_norm2 is downloaded only when the FFN runs on
+        //    the HOST. Batching the K/V download here (one sync at layer end)
+        //    instead of mid-layer lets the attention+FFN chain run async.
         {
             let a = self.prefill_act.as_ref().unwrap();
+            let kb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(k_rows_out.as_mut_ptr() as *mut u8, n_new * d_kv * 4)
+            };
+            let vb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(v_rows_out.as_mut_ptr() as *mut u8, n_new * d_kv * 4)
+            };
+            if !a.download_at(o_k * 4, kb) || !a.download_at(o_v * 4, vb) {
+                return false;
+            }
             if download_hidden {
                 let hb: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
@@ -6788,6 +6860,11 @@ impl CudaMatvecCache {
                     return false;
                 }
             }
+        }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            pb[3] += tmark.elapsed().as_nanos() as u64; // D2H (K/V + hidden)
+            phase_prof::add_prefill_block(pb[0], pb[1], pb[2], pb[3]);
         }
         consume_error_count() == 0
     }
@@ -7804,6 +7881,29 @@ impl CudaMatvecCache {
         let hb: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4) };
         // offset 0 = hidden (see the activation-slab offset tuple).
+        a.download_at(0, hb) && consume_error_count() == 0
+    }
+
+    /// PREFILL twin of [`Self::download_resident_hidden_f32`] — drain the
+    /// cross-layer-resident prefill `hidden` (`[n_new, d_model]`) from the prefill
+    /// activation slab (offset 0) to the host. The caller uses it when the
+    /// device-resident prefill run ends (before the final norm / LM head) or must
+    /// fall back to the host layer body (so the stale host `hidden` is refreshed).
+    pub fn download_prefill_resident_hidden_f32(
+        &self,
+        hidden: &mut [f32],
+        n_new: usize,
+        d_model: usize,
+    ) -> bool {
+        if hidden.len() != n_new * d_model || n_new == 0 {
+            return false;
+        }
+        let Some(a) = self.prefill_act.as_ref() else {
+            return false;
+        };
+        let hb: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, n_new * d_model * 4)
+        };
         a.download_at(0, hb) && consume_error_count() == 0
     }
 
