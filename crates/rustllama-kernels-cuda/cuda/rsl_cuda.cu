@@ -2178,6 +2178,17 @@ extern "C" int rsl_cuda_matvec_q8_0_repacked(rsl_cuda_stream *s, const void *w,
     return rsl_cuda_check("rsl_cuda_matvec_q8_0_repacked");
 }
 
+// Grid-stride float4 copy — the peak-DRAM-bandwidth micro-benchmark for the
+// in-code roofline (RUSTLLAMA_GEMM_ROOFLINE). A simple saturating copy measures
+// THIS device/MIG-slice's achieved DRAM bandwidth (no perf counters, no MIG peak
+// ambiguity), which the GEMM's achieved bandwidth is then graded against.
+__global__ void rsl_bw_copy_kernel(const float4 *__restrict__ in,
+                                   float4 *__restrict__ out, long n) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x * blockDim.x)
+        out[i] = in[i];
+}
+
 // Quant pre-pass (emit xq + xs; no xsum for symmetric Q8_0) + int8-TC GEMM.
 extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                                           const float *x, float *out, int M, int K,
@@ -2323,6 +2334,104 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                 cudaFree(prof);
                 return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
             }
+        }
+    }
+    // ncu-ish ROOFLINE (opt-in: RUSTLLAMA_GEMM_ROOFLINE=1). NO perf counters:
+    // (1) micro-benchmark THIS slice's peak DRAM bandwidth with a saturating copy;
+    // (2) time the real GEMM with cudaEvents; (3) report achieved int8-TOPS +
+    // effective (with weight re-reads) & min (perfect-cache) bandwidth vs the
+    // MEASURED peak, then the verdict. The clock64 profiler says WHERE cycles go
+    // (stage 77%); this says WHY — DRAM-bandwidth-bound on re-reads (⇒ bigger BN
+    // tile) vs latency/occupancy-bound (⇒ cp.async / more warps), the fork the
+    // next GEMM optimization turns on.
+    {
+        static int rl_done = 0;
+        if (!rl_done && std::getenv("RUSTLLAMA_GEMM_ROOFLINE") != nullptr) {
+            rl_done = 1;
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            // (1) Peak DRAM bandwidth: saturate with a 128 MB float4 copy.
+            double peak_gbs = 0.0;
+            {
+                long n4 = (128L << 20) / (long)sizeof(float4);
+                float4 *ci = nullptr, *co = nullptr;
+                if (cudaMalloc(&ci, n4 * sizeof(float4)) == cudaSuccess &&
+                    cudaMalloc(&co, n4 * sizeof(float4)) == cudaSuccess) {
+                    cudaMemset(ci, 1, n4 * sizeof(float4));
+                    int ct = 256;
+                    int cg = 65535;
+                    rsl_bw_copy_kernel<<<cg, ct, 0, s->stream>>>(ci, co, n4); // warmup
+                    cudaStreamSynchronize(s->stream);
+                    cudaEventRecord(e0, s->stream);
+                    const int CITERS = 30;
+                    for (int it = 0; it < CITERS; it++)
+                        rsl_bw_copy_kernel<<<cg, ct, 0, s->stream>>>(ci, co, n4);
+                    cudaEventRecord(e1, s->stream);
+                    cudaEventSynchronize(e1);
+                    float cms = 0.f;
+                    cudaEventElapsedTime(&cms, e0, e1);
+                    double ct_s = (double)cms / CITERS / 1e3;
+                    // read + write = 2x the buffer bytes.
+                    peak_gbs = 2.0 * (double)n4 * sizeof(float4) / ct_s / 1e9;
+                }
+                if (ci) cudaFree(ci);
+                if (co) cudaFree(co);
+            }
+            // (2) Time the real GEMM.
+            const int ITERS = 50;
+            if (repacked)
+                gemm_q8_0_w8a8_tc_kernel<false, true><<<grid, block, 0, s->stream>>>(
+                    nullptr, wq, wd, xq, xs, out, M, K, N, nullptr); // warmup
+            else
+                gemm_q8_0_w8a8_tc_kernel<false, false><<<grid, block, 0, s->stream>>>(
+                    (const unsigned char *)w, nullptr, nullptr, xq, xs, out, M, K, N, nullptr);
+            cudaStreamSynchronize(s->stream);
+            cudaEventRecord(e0, s->stream);
+            for (int it = 0; it < ITERS; it++) {
+                if (repacked)
+                    gemm_q8_0_w8a8_tc_kernel<false, true><<<grid, block, 0, s->stream>>>(
+                        nullptr, wq, wd, xq, xs, out, M, K, N, nullptr);
+                else
+                    gemm_q8_0_w8a8_tc_kernel<false, false><<<grid, block, 0, s->stream>>>(
+                        (const unsigned char *)w, nullptr, nullptr, xq, xs, out, M, K, N, nullptr);
+            }
+            cudaEventRecord(e1, s->stream);
+            cudaEventSynchronize(e1);
+            float gms = 0.f;
+            cudaEventElapsedTime(&gms, e0, e1);
+            double t = (double)gms / ITERS / 1e3; // s/call
+            cudaEventDestroy(e0);
+            cudaEventDestroy(e1);
+            // (3) Traffic + compute. int8 weight = M*K bytes + M*(K/32) f16 scales;
+            // activation likewise; output f32. Effective adds the tile re-reads
+            // (weight N/BN times, activation M/BM times); min = perfect caching.
+            double w_bytes = (double)M * K + (double)M * (K / 32) * 2.0;
+            double a_bytes = (double)N * K + (double)N * (K / 32) * 2.0;
+            double o_bytes = (double)M * N * 4.0;
+            double bn = RSL_Q4K_TC_BN, bm = RSL_Q4K_TC_BM;
+            double min_bytes = w_bytes + a_bytes + o_bytes;
+            double eff_bytes =
+                w_bytes * ((double)N / bn) + a_bytes * ((double)M / bm) + o_bytes;
+            double tops = 2.0 * (double)M * K * N / t / 1e12;
+            double eff_gbs = eff_bytes / t / 1e9;
+            double min_gbs = min_bytes / t / 1e9;
+            double pct = peak_gbs > 0 ? 100.0 / peak_gbs : 0.0;
+            std::fprintf(stderr,
+                         "[gemm-roofline] q8_0_w8a8_tc M=%d K=%d N=%d weights=%s: "
+                         "%.1f us/call | %.2f int8-TOPS | eff-BW=%.0f GB/s (%.0f%% peak, "
+                         "re-read %.1fx) | min-BW=%.0f GB/s (%.0f%% peak) | measured peak=%.0f GB/s\n",
+                         M, K, N, repacked ? "int4-repacked" : "byte-packed", t * 1e6,
+                         tops, eff_gbs, eff_gbs * pct, (double)N / bn, min_gbs,
+                         min_gbs * pct, peak_gbs);
+            const char *verdict =
+                (peak_gbs > 0 && eff_gbs >= 0.80 * peak_gbs)
+                    ? "DRAM-BANDWIDTH-BOUND on weight re-reads -> bigger BN tile (fewer re-reads) is the lever"
+                : (peak_gbs > 0 && min_gbs >= 0.70 * peak_gbs)
+                    ? "bandwidth-bound at the DATA floor -> only less data (precision/layout) helps"
+                    : "LATENCY/OCCUPANCY-bound (eff-BW << peak) -> cp.async staging / more warps / bigger reg tile for ILP";
+            std::fprintf(stderr, "[gemm-roofline] verdict: %s\n", verdict);
+            return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
         }
     }
     if (repacked) {
