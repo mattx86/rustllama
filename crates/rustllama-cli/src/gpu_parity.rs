@@ -5608,6 +5608,67 @@ fn fp4_mxfp4_scale_probe(stream: &ck::CudaStream) {
     );
 }
 
+/// On-device diagnostic (same env gate): sp24 output-row assignment. The 2:4
+/// kernel's compressed-A uses the same [rowG,rowG,rowG+8,rowG+8] register
+/// structure that was WRONG for dense nvfp4 — so a row scramble is a prime
+/// component of its cos 0.117. Weight row r = [big_r,big_r,0,0] per 4-group
+/// (big_r=(r+1)*0.5, prunes deterministically to 2*big_r; the two zeros drop),
+/// activation uniform 1.0: out[row r] = 16 groups * 2 * big_r * 1 = 32*big_r =
+/// 16*(r+1). out[*,0] reads which weight-row landed at each output row; identity
+/// = rows OK (then the residual is metadata/K-pairing), a permutation = the
+/// compressed-A register-row order (same class as the nvfp4 a1<->a2 fix).
+fn fp4_sp24_row_probe(stream: &ck::CudaStream) {
+    let (m, n, kd) = (16usize, 8usize, 64usize);
+    // Dense E4M3 weight, row-major. Row r group = [big,big,0,0], big=(r+1)*0.5.
+    let mut w = vec![0u8; m * kd];
+    for r in 0..m {
+        let big = (r + 1) as f32 * 0.5;
+        for g in 0..(kd / 4) {
+            let base = r * kd + g * 4;
+            w[base] = k::nvfp4::f32_to_e4m3(big);
+            w[base + 1] = k::nvfp4::f32_to_e4m3(big);
+            // base+2, base+3 stay 0 (E4M3 +0) → pruned.
+        }
+    }
+    let x = vec![1.0f32; n * kd];
+    let (Some(wb), Some(xb), Some(mut ob)) = (
+        ck::CudaDeviceBuffer::from_host(stream, &w),
+        cu_upload_f32(stream, &x),
+        ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+    ) else {
+        cu_emit("fp4:sp24_row", "KERNEL_ERR", "alloc");
+        return;
+    };
+    // SAFETY: live device buffers on `stream`.
+    let res = unsafe {
+        ck::gemm_fp8_sp24_f32(
+            stream,
+            wb.as_ptr() as *const std::ffi::c_void,
+            xb.as_ptr() as *const f32,
+            ob.as_mut_ptr() as *mut f32,
+            m,
+            n,
+            kd,
+        )
+    };
+    if let Err(e) = res {
+        cu_emit("fp4:sp24_row", "KERNEL_ERR", &format!("{e}"));
+        return;
+    }
+    let out = cu_download_f32(&ob, n * m);
+    let raw: Vec<f32> = (0..m).map(|p| out[p]).collect(); // out[*,0]
+    let row_map: Vec<i32> = raw
+        .iter()
+        .map(|&v| ((v / 16.0).round() as i32) - 1)
+        .collect();
+    let ok = (0..m).all(|p| row_map[p] == p as i32);
+    cu_emit(
+        "fp4:sp24_row",
+        if ok { "OK" } else { "MISCOMPUTE" },
+        &format!("out-row→weight-row = {row_map:?} (ident=ok; raw={raw:?})"),
+    );
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -7466,6 +7527,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             fp4_atom_probe(&stream);
             fp4_atom0_sweep(&stream);
             fp4_mxfp4_scale_probe(&stream);
+            fp4_sp24_row_probe(&stream);
         }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
