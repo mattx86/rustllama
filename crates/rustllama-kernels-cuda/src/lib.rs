@@ -350,6 +350,16 @@ extern "C" {
         m: c_int,
         k: c_int,
     ) -> c_int;
+    // Aligned DECODE matvec over the cached Q8_0 repack (lookup-only, -1 if the
+    // repack isn't cached → caller runs the byte-packed matvec).
+    fn rsl_cuda_matvec_q8_0_repacked(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
     // Q4_0 / Q5_0 W8A8 DECODE matvecs (single-row, lossy int8-activation; T3b).
     // Selected via `matvec:q4_0_w8a8` / `matvec:q5_0_w8a8` (correct + perf-gated).
     fn rsl_cuda_matvec_q4_0_w8a8(
@@ -2598,6 +2608,45 @@ pub unsafe fn matvec_q4_k_w4a8(
     } else {
         Err(CudaError::Kernel(rc))
     }
+}
+
+/// Aligned Q8_0 DECODE matvec over the cached repack (lookup-only). Reuses the
+/// per-stream Q8_0 repack the prefill GEMM builds (keyed by the SAME weight device
+/// ptr) so the decode's coalesced weight reads are 32-ALIGNED instead of straddling
+/// the 34-byte block boundary. Returns `Err` when the repack isn't cached (caller
+/// falls back to the byte-packed [`matvec_q8_0_packed_f32`]). Bit-equal math.
+///
+/// # Safety
+/// `w`/`x`/`out` are device pointers on `stream`'s device sized for (M,K)/K/M;
+/// `K % 32 == 0`.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn matvec_q8_0_repacked(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_matvec_q8_0_repacked(stream.raw(), w, x, out, m as c_int, k as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Whether the aligned repacked Q8_0 DECODE matvec is enabled (A/B lever
+/// `RUSTLLAMA_Q8_REPACK_DECODE=1`). Default OFF → the byte-packed matvec runs
+/// (byte-identical to today). Lookup-only + fail-closed, so even ON it only
+/// engages where the prefill already built the repack.
+fn q8_repack_decode_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_Q8_REPACK_DECODE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// Single-row Q8_0 W8A8 int-dot DECODE matvec (int8 activations, LOSSY) — the
@@ -5846,7 +5895,19 @@ impl CudaMatvecCache {
                     matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
                 }
                 CudaPackedKind::Q8_0 => {
-                    matvec_q8_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                    // Aligned repacked decode matvec (A/B via RUSTLLAMA_Q8_REPACK_DECODE):
+                    // reuses the prefill-built repack for 32-aligned weight reads. Falls
+                    // back to the byte-packed matvec when the repack isn't cached.
+                    if q8_repack_decode_enabled() {
+                        match matvec_q8_0_repacked(&self.stream, w_ptr, x_dev, out_dev, m, k) {
+                            Ok(()) => Ok(()),
+                            Err(_) => {
+                                matvec_q8_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                            }
+                        }
+                    } else {
+                        matvec_q8_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                    }
                 }
                 CudaPackedKind::Q4_K => {
                     // A1: lossy W4A8 int8-activation matvec where its verdict

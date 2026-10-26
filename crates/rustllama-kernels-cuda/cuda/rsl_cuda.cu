@@ -2118,6 +2118,66 @@ __global__ void q8_0_repack_kernel(const unsigned char *__restrict__ w,
         wd[(size_t)row * spr + blk] = (unsigned short)b[0] | ((unsigned short)b[1] << 8);
 }
 
+// Aligned DECODE matvec over the REPACKED Q8_0 layout (contiguous int8 `wq` +
+// separate f16 scales `wd`, from q8_0_repack_kernel). The byte-packed decode
+// matvec (q8_0_row_dot_warp) reads the int8 at offset +2 of a 34-byte-stride
+// block, so every warp's coalesced load straddles a 32B boundary → ~2
+// transactions (~0.5× effective weight bandwidth). Here lane `t` reads
+// wq[row*K + b*32 + t] at a 32-ALIGNED offset → ONE coalesced transaction. Same
+// math (per-block scale × int8 × x, warp-reduced) → parity-equal to the
+// byte-packed matvec (float reassociation only).
+__device__ __forceinline__ float
+q8_0_repacked_row_dot_warp(const signed char *wq_row, const unsigned short *wd_row,
+                           const float *x, int bpr, int lane) {
+    float acc = 0.0f;
+    for (int b = 0; b < bpr; ++b) {
+        float scale = rsl_f16_bits_to_f32(wd_row[b]);
+        float w = (float)wq_row[(size_t)b * 32 + lane];
+        acc += scale * w * x[b * 32 + lane];
+    }
+    return acc;
+}
+
+__global__ void matvec_q8_0_repacked_kernel(const signed char *wq,
+                                            const unsigned short *wd,
+                                            const float *x, float *out, int M,
+                                            int K) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= M) return;
+    int lane = threadIdx.x;
+    int bpr = K / 32;
+    float acc = q8_0_repacked_row_dot_warp(wq + (size_t)row * K,
+                                           wd + (size_t)row * bpr, x, bpr, lane);
+    for (int off = warpSize >> 1; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) out[row] = acc;
+}
+
+// Decode matvec over the per-stream Q8_0 repack cache — LOOKUP-ONLY (no malloc,
+// so it is CUDA-graph-capturable): if the repack this weight needs is already
+// cached (the prefill GEMM builds it, keyed by the SAME weight device ptr), run
+// the aligned kernel; otherwise return -1 so the caller runs the byte-packed
+// matvec_q8_0_packed_f32. Fail-closed + zero extra VRAM/build on the decode path.
+extern "C" int rsl_cuda_matvec_q8_0_repacked(rsl_cuda_stream *s, const void *w,
+                                             const float *x, float *out, int M,
+                                             int K) {
+    if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % 32) != 0) return -1;
+    const signed char *wq = nullptr;
+    const unsigned short *wd = nullptr;
+    for (auto &e : s->q80_repack)
+        if (e.w == w && e.wq && e.M == M && e.K == K) {
+            wq = e.wq;
+            wd = e.wd;
+            break;
+        }
+    if (!wq) return -1; // no cached repack → caller runs the byte-packed matvec
+    cudaSetDevice(s->device);
+    dim3 block(32, 8);
+    dim3 grid((unsigned)((M + 7) / 8));
+    matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K);
+    return rsl_cuda_check("rsl_cuda_matvec_q8_0_repacked");
+}
+
 // Quant pre-pass (emit xq + xs; no xsum for symmetric Q8_0) + int8-TC GEMM.
 extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                                           const float *x, float *out, int M, int K,
