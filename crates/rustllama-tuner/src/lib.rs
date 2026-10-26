@@ -325,6 +325,15 @@ pub const VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH: &str = "layer:dev_resident_cuda
 /// `accel::dev_step_cuda_graph_enabled`; gated AND with the two per-layer graph
 /// verdicts (pure-dense, F32-KV, no-bias/ring/YaRN/streaming), fail-closed OFF.
 pub const VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH: &str = "step:dev_resident_cuda_graph";
+/// PERF gate for the whole-step graph — it must be measured FASTER than the
+/// per-layer path before it engages, banked by the `tune --dev-attn` step arm
+/// (`measure_dev_attn`). ADDED 2026-10-26 after the whole-step graph measured a
+/// +34% decode REGRESSION on an sm_120 MIG slice (101 vs 135 tok/s per-layer) —
+/// the per-token exec_update/capture overhead can exceed the per-op launch saving
+/// once the matvecs are fast. `accel::dev_step_cuda_graph_enabled` AND's it with
+/// the correctness verdict, so an unmeasured / slower step graph is OFF (the
+/// per-layer path runs), and it re-enables only per (system,model) where it wins.
+pub const VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH_FASTER: &str = "step:dev_resident_cuda_graph_faster";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror

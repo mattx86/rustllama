@@ -11219,14 +11219,60 @@ fn dev_layer_cuda_graph_enabled() -> bool {
 /// validates the whole attn+FFN step), so it does NOT require the per-layer
 /// `attn:` / `layer:` verdicts. Any unmet precondition declines to the per-layer
 /// ladder without corruption.
+/// Whole-step-graph perf A/B force (the `tune --dev-attn` step arm drives it):
+/// -1 = unset (env/verdict decide), 0 = force OFF, 1 = force ON. NOT a user knob.
+static DEV_STEP_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+/// Count of decode tokens the whole-step graph actually ran (engagement check for
+/// the A/B — a forced-ON arm that never engaged is a meaningless measurement).
+static DEV_STEP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Force the whole-step graph on/off for the current process (the `tune --dev-attn`
+/// step A/B only). `None` clears → env/verdict decide.
+pub fn set_dev_step_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DEV_STEP_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many decode tokens ran through the whole-step graph (process-global).
+pub fn dev_step_hits() -> u64 {
+    DEV_STEP_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one whole-step-graph decode (called by `try_decode_step_cuda_graph_f32`).
+pub(crate) fn note_dev_step_hit() {
+    DEV_STEP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn dev_step_cuda_graph_enabled() -> bool {
+    // Perf A/B force (set_dev_step_force) wins over env/verdict.
+    match DEV_STEP_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return !spec_active() && !pipeline_active(),
+        _ => {}
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let base =
         *ON.get_or_init(
             || match std::env::var("RUSTLLAMA_DEV_STEP_GRAPH").ok().as_deref() {
                 Some("1") => true,
                 Some("0") => false,
-                _ => kernel_verdict(rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH),
+                // PERF-GATED (2026-10-26): the whole-step graph must be BOTH correct
+                // AND measured FASTER than the per-layer path. It was a +34% decode
+                // REGRESSION on the sm_120 MIG slice (101 vs 135 tok/s) — the
+                // per-token exec_update/capture overhead exceeds the per-op launch
+                // saving once the matvecs are fast (repack). Default (faster-verdict
+                // unbanked) ⇒ OFF ⇒ the per-layer path. `tune --dev-attn` re-enables
+                // it per (system,model) where it actually wins.
+                _ => {
+                    kernel_verdict(rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH)
+                        && kernel_verdict(
+                            rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH_FASTER,
+                        )
+                }
             },
         );
     // Disable the whole-step graph while speculating — the captured graph assumes a
@@ -11848,6 +11894,7 @@ pub fn try_decode_step_cuda_graph_f32(
         )
     };
     if ok {
+        note_dev_step_hit();
         static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             tracing::info!(

@@ -6847,6 +6847,36 @@ fn cmd_tune_dev_attn(
                     }
                 );
             }
+            // Whole-step graph (CUDA only): the step arm A/Bs it against the BEST
+            // per-layer path. Persist step:dev_resident_cuda_graph_faster only when
+            // it engaged + beat the per-layer path (step_winner = Some(true)); else
+            // off / unset. It was a +34% decode REGRESSION on sm_120 MIG, so it stays
+            // off unless it actually wins per (system,model).
+            if let (Some(step), Some(swin)) = (report.step_tps, report.step_winner) {
+                let bpl = report
+                    .graph_tps
+                    .into_iter()
+                    .chain(report.on_tps)
+                    .fold(0.0_f64, f64::max);
+                println!(
+                    "  whole-step gr  = {step:.2} tok/s  ({:+.1}% vs best per-layer)",
+                    if bpl > 0.0 {
+                        (step / bpl - 1.0) * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+                let sname = rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH_FASTER;
+                persist_kernel_verdicts(&[(sname.to_string(), swin)])?;
+                println!(
+                    "  → {} (persisted verdict {sname} = {swin})",
+                    if swin {
+                        "ENABLE — the whole-step graph is faster than the per-layer path here"
+                    } else {
+                        "keep per-layer path — the whole-step graph is not a win here"
+                    }
+                );
+            }
         }
         _ => {
             println!(

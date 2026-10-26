@@ -4140,6 +4140,15 @@ pub struct DevAttnReport {
     /// the win margin — the CLI then persists `attn:dev_resident_block_cuda_graph`.
     /// `None` = not measured / graph never engaged (verdict left unset → off).
     pub graph_winner: Option<bool>,
+    /// Whole-step graph (CUDA only): median DECODE tok/s with the whole-step graph
+    /// forced on (vs the BEST per-layer path = max(on_tps, graph_tps)). `None` when
+    /// not measured (not CUDA, or the step graph never engaged).
+    pub step_tps: Option<f64>,
+    /// `Some(true)` when the whole-step graph engaged AND beat the best per-layer
+    /// path by the win margin — the CLI then persists
+    /// `step:dev_resident_cuda_graph_faster`. `None` = not measured / never engaged
+    /// (verdict left unset → the step graph stays OFF, per-layer path runs).
+    pub step_winner: Option<bool>,
 }
 
 /// A/B the #2 on-device activation-residency attention block by measured DECODE
@@ -4286,6 +4295,24 @@ pub fn measure_dev_attn(
         (None, false)
     };
 
+    // STEP arm (whole-step graph, CUDA only): the whole-step graph runs at the
+    // FORWARD level (it bypasses the per-layer loop), so force the dev_attn / graph
+    // overrides OFF to isolate it, then force the step graph on and time decode.
+    // Engagement via `dev_step_hits`. Measures the whole-step graph vs the per-layer
+    // path (it was a +34% decode regression on sm_120 MIG — this gates it).
+    let (step_tps, step_engaged) = if is_cuda {
+        rustllama_models::accel::set_dev_attn_force(Some(false));
+        rustllama_models::accel::set_dev_attn_graph_force(Some(false));
+        let sh_before = rustllama_models::accel::dev_step_hits();
+        rustllama_models::accel::set_dev_step_force(Some(true));
+        let (stps, _serr) = bench(&mut cpu);
+        let sengaged = rustllama_models::accel::dev_step_hits() > sh_before;
+        rustllama_models::accel::set_dev_step_force(None);
+        (stps, sengaged)
+    } else {
+        (None, false)
+    };
+
     // Clear both overrides → the verdicts decide at serve time.
     rustllama_models::accel::set_dev_attn_force(None);
     rustllama_models::accel::set_dev_attn_graph_force(None);
@@ -4305,6 +4332,8 @@ pub fn measure_dev_attn(
             is_mlx: false,
             graph_tps: None,
             graph_winner: None,
+            step_tps: None,
+            step_winner: None,
         });
     }
 
@@ -4317,6 +4346,19 @@ pub fn measure_dev_attn(
     // runs) by the same clear-win margin. Fail-closed otherwise (verdict unset).
     let graph_winner = match (graph_engaged, on_tps, graph_tps) {
         (true, Some(on), Some(gr)) if on > 0.0 => Some(gr > on * WIN_MARGIN),
+        _ => None,
+    };
+    // Whole-step graph wins only if it ENGAGED and beat the BEST per-layer path
+    // (the eager device block OR the per-layer graph, whichever is faster) by the
+    // clear-win margin. Fail-closed (verdict unset ⇒ the per-layer path runs).
+    let best_per_layer = match (on_tps, graph_tps) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        _ => None,
+    };
+    let step_winner = match (step_engaged, best_per_layer, step_tps) {
+        (true, Some(bpl), Some(st)) if bpl > 0.0 => Some(st > bpl * WIN_MARGIN),
         _ => None,
     };
     // Which backend's block engaged: CUDA runs the #2 block; off CUDA it was the
@@ -4334,6 +4376,8 @@ pub fn measure_dev_attn(
         is_mlx,
         graph_tps,
         graph_winner,
+        step_tps,
+        step_winner,
     })
 }
 
