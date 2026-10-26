@@ -5458,6 +5458,88 @@ fn fp4_atom_probe(stream: &ck::CudaStream) {
     }
 }
 
+/// On-device diagnostic (same env gate): FULL atom-0 K sweep (all 64 K) to pin
+/// the exact within-atom mispairing (mb0 OK, mb1-3 broken per fp4_atom_probe).
+/// Weight row 0, microblock b = CODEBOOK[p]·2^b (block max 6·2^b at p=7 → block
+/// scale exactly 2^b; all powers/codebook values are E4M3/E2M1-exact → no
+/// rounding fuzz). Sweep an activation delta at K=j (value 6.0): out[0,0] =
+/// W[0, A-element the HW paired with B-j]·6. Recover that element's K-index from
+/// its (sign, |CODEBOOK|, 2^b-scale) signature → the map B-j → A-K for all 64.
+/// Identity = correct; the permutation names the B-fragment K-fill fix.
+fn fp4_atom0_sweep(stream: &ck::CudaStream) {
+    let (m, n, kd) = (16usize, 8usize, 64usize);
+    let blocks = kd / 16; // 4
+    const CB: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    let wval = |k: usize| -> f32 { CB[k % 16] * ((1u32 << (k / 16)) as f32) };
+    let mut w = vec![0u8; m * blocks * 9];
+    for b in 0..blocks {
+        let vals: Vec<f32> = (0..16).map(|p| CB[p] * ((1u32 << b) as f32)).collect();
+        let off = b * 9; // row 0, block b
+        k::nvfp4::quantize_block(&vals, &mut w[off..off + 9]);
+    }
+    let Some(wb) = ck::CudaDeviceBuffer::from_host(stream, &w) else {
+        cu_emit("fp4:atom0_sweep", "KERNEL_ERR", "w-alloc");
+        return;
+    };
+    // Recover a K-index from a measured W value (nearest wval over all 64).
+    let recover = |v: f32| -> i32 {
+        let mut best = -1i32;
+        let mut bd = f32::MAX;
+        for k in 0..kd {
+            let d = (wval(k) - v).abs();
+            if d < bd {
+                bd = d;
+                best = k as i32;
+            }
+        }
+        if bd < 0.05 {
+            best
+        } else {
+            -1
+        }
+    };
+    let mut map = vec![-1i32; kd];
+    for j in 0..kd {
+        let mut x = vec![0f32; n * kd];
+        for ni in 0..n {
+            x[ni * kd + j] = 6.0;
+        }
+        let (Some(xb), Some(mut ob)) = (
+            cu_upload_f32(stream, &x),
+            ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+        ) else {
+            cu_emit("fp4:atom0_sweep", "KERNEL_ERR", "xo-alloc");
+            return;
+        };
+        // SAFETY: live device buffers on `stream`.
+        let res = unsafe {
+            ck::gemm_fp4_tc_f32(
+                ck::CudaFp4TcKind::Nvfp4,
+                stream,
+                wb.as_ptr(),
+                xb.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                m,
+                n,
+                kd,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit("fp4:atom0_sweep", "KERNEL_ERR", &format!("j={j}: {e}"));
+            return;
+        }
+        map[j] = recover(cu_download_f32(&ob, n * m)[0] / 6.0);
+    }
+    let ident = (0..kd).all(|j| map[j] == j as i32);
+    cu_emit(
+        "fp4:atom0_sweep",
+        if ident { "OK" } else { "MISCOMPUTE" },
+        &format!("B-K → A-K (64): {map:?} — {}", if ident { "identity" } else { "PERMUTED" }),
+    );
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -7314,6 +7396,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             fp4_rowcol_probe(&stream);
             fp4_kpair_probe(&stream);
             fp4_atom_probe(&stream);
+            fp4_atom0_sweep(&stream);
         }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
