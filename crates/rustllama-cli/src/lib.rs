@@ -11547,6 +11547,7 @@ fn bench(
     let mut decode_tps = Vec::with_capacity(repeats as usize);
     let mut wall_ms = Vec::with_capacity(repeats as usize);
 
+    rustllama_kernels_cuda::phase_prof::reset(); // RUSTLLAMA_PHASE_PROFILE accounting
     for r in 0..repeats {
         cpu.clear_prefix_cache();
         let t = std::time::Instant::now();
@@ -11588,6 +11589,14 @@ fn bench(
     stats("prefill", prefill_ms, "ms");
     stats("decode", decode_tps, "tok/s");
     stats("wall", wall_ms, "ms");
+    // Phase profiler (RUSTLLAMA_PHASE_PROFILE=1): per-call matvec H2D/kernel/D2H
+    // split, batched=prefill GEMM vs single=decode matvec — localizes the
+    // host-in/host-out transfer overhead vs actual compute.
+    let phase = rustllama_kernels_cuda::phase_prof::dump();
+    if !phase.is_empty() {
+        println!();
+        println!("{phase}");
+    }
     // MoE tiered-expert engine: how many matvecs ran against a promoted
     // (device-resident) expert during the bench. Non-zero confirms the
     // (auto-enabled) device tier actually engaged (vs silently falling back);

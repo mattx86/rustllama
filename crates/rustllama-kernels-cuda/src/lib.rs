@@ -1730,6 +1730,74 @@ pub fn delta_net_chunk_f32(
 }
 
 // ============================================================
+// Phase profiler (env `RUSTLLAMA_PHASE_PROFILE=1`): host-side wall-time split of
+// the matvec ladder into H2D(x) / kernel / D2H(out), keyed by `single` (decode
+// single-row matvec) vs `batched` (prefill GEMM). This localizes the host-in/
+// host-out overhead — whether forward time is transfers vs compute. Disabled =
+// one relaxed-atomic bool load, no timing. Reported as us/call by `model bench`.
+// ============================================================
+pub mod phase_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    pub fn enabled() -> bool {
+        *EN.get_or_init(|| std::env::var("RUSTLLAMA_PHASE_PROFILE").is_ok())
+    }
+    static S_H2D: AtomicU64 = AtomicU64::new(0);
+    static S_KER: AtomicU64 = AtomicU64::new(0);
+    static S_D2H: AtomicU64 = AtomicU64::new(0);
+    static S_CALLS: AtomicU64 = AtomicU64::new(0);
+    static B_H2D: AtomicU64 = AtomicU64::new(0);
+    static B_KER: AtomicU64 = AtomicU64::new(0);
+    static B_D2H: AtomicU64 = AtomicU64::new(0);
+    static B_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Record one decode (single-row) matvec's H2D/kernel/D2H nanoseconds.
+    pub fn add_single(h2d: u64, ker: u64, d2h: u64) {
+        S_H2D.fetch_add(h2d, Ordering::Relaxed);
+        S_KER.fetch_add(ker, Ordering::Relaxed);
+        S_D2H.fetch_add(d2h, Ordering::Relaxed);
+        S_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one prefill (batched) GEMM's H2D/kernel/D2H nanoseconds.
+    pub fn add_batched(h2d: u64, ker: u64, d2h: u64) {
+        B_H2D.fetch_add(h2d, Ordering::Relaxed);
+        B_KER.fetch_add(ker, Ordering::Relaxed);
+        B_D2H.fetch_add(d2h, Ordering::Relaxed);
+        B_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn reset() {
+        for c in [&S_H2D, &S_KER, &S_D2H, &S_CALLS, &B_H2D, &B_KER, &B_D2H, &B_CALLS] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+    /// Formatted us-per-call breakdown (empty string if nothing recorded).
+    pub fn dump() -> String {
+        let ld = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let (sc, bc) = (ld(&S_CALLS), ld(&B_CALLS));
+        if sc == 0 && bc == 0 {
+            return String::new();
+        }
+        let per = |n: u64, calls: u64| if calls > 0 { n as f64 / 1e3 / calls as f64 } else { 0.0 };
+        let mut s = String::from("[phase] matvec H2D / kernel / D2H, us per call:\n");
+        if bc > 0 {
+            s += &format!(
+                "  prefill(batched): calls={bc} h2d={:.1} kernel={:.1} d2h={:.1} total={:.1}\n",
+                per(ld(&B_H2D), bc), per(ld(&B_KER), bc), per(ld(&B_D2H), bc),
+                per(ld(&B_H2D) + ld(&B_KER) + ld(&B_D2H), bc)
+            );
+        }
+        if sc > 0 {
+            s += &format!(
+                "  decode(single):   calls={sc} h2d={:.1} kernel={:.1} d2h={:.1} total={:.1}",
+                per(ld(&S_H2D), sc), per(ld(&S_KER), sc), per(ld(&S_D2H), sc),
+                per(ld(&S_H2D) + ld(&S_KER) + ld(&S_D2H), sc)
+            );
+        }
+        s
+    }
+}
+
+// ============================================================
 // Device-resident path (streams + device buffers + packed kernels)
 // ============================================================
 
@@ -4958,13 +5026,17 @@ impl CudaMatvecCache {
         {
             return false;
         }
+        let prof = phase_prof::enabled();
         let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let t_h2d = prof.then(std::time::Instant::now);
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
+        let h2d_ns = t_h2d.map_or(0, |t| t.elapsed().as_nanos() as u64);
         let w_ptr = self.weights[&weight_key].ptr;
         let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
         let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        let t_ker = prof.then(std::time::Instant::now);
         // SAFETY: w/x/out are live device buffers on `self.stream` sized
         // for (M,K); the wrapper synchronizes before returning.
         let res = unsafe {
@@ -5052,9 +5124,18 @@ impl CudaMatvecCache {
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+        }
+        let ker_ns = t_ker.map_or(0, |t| t.elapsed().as_nanos() as u64);
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
-        self.out_scratch.as_ref().unwrap().download(out_bytes)
+        let t_d2h = prof.then(std::time::Instant::now);
+        let ok = self.out_scratch.as_ref().unwrap().download(out_bytes);
+        if prof {
+            phase_prof::add_single(h2d_ns, ker_ns, t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64));
+        }
+        ok
     }
 
     /// B2 (Kindi rmsfold): device-resident folded Q/K/V projection — the
@@ -7492,14 +7573,18 @@ impl CudaMatvecCache {
         {
             return false;
         }
+        let prof = phase_prof::enabled();
         let x_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        let t_h2d = prof.then(std::time::Instant::now);
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
+        let h2d_ns = t_h2d.map_or(0, |t| t.elapsed().as_nanos() as u64);
         let w_ptr = self.weights[&weight_key].ptr;
         let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
         let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        let t_ker = prof.then(std::time::Instant::now);
         // SAFETY: as `matvec_packed`, with x/out sized for N rows.
         let res = unsafe {
             match kind {
@@ -7586,9 +7671,18 @@ impl CudaMatvecCache {
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }
+        if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+        }
+        let ker_ns = t_ker.map_or(0, |t| t.elapsed().as_nanos() as u64);
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
-        self.out_scratch.as_ref().unwrap().download(out_bytes)
+        let t_d2h = prof.then(std::time::Instant::now);
+        let ok = self.out_scratch.as_ref().unwrap().download(out_bytes);
+        if prof {
+            phase_prof::add_batched(h2d_ns, ker_ns, t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64));
+        }
+        ok
     }
 
     /// Device-resident batched packed matvec — the prefill-path analogue of
