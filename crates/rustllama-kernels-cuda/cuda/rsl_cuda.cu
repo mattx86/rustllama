@@ -4305,7 +4305,11 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
     // once (per-process).
     static int bq = -1;
     if (bq < 0) {
-        bq = 16;
+        // 32 won the on-device sweep (Qwen3-0.6B, MIG slice): lowest profiler
+        // attn= share (reads scale as n_new^2/BQ). The gain over the old BQ=4 is
+        // modest (~1.47x attn) because the attention is now COMPUTE-bound on the
+        // per-position online-softmax (shuffle-reduce + expf), not read-bound.
+        bq = 32;
         const char *e = getenv("RUSTLLAMA_FLASH_BQ");
         if (e) {
             int v = atoi(e);
