@@ -5540,6 +5540,74 @@ fn fp4_atom0_sweep(stream: &ck::CudaStream) {
     );
 }
 
+/// On-device diagnostic (same env gate): MXFP4 scale_vec::2X scale-byte → 32-block
+/// mapping (the suspect for mxfp4's 0.968 residual after the A-swap fix; mxfp4
+/// packs its 2 E8M0 scale bytes at register bytes 0,1 but 2X may want 0,2 on the
+/// per-16 byte grid). Weight 32-block b = 6·8^b (block0 scale 1, block1 scale 8 —
+/// both E8M0-exact and well separated), activation delta swept over K: out[0,0] =
+/// W[0, paired]·6 = 36·8^(block of paired). So out=36 ⇒ scale-1 (block0) applied,
+/// out=288 ⇒ scale-8 (block1). For K0-31 expect 36, K32-63 expect 288; anything
+/// else reveals the 2X byte misplacement (e.g. block1 reading a zero byte ⇒ 0/36).
+fn fp4_mxfp4_scale_probe(stream: &ck::CudaStream) {
+    let (m, n, kd) = (16usize, 8usize, 64usize);
+    let blk = 32usize;
+    let nblk = kd / blk; // 2
+    let bytes = 17; // MXFP4_BLOCK_BYTES
+    let mut w = vec![0u8; m * nblk * bytes];
+    for r in 0..m {
+        for b in 0..nblk {
+            let v = 6.0f32 * (8f32).powi(b as i32); // block0=6 (scale1), block1=48 (scale8)
+            let off = (r * nblk + b) * bytes;
+            k::mxfp_kv::quantize_block_mxfp4(&vec![v; 32], &mut w[off..off + bytes]);
+        }
+    }
+    let Some(wb) = ck::CudaDeviceBuffer::from_host(stream, &w) else {
+        cu_emit("fp4:mxfp4_scale", "KERNEL_ERR", "w-alloc");
+        return;
+    };
+    let mut got = Vec::new();
+    for &j in &[0usize, 16, 31, 32, 48, 63] {
+        let mut x = vec![0f32; n * kd];
+        for ni in 0..n {
+            x[ni * kd + j] = 6.0;
+        }
+        let (Some(xb), Some(mut ob)) = (
+            cu_upload_f32(stream, &x),
+            ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+        ) else {
+            cu_emit("fp4:mxfp4_scale", "KERNEL_ERR", "xo-alloc");
+            return;
+        };
+        // SAFETY: live device buffers on `stream`.
+        let res = unsafe {
+            ck::gemm_fp4_tc_f32(
+                ck::CudaFp4TcKind::Mxfp4,
+                stream,
+                wb.as_ptr(),
+                xb.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                m,
+                n,
+                kd,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit("fp4:mxfp4_scale", "KERNEL_ERR", &format!("j={j}: {e}"));
+            return;
+        }
+        got.push((j, cu_download_f32(&ob, n * m)[0]));
+    }
+    // Expect out=36 for K<32, out=288 for K>=32.
+    let ok = got
+        .iter()
+        .all(|&(j, v)| (v - if j < 32 { 36.0 } else { 288.0 }).abs() < 1.0);
+    cu_emit(
+        "fp4:mxfp4_scale",
+        if ok { "OK" } else { "MISCOMPUTE" },
+        &format!("(K,out) = {got:?} (expect 36 for K<32, 288 for K>=32)"),
+    );
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -7397,6 +7465,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             fp4_kpair_probe(&stream);
             fp4_atom_probe(&stream);
             fp4_atom0_sweep(&stream);
+            fp4_mxfp4_scale_probe(&stream);
         }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
