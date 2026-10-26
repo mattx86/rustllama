@@ -296,10 +296,15 @@ __global__ void rsl_bw_gemm_nvfp4_kernel(
 
         // ---- A fragment (weights, 4 regs) ----
         unsigned a[4];
-        a[0] = rsl_pack_a_nvfp4(w, rowA0, M, k0 + q * 8, K);
-        a[1] = rsl_pack_a_nvfp4(w, rowA0, M, k0 + 32 + q * 8, K);
-        a[2] = rsl_pack_a_nvfp4(w, rowA1, M, k0 + q * 8, K);
-        a[3] = rsl_pack_a_nvfp4(w, rowA1, M, k0 + 32 + q * 8, K);
+        // A-fragment register order is [rowG lowK, rowG+8 lowK, rowG highK,
+        // rowG+8 highK] — NOT [rowG low, rowG high, rowG+8 low, rowG+8 high].
+        // (The on-device atom0_sweep showed the high-K half → 0 for a single
+        // populated row: the reg that must carry rowG's K32-63 was holding
+        // rowG+8's data. The mxfp8/mxfp6 kernels already use this order.)
+        a[0] = rsl_pack_a_nvfp4(w, rowA0, M, k0 + q * 8, K);        // rowG,   K[q*8 ..]
+        a[1] = rsl_pack_a_nvfp4(w, rowA1, M, k0 + q * 8, K);        // rowG+8, K[q*8 ..]
+        a[2] = rsl_pack_a_nvfp4(w, rowA0, M, k0 + 32 + q * 8, K);   // rowG,   K[32+q*8 ..]
+        a[3] = rsl_pack_a_nvfp4(w, rowA1, M, k0 + 32 + q * 8, K);   // rowG+8, K[32+q*8 ..]
         // SFA (sm_120 block-scale layout, scale_vec::4X): with thread-id-a=0
         // (the {0,0} selector in rsl_bw_mma_nvfp4), the 2 bottom lanes of each
         // quad (q=0,1) each supply ONE output row's 4 K-block E4M3 scales —
@@ -435,10 +440,13 @@ __global__ void rsl_bw_gemm_mxfp4_kernel(
         __syncwarp();
 
         unsigned a[4];
-        a[0] = rsl_pack_a_mxfp4(w, rowA0, M, k0 + q * 8, K);
-        a[1] = rsl_pack_a_mxfp4(w, rowA0, M, k0 + 32 + q * 8, K);
-        a[2] = rsl_pack_a_mxfp4(w, rowA1, M, k0 + q * 8, K);
-        a[3] = rsl_pack_a_mxfp4(w, rowA1, M, k0 + 32 + q * 8, K);
+        // A-fragment register order (see the nvfp4 kernel): [rowG lowK, rowG+8
+        // lowK, rowG highK, rowG+8 highK]. a[1]/a[2] were swapped before the
+        // atom0_sweep localized the high-K half dropping to zero.
+        a[0] = rsl_pack_a_mxfp4(w, rowA0, M, k0 + q * 8, K);        // rowG,   K[q*8 ..]
+        a[1] = rsl_pack_a_mxfp4(w, rowA1, M, k0 + q * 8, K);        // rowG+8, K[q*8 ..]
+        a[2] = rsl_pack_a_mxfp4(w, rowA0, M, k0 + 32 + q * 8, K);   // rowG,   K[32+q*8 ..]
+        a[3] = rsl_pack_a_mxfp4(w, rowA1, M, k0 + 32 + q * 8, K);   // rowG+8, K[32+q*8 ..]
         // SFA: 2 MXFP4 (per-32) block E8M0 scales over K=64 (scale_vec::2X).
         // sm_120 layout: q=0 -> rowA0, q=1 -> rowA1 (see the NVFP4 kernel note).
         unsigned sfa = 0u;
@@ -741,8 +749,10 @@ __global__ void rsl_bw_gemm_nvfp4_tma_kernel(
         rsl_bw_mbar_wait(mb, phase); phase ^= 1;
         __syncwarp();
         unsigned a[4];
-        a[0] = rsl_pack_a_nvfp4(w, rA0, M, k0 + q * 8, K); a[1] = rsl_pack_a_nvfp4(w, rA0, M, k0 + 32 + q * 8, K);
-        a[2] = rsl_pack_a_nvfp4(w, rA1, M, k0 + q * 8, K); a[3] = rsl_pack_a_nvfp4(w, rA1, M, k0 + 32 + q * 8, K);
+        // A-reg order [rowG low, rowG+8 low, rowG high, rowG+8 high] (see the
+        // non-TMA nvfp4 kernel): a[1]/a[2] swapped from the old wrong order.
+        a[0] = rsl_pack_a_nvfp4(w, rA0, M, k0 + q * 8, K); a[1] = rsl_pack_a_nvfp4(w, rA1, M, k0 + q * 8, K);
+        a[2] = rsl_pack_a_nvfp4(w, rA0, M, k0 + 32 + q * 8, K); a[3] = rsl_pack_a_nvfp4(w, rA1, M, k0 + 32 + q * 8, K);
         unsigned sfa = 0u;
         if (rA0 < M) {
             #pragma unroll
