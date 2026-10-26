@@ -15,7 +15,9 @@
 #include "rsl_cuda.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <mma.h> // nvcuda::wmma — int8 tensor-core GEMM (W8A8), sm_72+
+#include <mma.h>           // nvcuda::wmma — int8 tensor-core GEMM (W8A8), sm_72+
+#include <cuda_pipeline.h> // cp.async (__pipeline_memcpy_async) — sm_80+; a synchronous
+                           // copy on older arches (sm_75), so safe across the arch list
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -2093,6 +2095,72 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 2)
     }
 }
 
+// cp.async staging for the 128x128 GEMM: the weight (REPACK, int4-aligned) + the
+// activation (int4-aligned) loads go through __pipeline_memcpy_async (async
+// global→shared on sm_80+, a sync copy on sm_75) so the DRAM latency overlaps the
+// MMA WITHOUT needing high occupancy — the fix for the register-blocked 128x128
+// being latency-bound at 1 block/SM. The small f32 scales stay sync (needed before
+// the fold). The caller issues __pipeline_commit() after this. OOB rows sync-zero
+// (can't cp.async a constant). Non-REPACK weights (34-byte, unaligned) byte-stage
+// sync (no cp.async); the launcher only uses the 128 kernel on the repacked path.
+template <bool REPACK, int BM, int BN, int KT>
+__device__ __forceinline__ void rsl_gemm_q8_0_stage_tile_cpasync(
+    int gt, int spr, int M, int N, int K, int rowBase, int tokBase, int tid, int nthreads,
+    const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
+    const unsigned short *__restrict__ wd, const signed char *__restrict__ xq,
+    const float *__restrict__ xs, signed char *As_b, signed char *Bs_b, float *dw_b,
+    float *xscl_b) {
+    const int KW = KT * 32;
+    const int nsub = (spr - gt < KT) ? (spr - gt) : KT;
+    for (int e = tid; e < BM * KT; e += nthreads) {
+        int rl = e / KT, sub = e % KT, mg = rowBase + rl;
+        float d = 0.0f;
+        if (mg < M && sub < nsub) {
+            unsigned short db;
+            if constexpr (REPACK)
+                db = wd[(size_t)mg * spr + (gt + sub)];
+            else {
+                const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
+                db = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+            }
+            d = rsl_f16_bits_to_f32(db);
+        }
+        dw_b[rl * KT + sub] = d;
+    }
+    for (int e = tid; e < BN * KT; e += nthreads) {
+        int tl = e / KT, sub = e % KT, ng = tokBase + tl;
+        xscl_b[tl * KT + sub] = (ng < N && sub < nsub) ? xs[(size_t)ng * spr + (gt + sub)] : 0.0f;
+    }
+    if constexpr (REPACK) {
+        for (int e = tid; e < BM * (KW / 16); e += nthreads) {
+            int rl = e / (KW / 16), kk = (e % (KW / 16)) * 16, sub = kk >> 5, mg = rowBase + rl;
+            if (mg < M && sub < nsub)
+                __pipeline_memcpy_async(As_b + rl * KW + kk,
+                                        &wq[(size_t)mg * K + (size_t)gt * 32 + kk], 16);
+            else
+                *reinterpret_cast<int4 *>(As_b + rl * KW + kk) = make_int4(0, 0, 0, 0);
+        }
+    } else {
+        for (int e = tid; e < BM * KW; e += nthreads) {
+            int rl = e / KW, kk = e % KW, sub = kk >> 5, kloc = kk & 31, mg = rowBase + rl;
+            signed char ww = 0;
+            if (mg < M && sub < nsub) {
+                const unsigned char *blk = w + ((size_t)mg * spr + (gt + sub)) * 34;
+                ww = (signed char)blk[2 + kloc];
+            }
+            As_b[rl * KW + kk] = ww;
+        }
+    }
+    for (int e = tid; e < BN * (KW / 16); e += nthreads) {
+        int tl = e / (KW / 16), kk = (e % (KW / 16)) * 16, sub = kk >> 5, ng = tokBase + tl;
+        if (ng < N && sub < nsub)
+            __pipeline_memcpy_async(Bs_b + tl * KW + kk,
+                                    &xq[(size_t)ng * K + (size_t)gt * 32 + kk], 16);
+        else
+            *reinterpret_cast<int4 *>(Bs_b + tl * KW + kk) = make_int4(0, 0, 0, 0);
+    }
+}
+
 // 128x128 register-blocked variant of gemm_q8_0_w8a8_tc_kernel. The roofline
 // (RUSTLLAMA_GEMM_ROOFLINE) measured the 64x64 kernel DRAM-BANDWIDTH-BOUND at 85%
 // peak, moving ~5.75x the minimum data because the 64x64 tile re-reads the weight
@@ -2134,20 +2202,26 @@ __global__ void __launch_bounds__(512, 2) gemm_q8_0_w8a8_tc_128_kernel(
         for (int c = 0; c < 8; ++c) cacc[f][c] = 0.0f;
 
     const int nTiles = spr; // KT=1 → one 32-wide sub-block per tile
-    rsl_gemm_q8_0_stage_tile<REPACK, BM, BN, KT>(0, spr, M, N, K, rowBase, tokBase, tid, nthreads,
-                                                 w, wq, wd, xq, xs, &As[0][0][0], &Bs[0][0][0],
-                                                 &dw[0][0][0], &xscl[0][0][0]);
-    __syncthreads();
+    // cp.async double-buffer: stage tile 0 (async), commit, then each iteration
+    // issues tile t+1's async loads and waits for tile t's group — the DRAM latency
+    // overlaps the MMA without needing high occupancy.
+    rsl_gemm_q8_0_stage_tile_cpasync<REPACK, BM, BN, KT>(0, spr, M, N, K, rowBase, tokBase, tid,
+                                                         nthreads, w, wq, wd, xq, xs, &As[0][0][0],
+                                                         &Bs[0][0][0], &dw[0][0][0], &xscl[0][0][0]);
+    __pipeline_commit();
 
     for (int t = 0; t < nTiles; ++t) {
         const int cur = t & 1;
         if (t + 1 < nTiles) {
             const int nxt = cur ^ 1;
-            rsl_gemm_q8_0_stage_tile<REPACK, BM, BN, KT>((t + 1) * KT, spr, M, N, K, rowBase,
-                                                         tokBase, tid, nthreads, w, wq, wd, xq, xs,
-                                                         &As[nxt][0][0], &Bs[nxt][0][0],
-                                                         &dw[nxt][0][0], &xscl[nxt][0][0]);
+            rsl_gemm_q8_0_stage_tile_cpasync<REPACK, BM, BN, KT>(
+                (t + 1) * KT, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, wq, wd, xq, xs,
+                &As[nxt][0][0], &Bs[nxt][0][0], &dw[nxt][0][0], &xscl[nxt][0][0]);
+            __pipeline_commit();
         }
+        // Wait for tile t's group (keep tile t+1's in flight if it was issued).
+        __pipeline_wait_prior((t + 1 < nTiles) ? 1 : 0);
+        __syncthreads();
         const int sub = 0; // KT=1
 #pragma unroll
         for (int fi = 0; fi < 4; ++fi) {
