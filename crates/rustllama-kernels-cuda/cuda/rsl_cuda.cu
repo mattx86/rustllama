@@ -2488,6 +2488,30 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                     fa.numRegs, fa.sharedSizeBytes, fa.maxThreadsPerBlock, nsm, maxThreadsSM,
                     maxSharedSM, threads, active, occ * 100.0, grid.x, grid.y, M, N, K);
             }
+            // 128x128 cp.async kernel — the occupancy-vs-SPILL answer: regs/thread,
+            // static shared/block, activeBlocks/SM (occupancy), and localSizeBytes
+            // (>0 = REGISTER SPILL to local memory). If activeBlocks/SM==1 AND
+            // localSize==0 → pure occupancy (the Cs-elimination 16KB→2 blocks/SM fix
+            // is worth it); if localSize>0 → cacc[4][8] spilled (the tile is too big
+            // for the reg budget = dead end on this slice without a smaller tile).
+            cudaFuncAttributes fa2;
+            if (cudaFuncGetAttributes(&fa2, gemm_q8_0_w8a8_tc_128_kernel<true>) == cudaSuccess) {
+                int nsm2 = 0, maxThreadsSM2 = 0, active2 = 0;
+                cudaDeviceGetAttribute(&nsm2, cudaDevAttrMultiProcessorCount, s->device);
+                cudaDeviceGetAttribute(&maxThreadsSM2, cudaDevAttrMaxThreadsPerMultiProcessor,
+                                       s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active2, gemm_q8_0_w8a8_tc_128_kernel<true>, 512, 0);
+                double occ2 =
+                    maxThreadsSM2 > 0 ? (double)(active2 * 512) / (double)maxThreadsSM2 : 0.0;
+                std::fprintf(stderr,
+                             "[gemm-diag] q8_0_w8a8_tc_128 (cp.async, reg-blocked): "
+                             "regs/thread=%d LOCAL(spill)=%zu B static_smem=%zu B/block | "
+                             "block=512thr activeBlocks/SM=%d -> occupancy=%.0f%%  "
+                             "(localSize>0 => SPILL; activeBlocks==1 & no spill => pure occupancy)\n",
+                             fa2.numRegs, fa2.localSizeBytes, fa2.sharedSizeBytes, active2,
+                             occ2 * 100.0);
+            }
         }
     }
     // In-kernel cycle profiler (opt-in: RUSTLLAMA_GEMM_CYCLES=1). Launch the PROF
