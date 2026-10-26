@@ -5669,6 +5669,56 @@ fn fp4_sp24_row_probe(stream: &ck::CudaStream) {
     );
 }
 
+/// On-device diagnostic (same env gate): map sp24's compressed-A thread→row
+/// layout by lighting ONE weight row at a time. The all-rows probe showed
+/// out[g]=weight-row(g+4) + the high half duplicating the low half — ambiguous.
+/// Here, for each weight row R, set ONLY row R nonzero ([6,6,0,0]/group → prunes
+/// to 2·6), activation uniform 1.0, and record which OUTPUT rows light up
+/// (out≈32·6=192). That gives the exact weight-row R → output-row(s) map with no
+/// cross-row ambiguity → the compressed-A register-row fix.
+fn fp4_sp24_rowmap_probe(stream: &ck::CudaStream) {
+    let (m, n, kd) = (16usize, 8usize, 64usize);
+    let mut lines = String::new();
+    for rr in 0..m {
+        let mut w = vec![0u8; m * kd];
+        for g in 0..(kd / 4) {
+            let base = rr * kd + g * 4;
+            w[base] = k::nvfp4::f32_to_e4m3(6.0);
+            w[base + 1] = k::nvfp4::f32_to_e4m3(6.0);
+        }
+        let x = vec![1.0f32; n * kd];
+        let (Some(wb), Some(xb), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(stream, &w),
+            cu_upload_f32(stream, &x),
+            ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+        ) else {
+            cu_emit("fp4:sp24_rowmap", "KERNEL_ERR", "alloc");
+            return;
+        };
+        // SAFETY: live device buffers on `stream`.
+        let res = unsafe {
+            ck::gemm_fp8_sp24_f32(
+                stream,
+                wb.as_ptr() as *const std::ffi::c_void,
+                xb.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                m,
+                n,
+                kd,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit("fp4:sp24_rowmap", "KERNEL_ERR", &format!("R={rr}: {e}"));
+            return;
+        }
+        let out = cu_download_f32(&ob, n * m);
+        // Which output rows (col 0) lit up (|out|>1)?
+        let lit: Vec<usize> = (0..m).filter(|&p| out[p].abs() > 1.0).collect();
+        lines.push_str(&format!("wR{rr}->outrows{lit:?} "));
+    }
+    cu_emit("fp4:sp24_rowmap", "INFO", &lines);
+}
+
 /// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
 fn ck_e4m3(b: u8) -> f32 {
     k::nvfp4::e4m3_to_f32(b)
@@ -7528,6 +7578,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             fp4_atom0_sweep(&stream);
             fp4_mxfp4_scale_probe(&stream);
             fp4_sp24_row_probe(&stream);
+            fp4_sp24_rowmap_probe(&stream);
         }
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
                                                        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
