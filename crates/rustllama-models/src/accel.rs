@@ -11033,6 +11033,34 @@ pub fn dev_attn_graph_hits() -> u64 {
     DEV_ATTN_GRAPH_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// PREFILL device-resident-block force override (the prefill twin of
+/// [`DEV_ATTN_FORCE`]): -1 = verdict decides, 0 = force OFF, 1 = force ON. Set by
+/// the `tune --dev-prefill` A/B per arm. NOT a user knob (the env override in
+/// [`dev_prefill_enabled`] is the pod A/B lever instead).
+static DEV_PREFILL_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+/// Count of prefill batches where the device-resident prefill block actually ran
+/// (incremented per successful [`try_prefill_attn_block_cuda_f32`]). The A/B reads
+/// it to confirm the ON arm engaged; 0 ⇒ the path never fired.
+static DEV_PREFILL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Force the device-resident PREFILL path on/off for the current process (the
+/// `tune --dev-prefill` A/B harness only). `None` clears the override → the
+/// verdict (or the `RUSTLLAMA_DEV_PREFILL` env) decides.
+pub fn set_dev_prefill_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DEV_PREFILL_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many prefill batches have run through the device-resident prefill block so
+/// far (process-global). The A/B harness compares this before/after the ON arm.
+pub fn dev_prefill_hits() -> u64 {
+    DEV_PREFILL_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
 /// reserved below free VRAM when `load_inner` projects the expert-promotion
 /// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
@@ -11083,6 +11111,36 @@ fn dev_attn_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK))
+}
+
+/// Whether the device-resident PREFILL block is enabled — the prefill twin of
+/// [`dev_attn_enabled`]. Perf-gated on verdict
+/// [`VERDICT_PREFILL_DEV_RESIDENT_BLOCK`] (persisted by `tune --dev-prefill` only
+/// where it beat the host prefill path). `RUSTLLAMA_DEV_PREFILL=1` force-enables
+/// (the on-pod A/B lever before the verdict is banked); `=0` force-disables. The
+/// tuner per-arm force override wins over both. Fail-closed: unmeasured /
+/// not-a-win ⇒ off (the host prefill path runs). Correctness is validated
+/// separately (`doctor --cuda-parity prefill:dev_resident_block`), so the gate is
+/// purely perf.
+pub fn dev_prefill_enabled() -> bool {
+    // PP-2: off under a multi-device pipeline split — the block pins the
+    // activation slab on one device across the whole forward.
+    if pipeline_active() {
+        return false;
+    }
+    match DEV_PREFILL_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("RUSTLLAMA_DEV_PREFILL").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => kernel_verdict(rustllama_tuner::VERDICT_PREFILL_DEV_RESIDENT_BLOCK),
+        },
+    )
 }
 
 /// Whether the Feature-1b CUDA-graph attention block is enabled. **AUTOMATIC, no
@@ -11345,6 +11403,173 @@ pub fn try_decode_attn_block_cuda_f32(
         }
     }
     // (attention ran on device, dense FFN ran on device)
+    (ok, ok && ffn_requested)
+}
+
+/// Device-resident PREFILL block — the batched (n_new-row) twin of
+/// [`try_decode_attn_block_cuda_f32`]. Runs a whole dense layer (attention + the
+/// dense SwiGLU FFN) for `n_new` prefill tokens GPU-resident, deleting the
+/// per-GEMM H2D(x)/D2H(out) transfers that dominate prefill. Keeps the host F32
+/// KV cache coherent: on success it scatters the post-RoPE K/V (returned in
+/// `k_rows`/`v_rows`, token-major) into the layer's head-major host cache at
+/// `[kv_len_base, kv_len_base+n_new)`, so a following decode (or a fallback)
+/// reads a correct cache.
+///
+/// REQUIRES the full dense FFN to be device-dispatchable — if `dense_ffn` is
+/// `Some` but any of its weights can't map to a CUDA packed kind, it declines
+/// entirely (`(false, false)`) rather than running attention-only, so the caller
+/// can treat `true` as "the WHOLE layer ran on device" and skip its host body.
+/// Also declines on `has_qkv_bias`, a non-dispatchable attention weight, no
+/// CUDA, or the perf gate off. Fail-soft: the cache method leaves `hidden`
+/// untouched on any failure, so the caller re-runs the host layer from a
+/// coherent `hidden`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_prefill_attn_block_cuda_f32(
+    w_q: &Tensor,
+    w_k: &Tensor,
+    w_v: &Tensor,
+    w_o: &Tensor,
+    attn_norm: &[f32],
+    post_norm: &[f32],
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    has_qkv_bias: bool,
+    inv_freq: &[f32],
+    hidden: &mut [f32],  // [n_new * d_model]
+    h_norm2: &mut [f32], // [n_new * d_model] scratch
+    k_rows: &mut [f32],  // [n_new * d_kv] post-RoPE K (token-major)
+    v_rows: &mut [f32],  // [n_new * d_kv] post-RoPE V (token-major)
+    k_cache: &mut [f32], // layer's host head-major F32 K cache
+    v_cache: &mut [f32],
+    dense_ffn: Option<(&Tensor, &Tensor, &Tensor, usize)>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    max_ctx: usize,
+    n_layers: usize,
+    layer_idx: usize,
+    rms_eps: f32,
+    window: u32,
+    softcap: f32,
+    upload_hidden: bool,
+    download_hidden: bool,
+) -> (bool, bool) {
+    if !dev_prefill_enabled() || !cuda_active() || has_qkv_bias {
+        return (false, false);
+    }
+    let (Some(kq), Some(kk), Some(kv), Some(ko)) = (
+        dtype_to_cuda_kind(w_q.dtype),
+        dtype_to_cuda_kind(w_k.dtype),
+        dtype_to_cuda_kind(w_v.dtype),
+        dtype_to_cuda_kind(w_o.dtype),
+    ) else {
+        return (false, false);
+    };
+    let (qb, kb, vb, ob) = (
+        w_q.storage.as_bytes(),
+        w_k.storage.as_bytes(),
+        w_v.storage.as_bytes(),
+        w_o.storage.as_bytes(),
+    );
+    // Build the device dense-FFN arg; a non-dispatchable FFN weight ⇒ decline the
+    // whole layer (prefill is whole-layer-or-nothing — see the doc note).
+    let ffn_requested = dense_ffn.is_some();
+    let ffn_dev: Option<(
+        (ck::CudaPackedKind, usize, &[u8]),
+        (ck::CudaPackedKind, usize, &[u8]),
+        (ck::CudaPackedKind, usize, &[u8]),
+        usize,
+    )> = dense_ffn.and_then(|(wg, wu, wd, d_ff)| {
+        let kg = dtype_to_cuda_kind(wg.dtype)?;
+        let ku = dtype_to_cuda_kind(wu.dtype)?;
+        let kd = dtype_to_cuda_kind(wd.dtype)?;
+        let gb = wg.storage.as_bytes();
+        let ub = wu.storage.as_bytes();
+        let db = wd.storage.as_bytes();
+        Some((
+            (kg, gb.as_ptr() as usize, gb),
+            (ku, ub.as_ptr() as usize, ub),
+            (kd, db.as_ptr() as usize, db),
+            d_ff,
+        ))
+    });
+    if ffn_requested && ffn_dev.is_none() {
+        return (false, false);
+    }
+    let Some(cache) = cuda_cache() else {
+        return (false, false);
+    };
+    let Ok(mut g) = cache.lock() else {
+        return (false, false);
+    };
+    // Select the batched device-I/O GEMM path from the per-model prefill-GEMM
+    // verdicts — the SAME selection the host-in/host-out prefill path makes.
+    g.set_prefill_gemm(
+        q8_0_w8a8_tc_enabled(),
+        q8_0_gemm_f32_enabled(),
+        q4k_w8a8_tc_enabled(),
+        q4k_gemm_f32_enabled(),
+    );
+    // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
+    // dims (caller contract); the cache owns the stream + mirror.
+    let ok = unsafe {
+        g.prefill_attn_block_f32(
+            (kq, qb.as_ptr() as usize, qb),
+            (kk, kb.as_ptr() as usize, kb),
+            (kv, vb.as_ptr() as usize, vb),
+            (ko, ob.as_ptr() as usize, ob),
+            attn_norm,
+            post_norm,
+            q_norm,
+            k_norm,
+            inv_freq,
+            hidden,
+            h_norm2,
+            k_rows,
+            v_rows,
+            k_cache,
+            v_cache,
+            ffn_dev,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_model,
+            kv_len_base,
+            n_new,
+            max_ctx,
+            n_layers,
+            layer_idx,
+            rms_eps,
+            window as i32,
+            softcap,
+            upload_hidden,
+            download_hidden,
+        )
+    };
+    if ok {
+        // Scatter the post-RoPE K/V (token-major [n_new, n_kv_heads, head_dim])
+        // into the host head-major KV cache at [kv_len_base, kv_len_base+n_new),
+        // so the host cache matches what a later decode / fallback expects.
+        for i in 0..n_new {
+            for h in 0..n_kv_heads {
+                let dst = (h * max_ctx + kv_len_base + i) * head_dim;
+                let src = (i * n_kv_heads + h) * head_dim;
+                k_cache[dst..dst + head_dim].copy_from_slice(&k_rows[src..src + head_dim]);
+                v_cache[dst..dst + head_dim].copy_from_slice(&v_rows[src..src + head_dim]);
+            }
+        }
+        if DEV_PREFILL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                "device-resident PREFILL block ENGAGED — the whole dense layer \
+                 (attention + FFN) runs GPU-resident for the prefill batch, keeping \
+                 activations on device across every op (perf-gated verdict \
+                 prefill:dev_resident_block) (logged once)"
+            );
+        }
+    }
     (ok, ok && ffn_requested)
 }
 

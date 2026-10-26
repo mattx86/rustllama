@@ -244,6 +244,15 @@ pub const VERDICT_MATVEC_Q5_0_W8A8: &str = "matvec:q5_0_w8a8";
 /// configs where attention isn't the bottleneck, a win only on a dense model or
 /// a fully-fitting GPU). Read by `accel::dev_attn_enabled`; f32-KV-only at dispatch.
 pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK: &str = "attn:dev_resident_block";
+/// PREFILL twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] — the batched (n_new-row)
+/// device-resident prefill layer (attention + dense FFN) that keeps the
+/// activation slab on device across the whole forward (`prefill_attn_block_f32`),
+/// deleting the ~7-GEMMs-per-layer H2D(x)/D2H(out) transfers that measured ~63%
+/// of the batched prefill GEMM time (the dominant prefill bottleneck). Read by
+/// `accel::dev_prefill_enabled`; f32-KV-only + dense + no-qkv-bias at dispatch.
+/// PERF-gated (correctness via `doctor --cuda-parity prefill:dev_resident_block`)
+/// — fail-closed off; `RUSTLLAMA_DEV_PREFILL=1` force-enables for the on-pod A/B.
+pub const VERDICT_PREFILL_DEV_RESIDENT_BLOCK: &str = "prefill:dev_resident_block";
 /// GPU paged attention (Phase C): the CUDA block-table flash-decode kernel
 /// (`flash_attn_decode_paged_f32`) graded vs the CPU gather + flash-decode
 /// reference over pass / SWA / soft-cap. Read by `accel::dev_attn_paged_enabled`;

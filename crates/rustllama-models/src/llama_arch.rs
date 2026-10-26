@@ -17109,6 +17109,91 @@ impl LlamaModel {
             // path for layers past the `[inference].n_gpu_layers`
             // cutoff.
             crate::accel::set_current_layer_idx(layer_idx as u32);
+
+            // Device-resident PREFILL block (P1): run the WHOLE dense layer
+            // (attention + FFN) GPU-resident, keeping activations on device across
+            // every op so the ~7 batched GEMMs per layer stop paying an
+            // H2D(x)+D2H(out) each (the measured prefill transfer bottleneck).
+            // Per-layer drain (hidden uploaded + downloaded each layer) so a
+            // non-qualifying layer or any failure falls straight through to the
+            // host body below with a coherent host `hidden` — correct by
+            // construction, cross-layer residency is a follow-up. F32 KV + dense
+            // + no-bias + no-tree + no-rope-scaling only; every other case
+            // declines and runs the proven host path unchanged.
+            let dev_ran = 'dev: {
+                if moe_cfg.is_some()
+                    || tree.is_some()
+                    || self.yarn_mscale != 1.0
+                    || rope_interleaved_enabled()
+                    || !crate::accel::dev_prefill_enabled()
+                    || !crate::accel::cuda_active()
+                {
+                    // The device block's RoPE is neox half-split with
+                    // `self.rope_inv_freq` + no YaRN mscale, so it is exact only
+                    // for the non-interleaved, mscale==1 convention — matching the
+                    // decode step graph's gate. Everything else runs the host path.
+                    break 'dev false;
+                }
+                if !matches!(kv.layers[layer_idx], KvLayer::F32 { .. }) {
+                    break 'dev false;
+                }
+                let has_bias =
+                    block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some();
+                if has_bias {
+                    break 'dev false;
+                }
+                let dense_block = &self.weights.blocks[layer_idx];
+                let dense_ffn = Some((
+                    &dense_block.w_gate,
+                    &dense_block.w_up,
+                    &dense_block.w_down,
+                    d_ff,
+                ));
+                let window = cfg.swa_window(layer_idx) as u32;
+                let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+                let (kc, vc) = match &mut kv.layers[layer_idx] {
+                    KvLayer::F32 { k, v } => (&mut k[..], &mut v[..]),
+                    _ => break 'dev false,
+                };
+                let (ran, _ffn_dev) = crate::accel::try_prefill_attn_block_cuda_f32(
+                    block.w_q(),
+                    block.w_k(),
+                    block.w_v(),
+                    block.w_o(),
+                    block.attn_norm(),
+                    block.ffn_norm(),
+                    block.q_norm(),
+                    block.k_norm(),
+                    has_bias,
+                    &self.rope_inv_freq,
+                    &mut hidden,
+                    &mut h_norm,
+                    &mut k_buf,
+                    &mut v_buf,
+                    kc,
+                    vc,
+                    dense_ffn,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    d,
+                    kv_len_base,
+                    n_new,
+                    max_ctx,
+                    attn_views.len(),
+                    layer_idx,
+                    cfg.rms_eps,
+                    window,
+                    softcap,
+                    true, // upload hidden (per-layer drain)
+                    true, // download hidden
+                );
+                ran
+            };
+            if dev_ran {
+                continue;
+            }
+
             // ---- attention ----
             // Stage 1 (per-token): pre-attention rmsnorm. Cheap and
             // hard to batch across tokens cleanly, so it stays serial.

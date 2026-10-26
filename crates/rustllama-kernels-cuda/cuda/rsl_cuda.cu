@@ -3608,6 +3608,86 @@ extern "C" int rsl_cuda_rope_f32(rsl_cuda_stream *s, float *qk, int n_heads,
     return rsl_cuda_check("rsl_cuda_rope_f32");
 }
 
+// Batched RoPE for the device-resident PREFILL block: rotate n_rows rows, each
+// token-row `row` at its own absolute position `base_pos + row` (vs the single
+// `pos` of rsl_cuda_rope_f32). `qk` is [n_rows, n_heads, head_dim] (token-major,
+// the GEMM output layout); `inv_freq` is [head_dim/2]. One thread per (row,
+// head, j<half) — the per-row position is the only difference from the decode
+// kernel, so numerics match rope_f32 at n_rows=1, base_pos=pos.
+__global__ void rope_rows_f32_kernel(float *qk, int n_heads, int head_dim,
+                                     int base_pos, int n_rows,
+                                     const float *inv_freq) {
+    int half = head_dim / 2;
+    int per_row = n_heads * half;
+    long total = (long)n_rows * per_row;
+    long flat = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat >= total) return;
+    int row = (int)(flat / per_row);
+    int rem = (int)(flat % per_row);
+    int head = rem / half;
+    int j = rem % half;
+    float angle = (float)(base_pos + row) * inv_freq[j];
+    float c = cosf(angle), si = sinf(angle);
+    long base = ((long)row * n_heads + head) * head_dim;
+    float x0 = qk[base + j];
+    float x1 = qk[base + j + half];
+    qk[base + j] = x0 * c - x1 * si;
+    qk[base + j + half] = x0 * si + x1 * c;
+}
+
+extern "C" int rsl_cuda_rope_rows_f32(rsl_cuda_stream *s, float *qk, int n_heads,
+                                      int head_dim, int base_pos, int n_rows,
+                                      const float *inv_freq) {
+    if (!s || !qk || !inv_freq || n_heads <= 0 || head_dim <= 0 || n_rows <= 0 ||
+        base_pos < 0 || (head_dim % 2) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    long total = (long)n_rows * n_heads * (head_dim / 2);
+    int t = 128;
+    int b = (int)((total + t - 1) / t);
+    rope_rows_f32_kernel<<<b, t, 0, s->stream>>>(qk, n_heads, head_dim, base_pos,
+                                                 n_rows, inv_freq);
+    return rsl_cuda_check("rsl_cuda_rope_rows_f32");
+}
+
+// Scatter n_new post-RoPE K/V rows from the token-major activation layout
+// [n_new, n_kv_heads, head_dim] into the head-major KV mirror
+// [n_kv_heads, max_ctx, head_dim] at column `col_base`, so that
+// mirror[h, col_base + i, :] = src[i, h, :]. This is the device-resident PREFILL
+// analogue of the decode block's per-head d2d mirror write (which copies ONE
+// column); here one launch transposes + scatters all n_new columns. One thread
+// per element. The flash-prefill kernel then reads the mirror as its K/V cache.
+__global__ void kv_scatter_rows_f32_kernel(float *mirror, const float *src,
+                                           int n_new, int n_kv_heads,
+                                           int head_dim, int max_ctx,
+                                           int col_base) {
+    long total = (long)n_new * n_kv_heads * head_dim;
+    long flat = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat >= total) return;
+    int e = (int)(flat % head_dim);
+    long t2 = flat / head_dim;
+    int h = (int)(t2 % n_kv_heads);
+    int i = (int)(t2 / n_kv_heads);
+    long dst = ((long)h * max_ctx + col_base + i) * head_dim + e;
+    mirror[dst] = src[flat];
+}
+
+extern "C" int rsl_cuda_kv_scatter_rows_f32(rsl_cuda_stream *s, float *mirror,
+                                            const float *src, int n_new,
+                                            int n_kv_heads, int head_dim,
+                                            int max_ctx, int col_base) {
+    if (!s || !mirror || !src || n_new <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+        max_ctx <= 0 || col_base < 0 || col_base + n_new > max_ctx)
+        return -1;
+    cudaSetDevice(s->device);
+    long total = (long)n_new * n_kv_heads * head_dim;
+    int t = 256;
+    int b = (int)((total + t - 1) / t);
+    kv_scatter_rows_f32_kernel<<<b, t, 0, s->stream>>>(
+        mirror, src, n_new, n_kv_heads, head_dim, max_ctx, col_base);
+    return rsl_cuda_check("rsl_cuda_kv_scatter_rows_f32");
+}
+
 // Stream-based DEVICE-RESIDENT RMSNorm (no internal malloc/copy, unlike
 // rsl_cuda_rmsnorm_f32 which round-trips host arrays) — for the on-device
 // activation-residency decode path (#2). x/w/y are DEVICE pointers on the

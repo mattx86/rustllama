@@ -929,6 +929,27 @@ extern "C" {
         pos: c_int,
         inv_freq: *const f32,
     ) -> c_int;
+    // Device-resident PREFILL block: batched RoPE (per-row position base_pos+row)
+    // + head-major KV mirror scatter of n_new token-major rows.
+    fn rsl_cuda_rope_rows_f32(
+        s: *mut RslCudaStreamRaw,
+        qk: *mut f32,
+        n_heads: c_int,
+        head_dim: c_int,
+        base_pos: c_int,
+        n_rows: c_int,
+        inv_freq: *const f32,
+    ) -> c_int;
+    fn rsl_cuda_kv_scatter_rows_f32(
+        s: *mut RslCudaStreamRaw,
+        mirror: *mut f32,
+        src: *const f32,
+        n_new: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        col_base: c_int,
+    ) -> c_int;
     // Stream-based device-resident RMSNorm + Qwen3 per-head q/k RMSNorm (#2
     // activation residency): device pointers, no internal round-trip.
     fn rsl_cuda_rmsnorm_dev_f32(
@@ -1789,7 +1810,13 @@ pub mod phase_prof {
         if sc == 0 && bc == 0 && pg == 0 {
             return String::new();
         }
-        let per = |n: u64, calls: u64| if calls > 0 { n as f64 / 1e3 / calls as f64 } else { 0.0 };
+        let per = |n: u64, calls: u64| {
+            if calls > 0 {
+                n as f64 / 1e3 / calls as f64
+            } else {
+                0.0
+            }
+        };
         let mut s = String::from("[phase] matvec H2D / kernel / D2H, us per call:\n");
         if pg > 0 {
             s += &format!(
@@ -1801,14 +1828,18 @@ pub mod phase_prof {
         if bc > 0 {
             s += &format!(
                 "  prefill(batched): calls={bc} h2d={:.1} kernel={:.1} d2h={:.1} total={:.1}\n",
-                per(ld(&B_H2D), bc), per(ld(&B_KER), bc), per(ld(&B_D2H), bc),
+                per(ld(&B_H2D), bc),
+                per(ld(&B_KER), bc),
+                per(ld(&B_D2H), bc),
                 per(ld(&B_H2D) + ld(&B_KER) + ld(&B_D2H), bc)
             );
         }
         if sc > 0 {
             s += &format!(
                 "  decode(single):   calls={sc} h2d={:.1} kernel={:.1} d2h={:.1} total={:.1}",
-                per(ld(&S_H2D), sc), per(ld(&S_KER), sc), per(ld(&S_D2H), sc),
+                per(ld(&S_H2D), sc),
+                per(ld(&S_KER), sc),
+                per(ld(&S_D2H), sc),
                 per(ld(&S_H2D) + ld(&S_KER) + ld(&S_D2H), sc)
             );
         }
@@ -2793,6 +2824,74 @@ pub unsafe fn rope_f32(
         head_dim as c_int,
         pos as c_int,
         inv_freq,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Batched RoPE for the device-resident PREFILL block: rotate `n_rows` rows of
+/// `qk` = [n_rows, n_heads, head_dim], each row `r` at absolute position
+/// `base_pos + r`. Matches [`rope_f32`] numerics at `n_rows == 1`.
+///
+/// SAFETY: `qk` (≥ `n_rows*n_heads*head_dim`) + `inv_freq` (≥ `head_dim/2`) are
+/// device pointers on `stream`; `head_dim` even.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn rope_rows_f32(
+    stream: &CudaStream,
+    qk: *mut f32,
+    n_rows: usize,
+    n_heads: usize,
+    head_dim: usize,
+    base_pos: usize,
+    inv_freq: *const f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_rope_rows_f32(
+        stream.raw(),
+        qk,
+        n_heads as c_int,
+        head_dim as c_int,
+        base_pos as c_int,
+        n_rows as c_int,
+        inv_freq,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Scatter `n_new` post-RoPE K/V rows (token-major `[n_new, n_kv_heads,
+/// head_dim]`) into the head-major KV mirror `[n_kv_heads, max_ctx, head_dim]`
+/// at column `col_base` (`mirror[h, col_base+i, :] = src[i, h, :]`). The
+/// device-resident PREFILL analogue of the decode block's per-column d2d write.
+///
+/// SAFETY: `mirror` (≥ `n_kv_heads*max_ctx*head_dim`) + `src` (≥
+/// `n_new*n_kv_heads*head_dim`) are device pointers on `stream`; `col_base +
+/// n_new <= max_ctx`.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn kv_scatter_rows_f32(
+    stream: &CudaStream,
+    mirror: *mut f32,
+    src: *const f32,
+    n_new: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    col_base: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_kv_scatter_rows_f32(
+        stream.raw(),
+        mirror,
+        src,
+        n_new as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        col_base as c_int,
     );
     if rc == 0 {
         Ok(())
@@ -4629,6 +4728,21 @@ pub struct CudaMatvecCache {
     // the caller's `q4k_w4a8_enabled()` decision; forced OFF in the graph twin
     // (the W4A8 wrapper synchronizes, so it is not CUDA-graph-capturable).
     q4k_w4a8: bool,
+    // Device-resident PREFILL block (the batched prefill twin of the decode #2
+    // block). The caller sets these per-model from the prefill-GEMM verdicts
+    // before `prefill_attn_block_f32`, so the batched device-I/O GEMM selects the
+    // SAME fast kernel the host-in/host-out prefill path would (weight-reusing
+    // Q8_0/Q4_K GEMM). All false ⇒ the bit-exact per-kind batched matvec (still
+    // device-resident, just slower) — fail-safe default.
+    prefill_q8_0_w8a8_tc: bool,
+    prefill_q8_0_f32: bool,
+    prefill_q4_k_w8a8_tc: bool,
+    prefill_q4_k_f32: bool,
+    // Device-resident PREFILL activation slab (the batched analogue of
+    // `attn_act`): hidden|h_norm|q|k|v|attn_out|o|h_norm2[|gate|up|act], each
+    // ×n_new rows. Separate from the single-row `attn_act` so prefill and decode
+    // don't contend for one slab's size.
+    prefill_act: Option<RawDevBuf>,
     // AirLLM-style layer streaming: a bounded VRAM window that cycles whole
     // layers' weights through the cache (admit-by-evicting the COLDEST layer)
     // instead of declining once full. `stream_window_layers == 0` (the default)
@@ -4750,6 +4864,11 @@ impl CudaMatvecCache {
             attn_graph_exec: Vec::new(),
             step_graph_exec: None,
             q4k_w4a8: false,
+            prefill_q8_0_w8a8_tc: false,
+            prefill_q8_0_f32: false,
+            prefill_q4_k_w8a8_tc: false,
+            prefill_q4_k_f32: false,
+            prefill_act: None,
             stream_window_layers: 0,
             current_layer_tag: 0,
             tick: 0,
@@ -5152,7 +5271,11 @@ impl CudaMatvecCache {
         let t_d2h = prof.then(std::time::Instant::now);
         let ok = self.out_scratch.as_ref().unwrap().download(out_bytes);
         if prof {
-            phase_prof::add_single(h2d_ns, ker_ns, t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64));
+            phase_prof::add_single(
+                h2d_ns,
+                ker_ns,
+                t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64),
+            );
         }
         ok
     }
@@ -5769,6 +5892,159 @@ impl CudaMatvecCache {
         res.is_ok() && consume_error_count() == 0
     }
 
+    /// Set the device-resident PREFILL block's GEMM selection from the caller's
+    /// per-model verdicts (prefill-GEMM paths), so the batched device-I/O GEMM
+    /// picks the SAME fast kernel the host-in/host-out prefill path would. All
+    /// false ⇒ the bit-exact per-kind batched matvec.
+    pub fn set_prefill_gemm(
+        &mut self,
+        q8_0_w8a8_tc: bool,
+        q8_0_f32: bool,
+        q4_k_w8a8_tc: bool,
+        q4_k_f32: bool,
+    ) {
+        self.prefill_q8_0_w8a8_tc = q8_0_w8a8_tc;
+        self.prefill_q8_0_f32 = q8_0_f32;
+        self.prefill_q4_k_w8a8_tc = q4_k_w8a8_tc;
+        self.prefill_q4_k_f32 = q4_k_f32;
+    }
+
+    /// Batched device-I/O GEMM — the N-row analogue of
+    /// [`Self::matvec_packed_dev_io`] for the device-resident PREFILL block.
+    /// `x_dev` = `[n, k]`, `out_dev` = `[n, m]` are activation-slab device
+    /// pointers; nothing is uploaded or downloaded (that's the whole point — the
+    /// per-op H2D(x)/D2H(out) the host prefill path pays is what this removes).
+    /// Q8_0 / Q4_K route to the weight-reusing prefill GEMM when the caller
+    /// enabled its verdict via [`Self::set_prefill_gemm`]; every other format (and
+    /// the un-verdicted Q8_0/Q4_K) uses the bit-exact per-kind batched matvec.
+    /// Returns false on bad shape / unaligned K / a kernel failure.
+    ///
+    /// # Safety
+    /// `w_bytes` outlives the call; `x_dev` (≥ `n*k`) / `out_dev` (≥ `n*m`) are
+    /// live device pointers on this cache's stream.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matvec_packed_batched_dev_io(
+        &mut self,
+        kind: CudaPackedKind,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        if m == 0 || k == 0 || n == 0 || x_dev.is_null() || out_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_bytes.len() < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        // SAFETY: w is cached device memory of the right size; x_dev/out_dev are
+        // caller-guaranteed live device pointers on this stream. Same per-format
+        // kernels as the host-in/host-out `matvec_packed_batched` /
+        // `gemm_packed_batched_q8_0_*`, so bit-identical where they overlap.
+        let res = unsafe {
+            match kind {
+                CudaPackedKind::Q8_0 if self.prefill_q8_0_w8a8_tc && k % 32 == 0 => {
+                    gemm_q8_0_w8a8_tc(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q8_0 if self.prefill_q8_0_f32 && k % 32 == 0 => {
+                    gemm_q8_0_f32(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q4_K if self.prefill_q4_k_w8a8_tc && k % 256 == 0 => {
+                    gemm_q4_k_w8a8_tc(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q4_K if self.prefill_q4_k_f32 && k % 256 == 0 => {
+                    gemm_q4_k_f32(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+                CudaPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_dev, out_dev, m, k, n)
+                }
+            }
+        };
+        res.is_ok() && consume_error_count() == 0
+    }
+
     /// On-device activation-residency DECODE attention block (#2). Runs the whole
     /// attention block for one token on THIS cache's stream, keeping the
     /// activation resident on device across every op — so instead of ~5 H2D + ~5
@@ -6115,6 +6391,398 @@ impl CudaMatvecCache {
             if dense_ffn.is_none() {
                 let h2b: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4)
+                };
+                if !a.download_at(o_hn2 * 4, h2b) {
+                    return false;
+                }
+            }
+        }
+        consume_error_count() == 0
+    }
+
+    /// On-device activation-residency PREFILL block — the batched (n_new-row)
+    /// twin of [`Self::decode_attn_block_f32`]. Runs a whole dense layer
+    /// (attention + optional SwiGLU FFN) for `n_new` prefill tokens on THIS
+    /// cache's stream, keeping the activation slab resident on device across every
+    /// op. Instead of ~7 batched GEMMs each paying an H2D(x)+D2H(out) (the prefill
+    /// transfer bottleneck — measured ~63% of the batched GEMM time), there is one
+    /// hidden upload (layer 0) + one hidden download (last layer) + a small K/V
+    /// download for the host KV cache. Sequence per layer:
+    /// `rmsnorm→q/k/v=batched_dev_io→qk_head_norm→rope_rows→[dl k/v; mirror
+    /// scatter]→flash_prefill(q,mirror)→o=batched_dev_io→add_rmsnorm(hidden+=o)
+    /// →[gate/up→silu→down→hidden+=ffn_out]`.
+    ///
+    /// `hidden` is `[n_new, d_model]` (token-major). `k_rows_out`/`v_rows_out`
+    /// receive the post-RoPE K/V `[n_new, d_kv]` (token-major) so the caller
+    /// scatters them into its host head-major KV cache. The device KV mirror for
+    /// this layer holds `[0, kv_len_base + n_new)` after the call (the prefix is
+    /// seeded from the host cache when `kv_len_base > 0`), so a following decode
+    /// continues from it. F32 KV only; no qkv bias; same `(upload_hidden,
+    /// download_hidden)` cross-layer-residency contract as the decode block.
+    /// Returns false (caller runs the host prefill path, `hidden` untouched since
+    /// it is only written back on full success) on bad shape / a mirror gap / any
+    /// kernel failure. NOT bit-exact (device rmsnorm/attn parallel reduce + the
+    /// optional lossy W8A8 GEMM) — verdict + fallback gated by the caller.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::decode_attn_block_f32`]: weight byte-slices live
+    /// for the call, host buffers are sized to the dims, the cache owns the
+    /// stream + mirrors.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prefill_attn_block_f32(
+        &mut self,
+        wq: (CudaPackedKind, usize, &[u8]),
+        wk: (CudaPackedKind, usize, &[u8]),
+        wv: (CudaPackedKind, usize, &[u8]),
+        wo: (CudaPackedKind, usize, &[u8]),
+        attn_norm: &[f32],
+        post_norm: &[f32],
+        q_norm: Option<&[f32]>,
+        k_norm: Option<&[f32]>,
+        inv_freq: &[f32],
+        hidden: &mut [f32],     // [n_new * d_model]
+        h_norm2: &mut [f32],    // [n_new * d_model] (FFN input when host FFN)
+        k_rows_out: &mut [f32], // [n_new * d_kv] post-RoPE K (token-major)
+        v_rows_out: &mut [f32], // [n_new * d_kv] post-RoPE V (token-major)
+        k_cache: &[f32],        // host head-major KV cache (prefix seed; unused at base 0)
+        v_cache: &[f32],
+        dense_ffn: Option<(
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            usize,
+        )>,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        kv_len_base: usize,
+        n_new: usize,
+        max_ctx: usize,
+        n_layers: usize,
+        layer_idx: usize,
+        rms_eps: f32,
+        window: i32,
+        softcap: f32,
+        upload_hidden: bool,
+        download_hidden: bool,
+    ) -> bool {
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = dense_ffn.as_ref().map(|f| f.3).unwrap_or(0);
+        if n_new == 0
+            || hidden.len() != n_new * d_model
+            || h_norm2.len() != n_new * d_model
+            || k_rows_out.len() != n_new * d_kv
+            || v_rows_out.len() != n_new * d_kv
+            || attn_norm.len() != d_model
+            || post_norm.len() != d_model
+            || inv_freq.len() != head_dim / 2
+            || head_dim % 2 != 0
+            || layer_idx >= n_layers
+            || kv_len_base + n_new > max_ctx
+            || n_kv_heads == 0
+            || n_heads % n_kv_heads != 0
+        {
+            return false;
+        }
+        // Per-layer F32 KV mirror on this stream (shared with the decode block);
+        // rebuilt on a shape change.
+        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        if self.attn_mirror_ctx != mctx {
+            self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_valid_len = vec![0; n_layers];
+            self.attn_mirror_ctx = mctx;
+        }
+        // Seed the mirror prefix [valid, kv_len_base) from the host cache (a no-op
+        // for a fresh single-chunk prefill where kv_len_base == 0).
+        if (self.attn_valid_len[layer_idx] as usize) < kv_len_base
+            && !unsafe {
+                self.seed_attn_mirror_f32(
+                    layer_idx,
+                    k_cache,
+                    v_cache,
+                    kv_len_base,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    n_layers,
+                )
+            }
+        {
+            return false;
+        }
+        if (self.attn_valid_len[layer_idx] as usize) < kv_len_base {
+            return false; // mirror gap: caller falls back / seeds the history
+        }
+        // Prefill activation slab (×n_new): hidden|h_norm|q|k|v|attn_out|o|h_norm2
+        // [|gate|up|act]. +3·n·d_ff when a dense FFN follows.
+        let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * n_new * 4;
+        let norm_bytes = (2 * d_model + 2 * head_dim + head_dim / 2) * 4;
+        let mir_bytes = d_kv * max_ctx * 4;
+        if !Self::ensure_scratch(&mut self.prefill_act, &self.stream, act_bytes)
+            || !Self::ensure_scratch(&mut self.attn_norms, &self.stream, norm_bytes)
+            || !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
+            || !Self::ensure_scratch(&mut self.attn_v_mirror[layer_idx], &self.stream, mir_bytes)
+        {
+            return false;
+        }
+        // Activation-slab f32 offsets (each region is n_new rows wide).
+        let (o_hidden, o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
+            0,
+            n_new * d_model,
+            2 * n_new * d_model,
+            n_new * (2 * d_model + d_q),
+            n_new * (2 * d_model + d_q + d_kv),
+            n_new * (2 * d_model + d_q + 2 * d_kv),
+            n_new * (2 * d_model + 2 * d_q + 2 * d_kv),
+            n_new * (3 * d_model + 2 * d_q + 2 * d_kv),
+        );
+        let ffn_base = n_new * (4 * d_model + 2 * d_q + 2 * d_kv);
+        let (o_gate, o_up, o_act) = (
+            ffn_base,
+            ffn_base + n_new * d_ff,
+            ffn_base + 2 * n_new * d_ff,
+        );
+        // Norm-slab offsets (per-element, shared with decode).
+        let (no_attn, no_post, no_qn, no_kn, no_if) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + head_dim,
+            2 * d_model + 2 * head_dim,
+        );
+        let fb = |s: &[f32]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+        };
+        if upload_hidden
+            && !self
+                .prefill_act
+                .as_mut()
+                .unwrap()
+                .upload_at(o_hidden * 4, fb(hidden))
+        {
+            return false;
+        }
+        {
+            let nrm = self.attn_norms.as_mut().unwrap();
+            if !nrm.upload_at(no_attn * 4, fb(attn_norm))
+                || !nrm.upload_at(no_post * 4, fb(post_norm))
+                || !nrm.upload_at(no_if * 4, fb(inv_freq))
+            {
+                return false;
+            }
+            if let Some(w) = q_norm {
+                if !nrm.upload_at(no_qn * 4, fb(w)) {
+                    return false;
+                }
+            }
+            if let Some(w) = k_norm {
+                if !nrm.upload_at(no_kn * 4, fb(w)) {
+                    return false;
+                }
+            }
+        }
+        let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
+            let a = self.prefill_act.as_ref().unwrap();
+            (
+                a.f32_ptr_at(o_hidden),
+                a.f32_ptr_at(o_hnorm),
+                a.f32_ptr_at(o_q),
+                a.f32_ptr_at(o_k),
+                a.f32_ptr_at(o_v),
+                a.f32_ptr_at(o_attn),
+                a.f32_ptr_at(o_o),
+                a.f32_ptr_at(o_hn2),
+                a.f32_ptr_at(o_gate),
+                a.f32_ptr_at(o_up),
+                a.f32_ptr_at(o_act),
+            )
+        };
+        let (pan, ppn, pqn, pkn, pif) = {
+            let n = self.attn_norms.as_ref().unwrap();
+            (
+                n.f32_ptr_at(no_attn),
+                n.f32_ptr_at(no_post),
+                n.f32_ptr_at(no_qn),
+                n.f32_ptr_at(no_kn),
+                n.f32_ptr_at(no_if),
+            )
+        };
+        // 1. attn RMSNorm over n_new rows; 2. q/k/v batched device-I/O GEMMs.
+        unsafe {
+            if rmsnorm_dev_f32(&self.stream, ph, pan, phn, n_new, d_model, rms_eps).is_err() {
+                return false;
+            }
+        }
+        if !unsafe {
+            self.matvec_packed_batched_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model, n_new)
+        } || !unsafe {
+            self.matvec_packed_batched_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model, n_new)
+        } || !unsafe {
+            self.matvec_packed_batched_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model, n_new)
+        } {
+            return false;
+        }
+        // 3. Qwen3 per-head q/k RMSNorm over all n_new*heads rows (shared weight);
+        // 4. batched RoPE (each row at kv_len_base+row).
+        unsafe {
+            if q_norm.is_some()
+                && qk_head_norm_f32(&self.stream, pq, pqn, n_new * n_heads, head_dim, rms_eps)
+                    .is_err()
+            {
+                return false;
+            }
+            if k_norm.is_some()
+                && qk_head_norm_f32(&self.stream, pk, pkn, n_new * n_kv_heads, head_dim, rms_eps)
+                    .is_err()
+            {
+                return false;
+            }
+            if rope_rows_f32(&self.stream, pq, n_new, n_heads, head_dim, kv_len_base, pif).is_err()
+                || rope_rows_f32(
+                    &self.stream,
+                    pk,
+                    n_new,
+                    n_kv_heads,
+                    head_dim,
+                    kv_len_base,
+                    pif,
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+        // 5. Download post-RoPE K/V rows (token-major) for the host KV cache, then
+        //    scatter the SAME device K/V into the head-major mirror at col
+        //    kv_len_base (device→device, one launch), and advance valid_len.
+        {
+            let a = self.prefill_act.as_ref().unwrap();
+            let kb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(k_rows_out.as_mut_ptr() as *mut u8, n_new * d_kv * 4)
+            };
+            let vb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(v_rows_out.as_mut_ptr() as *mut u8, n_new * d_kv * 4)
+            };
+            if !a.download_at(o_k * 4, kb) || !a.download_at(o_v * 4, vb) {
+                return false;
+            }
+        }
+        {
+            let km = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
+            let vm = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
+            unsafe {
+                if kv_scatter_rows_f32(
+                    &self.stream,
+                    km,
+                    pk,
+                    n_new,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                )
+                .is_err()
+                    || kv_scatter_rows_f32(
+                        &self.stream,
+                        vm,
+                        pv,
+                        n_new,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len_base,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        if (self.attn_valid_len[layer_idx] as usize) < kv_len_base + n_new {
+            self.attn_valid_len[layer_idx] = (kv_len_base + n_new) as u32;
+        }
+        // 6. Flash-prefill: n_new causal queries over the mirror [0, kv_len_base+n_new).
+        let km_ptr = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
+        let vm_ptr = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
+        unsafe {
+            if flash_attn_prefill_f32(
+                &self.stream,
+                pq,
+                km_ptr,
+                vm_ptr,
+                pat,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len_base,
+                n_new,
+                window,
+                softcap,
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+        // 7. o projection (batched device-I/O); 8. fused residual + post-attn RMSNorm.
+        if !unsafe {
+            self.matvec_packed_batched_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q, n_new)
+        } {
+            return false;
+        }
+        unsafe {
+            if add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, n_new, d_model, rms_eps).is_err() {
+                return false;
+            }
+        }
+        // 8b. Optional dense SwiGLU FFN, device-resident.
+        if let Some((wg, wu, wd, _)) = dense_ffn {
+            unsafe {
+                if !self.matvec_packed_batched_dev_io(
+                    wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model, n_new,
+                ) || !self.matvec_packed_batched_dev_io(
+                    wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model, n_new,
+                ) {
+                    return false;
+                }
+                if silu_mul_f32(&self.stream, p_gate, p_up, p_act, n_new * d_ff).is_err() {
+                    return false;
+                }
+                if !self
+                    .matvec_packed_batched_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff, n_new)
+                {
+                    return false;
+                }
+                if add_f32(&self.stream, ph, po, n_new * d_model).is_err() {
+                    return false;
+                }
+            }
+        }
+        // 9. Download the updated hidden (unless it stays resident for the next
+        //    layer). h_norm2 is downloaded only when the FFN runs on the HOST.
+        {
+            let a = self.prefill_act.as_ref().unwrap();
+            if download_hidden {
+                let hb: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        hidden.as_mut_ptr() as *mut u8,
+                        n_new * d_model * 4,
+                    )
+                };
+                if !a.download_at(o_hidden * 4, hb) {
+                    return false;
+                }
+            }
+            if dense_ffn.is_none() {
+                let h2b: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        h_norm2.as_mut_ptr() as *mut u8,
+                        n_new * d_model * 4,
+                    )
                 };
                 if !a.download_at(o_hn2 * 4, h2b) {
                     return false;
@@ -7699,7 +8367,11 @@ impl CudaMatvecCache {
         let t_d2h = prof.then(std::time::Instant::now);
         let ok = self.out_scratch.as_ref().unwrap().download(out_bytes);
         if prof {
-            phase_prof::add_batched(h2d_ns, ker_ns, t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64));
+            phase_prof::add_batched(
+                h2d_ns,
+                ker_ns,
+                t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64),
+            );
         }
         ok
     }
@@ -8159,7 +8831,11 @@ impl CudaMatvecCache {
         let t_d2h = prof.then(std::time::Instant::now);
         let ok = self.out_scratch.as_ref().unwrap().download(out_bytes);
         if prof {
-            phase_prof::add_batched(h2d_ns, ker_ns, t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64));
+            phase_prof::add_batched(
+                h2d_ns,
+                ker_ns,
+                t_d2h.map_or(0, |t| t.elapsed().as_nanos() as u64),
+            );
         }
         ok
     }
