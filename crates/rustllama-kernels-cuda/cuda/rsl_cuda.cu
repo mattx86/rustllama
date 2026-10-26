@@ -1862,17 +1862,14 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
 // g+1 into the OFF buffer while the MMA consumes tile g from the ON buffer — this
 // body is byte-for-byte the staging the single-buffer loop did, so the result
 // (and parity) is unchanged; only WHEN the loads are issued changes.
-template <bool REPACK>
+template <bool REPACK, int BM, int BN, int KT>
 __device__ __forceinline__ void rsl_gemm_q8_0_stage_tile(
     int gt, int spr, int M, int N, int K, int rowBase, int tokBase, int tid,
     int nthreads, const unsigned char *__restrict__ w,
     const signed char *__restrict__ wq, const unsigned short *__restrict__ wd,
     const signed char *__restrict__ xq, const float *__restrict__ xs,
     signed char *As_b, signed char *Bs_b, float *dw_b, float *xscl_b) {
-    const int KT = RSL_Q4K_TC_KT;
     const int KW = KT * 32;
-    const int BM = RSL_Q4K_TC_BM;
-    const int BN = RSL_Q4K_TC_BN;
     const int nsub = (spr - gt < KT) ? (spr - gt) : KT;
     // Per-row block scale d (f16) for each staged sub-block. REPACK reads the
     // split f16-scale array; the packed path unpacks it from the 34-byte block.
@@ -2010,9 +2007,9 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 2)
     // visible for the next iteration AND fences the current buffer before iter t+1
     // reuses it.
     const int nTiles = (spr + RSL_Q4K_TC_KT - 1) / RSL_Q4K_TC_KT;
-    rsl_gemm_q8_0_stage_tile<REPACK>(0, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, wq, wd,
-                                     xq, xs, &As[0][0][0], &Bs[0][0][0], &dw[0][0][0],
-                                     &xscl[0][0][0]);
+    rsl_gemm_q8_0_stage_tile<REPACK, RSL_Q4K_TC_BM, RSL_Q4K_TC_BN, RSL_Q4K_TC_KT>(
+        0, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, wq, wd, xq, xs, &As[0][0][0],
+        &Bs[0][0][0], &dw[0][0][0], &xscl[0][0][0]);
     if (P) { long long n = clock64(); cStage += (unsigned long long)(n - pt); pt = n; }
     __syncthreads();
     if (P) { long long n = clock64(); cSync1 += (unsigned long long)(n - pt); pt = n; }
@@ -2024,10 +2021,9 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 2)
         // Prefetch tile t+1 into the off buffer (overlaps the MMA below).
         if (t + 1 < nTiles) {
             const int nxt = cur ^ 1;
-            rsl_gemm_q8_0_stage_tile<REPACK>((t + 1) * RSL_Q4K_TC_KT, spr, M, N, K, rowBase,
-                                             tokBase, tid, nthreads, w, wq, wd, xq, xs,
-                                             &As[nxt][0][0], &Bs[nxt][0][0], &dw[nxt][0][0],
-                                             &xscl[nxt][0][0]);
+            rsl_gemm_q8_0_stage_tile<REPACK, RSL_Q4K_TC_BM, RSL_Q4K_TC_BN, RSL_Q4K_TC_KT>(
+                (t + 1) * RSL_Q4K_TC_KT, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, wq, wd,
+                xq, xs, &As[nxt][0][0], &Bs[nxt][0][0], &dw[nxt][0][0], &xscl[nxt][0][0]);
         }
         if (P) { long long n = clock64(); cStage += (unsigned long long)(n - pt); pt = n; }
 
@@ -2094,6 +2090,117 @@ __global__ void __launch_bounds__(RSL_Q4K_TC_WARPS * 32, 2)
         int mg = m0 + mi;
         int ng = n0 + nj;
         if (mg < M && ng < N) out[(size_t)ng * M + mg] = cacc[c];
+    }
+}
+
+// 128x128 register-blocked variant of gemm_q8_0_w8a8_tc_kernel. The roofline
+// (RUSTLLAMA_GEMM_ROOFLINE) measured the 64x64 kernel DRAM-BANDWIDTH-BOUND at 85%
+// peak, moving ~5.75x the minimum data because the 64x64 tile re-reads the weight
+// N/64 and the activation M/64 times. A 128x128 tile HALVES both re-read factors
+// → ~2x useful-bytes/byte → approaches the compute floor. 16 warps (512 threads),
+// each computing a 2x2 block of 16x16 WMMA fragments (register-blocked, cacc[4][8]).
+// KT=1 (not 2) so the double-buffered staging + the Cs round-trip fit the 48KB
+// static-shared floor: As/Bs = 2*128*32 = 8KB each, Cs = 16KB, ~34KB total. Same
+// int8 WMMA math + per-32 scale fold as the 64x64 kernel → parity-equal (graded by
+// doctor --cuda-parity vs the fair-W8A8 ref). Launcher shape-gates it to N>=128
+// (prefill) so the small-N spec path keeps the un-padded 64x64 kernel.
+template <bool REPACK>
+__global__ void __launch_bounds__(512, 2) gemm_q8_0_w8a8_tc_128_kernel(
+    const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
+    const unsigned short *__restrict__ wd, const signed char *__restrict__ xq,
+    const float *__restrict__ xs, float *__restrict__ out, int M, int K, int N) {
+    constexpr int BM = 128, BN = 128, KT = 1, WARPS = 16, KW = KT * 32;
+    __shared__ __align__(16) signed char As[2][BM][KW];
+    __shared__ __align__(16) signed char Bs[2][BN][KW];
+    __shared__ float dw[2][BM][KT];
+    __shared__ float xscl[2][BN][KT];
+    __shared__ int Cs[WARPS][16][16];
+
+    const int rowBase = blockIdx.x * BM;
+    const int tokBase = blockIdx.y * BN;
+    const int warpId = threadIdx.y; // 0..15
+    const int lane = threadIdx.x;   // 0..31
+    const int tid = warpId * 32 + lane;
+    const int nthreads = WARPS * 32; // 512
+    const int spr = K / 32;
+    // 4x4 warp grid over the 8x8 fragment grid; each warp owns a 2x2 fragment block.
+    const int wmr = warpId >> 2; // 0..3
+    const int wmc = warpId & 3;  // 0..3
+
+    float cacc[4][8];
+#pragma unroll
+    for (int f = 0; f < 4; ++f)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) cacc[f][c] = 0.0f;
+
+    const int nTiles = spr; // KT=1 → one 32-wide sub-block per tile
+    rsl_gemm_q8_0_stage_tile<REPACK, BM, BN, KT>(0, spr, M, N, K, rowBase, tokBase, tid, nthreads,
+                                                 w, wq, wd, xq, xs, &As[0][0][0], &Bs[0][0][0],
+                                                 &dw[0][0][0], &xscl[0][0][0]);
+    __syncthreads();
+
+    for (int t = 0; t < nTiles; ++t) {
+        const int cur = t & 1;
+        if (t + 1 < nTiles) {
+            const int nxt = cur ^ 1;
+            rsl_gemm_q8_0_stage_tile<REPACK, BM, BN, KT>((t + 1) * KT, spr, M, N, K, rowBase,
+                                                         tokBase, tid, nthreads, w, wq, wd, xq, xs,
+                                                         &As[nxt][0][0], &Bs[nxt][0][0],
+                                                         &dw[nxt][0][0], &xscl[nxt][0][0]);
+        }
+        const int sub = 0; // KT=1
+#pragma unroll
+        for (int fi = 0; fi < 4; ++fi) {
+            const int fm = 2 * wmr + (fi >> 1); // 0..7 fragment row
+            const int fn = 2 * wmc + (fi & 1);  // 0..7 fragment col
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, signed char,
+                                   nvcuda::wmma::row_major> a_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, signed char,
+                                   nvcuda::wmma::col_major> b_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
+            nvcuda::wmma::fill_fragment(acc_frag, 0);
+#pragma unroll
+            for (int kk = 0; kk < 32; kk += 16) {
+                nvcuda::wmma::load_matrix_sync(a_frag, &As[cur][fm * 16][kk], KW);
+                nvcuda::wmma::load_matrix_sync(b_frag, &Bs[cur][fn * 16][kk], KW);
+                nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+            nvcuda::wmma::store_matrix_sync(&Cs[warpId][0][0], acc_frag, 16,
+                                            nvcuda::wmma::mem_row_major);
+#else
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32, mi = e >> 4, nj = e & 15, acc_i = 0;
+                for (int kk = 0; kk < 32; ++kk)
+                    acc_i += (int)As[cur][fm * 16 + mi][kk] * (int)Bs[cur][fn * 16 + nj][kk];
+                Cs[warpId][mi][nj] = acc_i;
+            }
+#endif
+            __syncwarp();
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32, mi = e >> 4, nj = e & 15;
+                int row = fm * 16 + mi, tok = fn * 16 + nj;
+                cacc[fi][c] +=
+                    xscl[cur][tok][sub] * dw[cur][row][sub] * (float)Cs[warpId][mi][nj];
+            }
+            __syncwarp(); // before this warp reuses Cs for the next fragment
+        }
+        __syncthreads(); // prefetched tile visible + current buffer free to reuse
+    }
+
+    // Write out[token][row] for each of the warp's 4 fragments.
+#pragma unroll
+    for (int fi = 0; fi < 4; ++fi) {
+        const int m0 = rowBase + (2 * wmr + (fi >> 1)) * 16;
+        const int n0 = tokBase + (2 * wmc + (fi & 1)) * 16;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int e = lane + c * 32, mi = e >> 4, nj = e & 15;
+            int mg = m0 + mi, ng = n0 + nj;
+            if (mg < M && ng < N) out[(size_t)ng * M + mg] = cacc[fi][c];
+        }
     }
 }
 
@@ -2378,24 +2485,36 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                 if (ci) cudaFree(ci);
                 if (co) cudaFree(co);
             }
-            // (2) Time the real GEMM.
+            // (2) Time the real GEMM — the SAME kernel the launcher picks (128x128
+            // for N>=128, else 64x64), so re-running the roofline measures the
+            // actually-dispatched path.
             const int ITERS = 50;
-            if (repacked)
-                gemm_q8_0_w8a8_tc_kernel<false, true><<<grid, block, 0, s->stream>>>(
-                    nullptr, wq, wd, xq, xs, out, M, K, N, nullptr); // warmup
-            else
-                gemm_q8_0_w8a8_tc_kernel<false, false><<<grid, block, 0, s->stream>>>(
-                    (const unsigned char *)w, nullptr, nullptr, xq, xs, out, M, K, N, nullptr);
+            dim3 g128((unsigned)((M + 127) / 128), (unsigned)((N + 127) / 128));
+            dim3 b128(32, 16);
+#define RSL_RL_GEMM()                                                                      \
+    do {                                                                                   \
+        if (N >= 128) {                                                                    \
+            if (repacked)                                                                  \
+                gemm_q8_0_w8a8_tc_128_kernel<true>                                         \
+                    <<<g128, b128, 0, s->stream>>>(nullptr, wq, wd, xq, xs, out, M, K, N); \
+            else                                                                           \
+                gemm_q8_0_w8a8_tc_128_kernel<false><<<g128, b128, 0, s->stream>>>(         \
+                    (const unsigned char *)w, nullptr, nullptr, xq, xs, out, M, K, N);     \
+        } else {                                                                           \
+            if (repacked)                                                                  \
+                gemm_q8_0_w8a8_tc_kernel<false, true><<<grid, block, 0, s->stream>>>(      \
+                    nullptr, wq, wd, xq, xs, out, M, K, N, nullptr);                       \
+            else                                                                           \
+                gemm_q8_0_w8a8_tc_kernel<false, false><<<grid, block, 0, s->stream>>>(     \
+                    (const unsigned char *)w, nullptr, nullptr, xq, xs, out, M, K, N,      \
+                    nullptr);                                                              \
+        }                                                                                  \
+    } while (0)
+            RSL_RL_GEMM(); // warmup
             cudaStreamSynchronize(s->stream);
             cudaEventRecord(e0, s->stream);
-            for (int it = 0; it < ITERS; it++) {
-                if (repacked)
-                    gemm_q8_0_w8a8_tc_kernel<false, true><<<grid, block, 0, s->stream>>>(
-                        nullptr, wq, wd, xq, xs, out, M, K, N, nullptr);
-                else
-                    gemm_q8_0_w8a8_tc_kernel<false, false><<<grid, block, 0, s->stream>>>(
-                        (const unsigned char *)w, nullptr, nullptr, xq, xs, out, M, K, N, nullptr);
-            }
+            for (int it = 0; it < ITERS; it++) RSL_RL_GEMM();
+#undef RSL_RL_GEMM
             cudaEventRecord(e1, s->stream);
             cudaEventSynchronize(e1);
             float gms = 0.f;
@@ -2409,7 +2528,8 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             double w_bytes = (double)M * K + (double)M * (K / 32) * 2.0;
             double a_bytes = (double)N * K + (double)N * (K / 32) * 2.0;
             double o_bytes = (double)M * N * 4.0;
-            double bn = RSL_Q4K_TC_BN, bm = RSL_Q4K_TC_BM;
+            double bn = (N >= 128) ? 128.0 : (double)RSL_Q4K_TC_BN;
+            double bm = (N >= 128) ? 128.0 : (double)RSL_Q4K_TC_BM;
             double min_bytes = w_bytes + a_bytes + o_bytes;
             double eff_bytes =
                 w_bytes * ((double)N / bn) + a_bytes * ((double)M / bm) + o_bytes;
@@ -2433,6 +2553,21 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             std::fprintf(stderr, "[gemm-roofline] verdict: %s\n", verdict);
             return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
         }
+    }
+    // Shape-gated 128x128 (roofline: the 64x64 is DRAM-bandwidth-bound on ~8x
+    // weight re-reads; the 128x128 tile halves both re-read factors). Large-N
+    // prefill only — N<128 (the speculative batched path) keeps the un-padded
+    // 64x64 kernel, which a 128-wide tile would over-pad.
+    if (N >= 128) {
+        dim3 g128((unsigned)((M + 127) / 128), (unsigned)((N + 127) / 128));
+        dim3 b128(32, 16);
+        if (repacked)
+            gemm_q8_0_w8a8_tc_128_kernel<true><<<g128, b128, 0, s->stream>>>(
+                nullptr, wq, wd, xq, xs, out, M, K, N);
+        else
+            gemm_q8_0_w8a8_tc_128_kernel<false><<<g128, b128, 0, s->stream>>>(
+                (const unsigned char *)w, nullptr, nullptr, xq, xs, out, M, K, N);
+        return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
     }
     if (repacked) {
         gemm_q8_0_w8a8_tc_kernel<false, true><<<grid, block, 0, s->stream>>>(
