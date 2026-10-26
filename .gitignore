@@ -31,3 +31,4 @@ app/desktop/target
 
 # transient build logs (scripts/_build*.bat redirected output)
 /build*.log
+/release*.log

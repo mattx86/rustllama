@@ -17127,6 +17127,10 @@ impl LlamaModel {
                     || rope_interleaved_enabled()
                     || !crate::accel::dev_prefill_enabled()
                     || !crate::accel::cuda_active()
+                    // Honor the n_gpu_layers cutoff like the host GPU dispatch: a
+                    // layer past the cutoff belongs on CPU (its weights may not be
+                    // VRAM-resident), so the device block must decline it too.
+                    || !crate::accel::gpu_active_for_current_layer()
                 {
                     // The device block's RoPE is neox half-split with
                     // `self.rope_inv_freq` + no YaRN mscale, so it is exact only
