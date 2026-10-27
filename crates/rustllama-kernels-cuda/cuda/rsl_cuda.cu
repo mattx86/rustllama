@@ -2523,6 +2523,32 @@ extern "C" int rsl_cuda_matvec_q8_0_repacked(rsl_cuda_stream *s, const void *w,
     return rsl_cuda_check("rsl_cuda_matvec_q8_0_repacked");
 }
 
+// ---- cudaEvent timing FFI (the sync-free, GRAPH-representative phase timer) ----
+// The host-side `DB_*` profiler brackets each phase with a full stream-sync, so it
+// measures the EAGER path (CPU launch overhead + GPU time) — not the graph, where
+// launches are collapsed. cudaEvents recorded IN the stream at phase boundaries,
+// then ONE end-sync + elapsed, give the pure GPU time between phases (launch
+// overhead excluded) — the real per-phase cost the production graph pays. Used by
+// the decode-block TRUE breakdown (RUSTLLAMA_DECODE_BLOCK_DIAG).
+extern "C" void *rsl_cuda_event_create() {
+    cudaEvent_t e;
+    if (cudaEventCreate(&e) != cudaSuccess) return nullptr;
+    return (void *)e;
+}
+extern "C" int rsl_cuda_event_record(void *e, rsl_cuda_stream *s) {
+    if (!e || !s) return -1;
+    return cudaEventRecord((cudaEvent_t)e, s->stream) == cudaSuccess ? 0 : -1;
+}
+extern "C" float rsl_cuda_event_elapsed_ms(void *a, void *b) {
+    if (!a || !b) return -1.f;
+    float ms = 0.f;
+    if (cudaEventElapsedTime(&ms, (cudaEvent_t)a, (cudaEvent_t)b) != cudaSuccess) return -1.f;
+    return ms;
+}
+extern "C" void rsl_cuda_event_destroy(void *e) {
+    if (e) cudaEventDestroy((cudaEvent_t)e);
+}
+
 // Grid-stride float4 copy — the peak-DRAM-bandwidth micro-benchmark for the
 // in-code roofline (RUSTLLAMA_GEMM_ROOFLINE). A simple saturating copy measures
 // THIS device/MIG-slice's achieved DRAM bandwidth (no perf counters, no MIG peak

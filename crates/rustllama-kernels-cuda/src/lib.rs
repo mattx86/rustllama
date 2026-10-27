@@ -198,6 +198,12 @@ extern "C" {
         n_bytes: u64,
     ) -> c_int;
     fn rsl_cuda_stream_sync(s: *mut RslCudaStreamRaw) -> c_int;
+    // cudaEvent timing (the sync-free, graph-representative phase timer for the
+    // decode-block TRUE breakdown — see RUSTLLAMA_DECODE_BLOCK_DIAG).
+    fn rsl_cuda_event_create() -> *mut std::ffi::c_void;
+    fn rsl_cuda_event_record(e: *mut std::ffi::c_void, s: *mut RslCudaStreamRaw) -> c_int;
+    fn rsl_cuda_event_elapsed_ms(a: *mut std::ffi::c_void, b: *mut std::ffi::c_void) -> f32;
+    fn rsl_cuda_event_destroy(e: *mut std::ffi::c_void);
     // C1 — resident-state single-token Gated-DeltaNet recurrence step. All pointers
     // are DEVICE pointers; `state` is the RESIDENT per-layer S (caller-owned), the
     // rest are the uploaded per-token I/O. Declines (nonzero) when qk != vd.
@@ -2782,6 +2788,28 @@ fn decode_fused_gate_up_enabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+/// Arm the decode-block TRUE breakdown ONCE (`RUSTLLAMA_DECODE_BLOCK_DIAG=1`):
+/// returns true on the FIRST eager decode-block call only, so that call records
+/// cudaEvents at its section boundaries (start / pre-attn / attn / post-attn /
+/// xfer) → the real per-section GPU time with launch overhead EXCLUDED, vs the
+/// sync-distorted `DB_*` eager profiler (which measures CPU launch + GPU). Combined
+/// with the matvec-diag matvec time, this splits the non-matvec decode cost (glue
+/// vs attn vs xfer) truly — the "which glue to fuse" question.
+fn decode_block_diag_arm() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let en = *ENABLED.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DECODE_BLOCK_DIAG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    });
+    // First call wins the compare_exchange → arms exactly one block.
+    en && DONE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 /// Single-row Q8_0 W8A8 int-dot DECODE matvec (int8 activations, LOSSY) — the
@@ -6549,6 +6577,22 @@ impl CudaMatvecCache {
         // is the qkv/o attention projections. Only measured under PHASE_PROFILE.
         let mut ffn_ns = 0u64;
         let mut tmark = std::time::Instant::now();
+        // TRUE sync-free section breakdown (RUSTLLAMA_DECODE_BLOCK_DIAG, one block):
+        // cudaEvents at start / pre-attn / attn / post-attn / xfer → GPU time with
+        // launch overhead excluded (the graph-representative cost). `bev` collects
+        // the 5 boundary events; measured + printed at block end.
+        let bdiag = decode_block_diag_arm();
+        let mut bev: Vec<*mut std::ffi::c_void> = Vec::new();
+        let brec = |bev: &mut Vec<*mut std::ffi::c_void>, raw: *mut RslCudaStreamRaw| {
+            if bdiag {
+                let e = unsafe { rsl_cuda_event_create() };
+                if !e.is_null() {
+                    let _ = unsafe { rsl_cuda_event_record(e, raw) };
+                }
+                bev.push(e);
+            }
+        };
+        brec(&mut bev, self.stream.raw()); // E0: block start
         // 1. attn RMSNorm; 2. q/k/v projections (device-I/O, no copy).
         unsafe {
             if rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_err() {
@@ -6594,6 +6638,7 @@ impl CudaMatvecCache {
             db[2] += tmark.elapsed().as_nanos() as u64; // glue (qk-norm + rope)
             tmark = std::time::Instant::now();
         }
+        brec(&mut bev, self.stream.raw()); // E1: end of pre-attn (rmsnorm+qkv+qknorm+rope)
         // 5. Download post-RoPE K/V into the caller's host KV-cache row, then
         //    scatter the SAME post-RoPE device K/V into the F32 mirror at `pos`,
         //    one kv-head at a time (head-major). A2: the mirror write is now an
@@ -6668,6 +6713,7 @@ impl CudaMatvecCache {
             db[1] += tmark.elapsed().as_nanos() as u64; // attn (flash-decode)
             tmark = std::time::Instant::now();
         }
+        brec(&mut bev, self.stream.raw()); // E2: end of attn (kv-write + flash-decode)
         // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
         if !unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) } {
             return false;
@@ -6725,6 +6771,7 @@ impl CudaMatvecCache {
             ffn_ns += e;
             tmark = std::time::Instant::now();
         }
+        brec(&mut bev, self.stream.raw()); // E3: end of post-attn (o + residual + FFN)
         // 9. Download the updated hidden (hidden += o [+ ffn_out]). The post-attn
         // norm (h_norm2) is downloaded only when the FFN ran on the HOST — when
         // the device FFN above consumed it, the caller skips the host FFN so it's
@@ -6755,6 +6802,37 @@ impl CudaMatvecCache {
             unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
             db[3] += tmark.elapsed().as_nanos() as u64; // xfer (hidden/h_norm2 download)
             phase_prof::add_decode_block(db[0], db[1], db[2], db[3], ffn_ns);
+        }
+        brec(&mut bev, self.stream.raw()); // E4: end of xfer (hidden download)
+        if bdiag && bev.len() >= 5 {
+            // One end-sync, then the pure GPU time between the in-stream events (NO
+            // per-phase sync → launch overhead excluded, graph-representative).
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            let el = |a: *mut std::ffi::c_void, b: *mut std::ffi::c_void| -> f64 {
+                if a.is_null() || b.is_null() {
+                    return 0.0;
+                }
+                let ms = unsafe { rsl_cuda_event_elapsed_ms(a, b) };
+                if ms < 0.0 {
+                    0.0
+                } else {
+                    ms as f64 * 1e3 // → us
+                }
+            };
+            let pre = el(bev[0], bev[1]);
+            let attn = el(bev[1], bev[2]);
+            let post = el(bev[2], bev[3]);
+            let xfer = el(bev[3], bev[4]);
+            eprintln!(
+                "[decode-block-diag] TRUE GPU us/layer (cudaEvents, launch-overhead EXCLUDED): \
+                 pre-attn(rmsnorm+qkv+qknorm+rope)={pre:.1} attn(kv+flash)={attn:.1} \
+                 post-attn(o+resid+ffn)={post:.1} xfer={xfer:.1} total={:.1}  \
+                 [subtract the matvec-diag matvec time from pre+post → glue cost]",
+                pre + attn + post + xfer
+            );
+            for e in &bev {
+                unsafe { rsl_cuda_event_destroy(*e) };
+            }
         }
         consume_error_count() == 0
     }
