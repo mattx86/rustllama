@@ -1850,11 +1850,18 @@ pub mod phase_prof {
     static DB_GLUE: AtomicU64 = AtomicU64::new(0);
     static DB_XFER: AtomicU64 = AtomicU64::new(0);
     static DB_CALLS: AtomicU64 = AtomicU64::new(0);
-    /// Record one eager decode-block layer's matvec/attn/glue/transfer ns.
-    pub fn add_decode_block(matvec: u64, attn: u64, glue: u64, xfer: u64) {
+    // FFN subset of DB_MATVEC (gate/up/down matvecs); the rest is the attention
+    // projections (qkv/o). Tells the ncu-free decode profiler whether the FFN or
+    // the attn-projection matvecs dominate the decode matvec time (both are
+    // single-row weight-bandwidth reads) — the fusion-lever discriminator.
+    static DB_FFN: AtomicU64 = AtomicU64::new(0);
+    /// Record one eager decode-block layer's matvec/attn/glue/transfer ns, plus
+    /// the FFN-matvec (gate/up/down) sub-slice of matvec.
+    pub fn add_decode_block(matvec: u64, attn: u64, glue: u64, xfer: u64, ffn: u64) {
         DB_MATVEC.fetch_add(matvec, Ordering::Relaxed);
         DB_ATTN.fetch_add(attn, Ordering::Relaxed);
         DB_GLUE.fetch_add(glue, Ordering::Relaxed);
+        DB_FFN.fetch_add(ffn, Ordering::Relaxed);
         DB_XFER.fetch_add(xfer, Ordering::Relaxed);
         DB_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1895,6 +1902,7 @@ pub mod phase_prof {
             &DB_ATTN,
             &DB_GLUE,
             &DB_XFER,
+            &DB_FFN,
             &DB_CALLS,
         ] {
             c.store(0, Ordering::Relaxed);
@@ -1917,16 +1925,28 @@ pub mod phase_prof {
         };
         let mut s = String::from("[phase] matvec H2D / kernel / D2H, us per call:\n");
         if db > 0 {
+            let mv = ld(&DB_MATVEC);
+            let ffn = ld(&DB_FFN);
             s += &format!(
                 "  dev-decode block (per layer): calls={db} matvec={:.1} attn={:.1} glue={:.1} xfer={:.1} total={:.1}\n",
-                per(ld(&DB_MATVEC), db),
+                per(mv, db),
                 per(ld(&DB_ATTN), db),
                 per(ld(&DB_GLUE), db),
                 per(ld(&DB_XFER), db),
-                per(
-                    ld(&DB_MATVEC) + ld(&DB_ATTN) + ld(&DB_GLUE) + ld(&DB_XFER),
-                    db
-                )
+                per(mv + ld(&DB_ATTN) + ld(&DB_GLUE) + ld(&DB_XFER), db)
+            );
+            s += &format!(
+                "    matvec split: ffn={:.1} qkvo={:.1}  [matvec {:.0}% of decode block]\n",
+                per(ffn, db),
+                per(mv.saturating_sub(ffn), db),
+                {
+                    let tot = mv + ld(&DB_ATTN) + ld(&DB_GLUE) + ld(&DB_XFER);
+                    if tot > 0 {
+                        mv as f64 * 100.0 / tot as f64
+                    } else {
+                        0.0
+                    }
+                }
             );
         }
         if pb > 0 {
@@ -6497,6 +6517,9 @@ impl CudaMatvecCache {
         // RATIO is the signal). db = [matvec, attn, glue, xfer] ns.
         let prof = phase_prof::enabled();
         let mut db = [0u64; 4];
+        // FFN-matvec (gate/up/down) sub-slice of db[0] (matvec); the rest of db[0]
+        // is the qkv/o attention projections. Only measured under PHASE_PROFILE.
+        let mut ffn_ns = 0u64;
         let mut tmark = std::time::Instant::now();
         // 1. attn RMSNorm; 2. q/k/v projections (device-I/O, no copy).
         unsafe {
@@ -6661,7 +6684,9 @@ impl CudaMatvecCache {
         }
         if prof {
             unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
-            db[0] += tmark.elapsed().as_nanos() as u64; // matvec (FFN gate/up/down; silu+add negligible)
+            let e = tmark.elapsed().as_nanos() as u64;
+            db[0] += e; // matvec (FFN gate/up/down; silu+add negligible)
+            ffn_ns += e;
             tmark = std::time::Instant::now();
         }
         // 9. Download the updated hidden (hidden += o [+ ffn_out]). The post-attn
@@ -6693,7 +6718,7 @@ impl CudaMatvecCache {
         if prof {
             unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
             db[3] += tmark.elapsed().as_nanos() as u64; // xfer (hidden/h_norm2 download)
-            phase_prof::add_decode_block(db[0], db[1], db[2], db[3]);
+            phase_prof::add_decode_block(db[0], db[1], db[2], db[3], ffn_ns);
         }
         consume_error_count() == 0
     }

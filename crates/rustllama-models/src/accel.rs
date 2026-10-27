@@ -11206,7 +11206,18 @@ fn dev_attn_cuda_graph_enabled() -> bool {
         _ => {}
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH))
+    // `RUSTLLAMA_DEV_ATTN_GRAPH=0` forces the per-layer attention GRAPH off so the
+    // EAGER device-resident decode block runs instead — the only path carrying the
+    // `DB_*` per-phase (matvec/attn/glue/xfer) profiler marks, since a captured
+    // graph can't be synced mid-replay. The diagnostic lever for decode-kernel
+    // localization (pair with `RUSTLLAMA_PHASE_PROFILE=1`); `=1` forces it on.
+    *ON.get_or_init(
+        || match std::env::var("RUSTLLAMA_DEV_ATTN_GRAPH").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH),
+        },
+    )
 }
 
 /// Feature 1b WHOLE-LAYER gate: fuse the dense SwiGLU FFN *into* the captured
