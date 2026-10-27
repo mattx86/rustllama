@@ -452,6 +452,13 @@ struct rsl_cuda_stream {
         int K;
     };
     std::vector<Q80Repack> q80_repack;
+    // Split-KV (FlashDecoding) decode-attention partials scratch:
+    // [n_heads * n_splits * (head_dim+2)] floats (per-chunk acc + m + l). Grown on
+    // demand + REUSED — allocated on the first EAGER split-eligible decode-attn call
+    // and reused on CUDA-graph replay (a stable device address is required for the
+    // captured launch). Freed on stream destroy.
+    float *fd_partials = nullptr;
+    size_t fd_partials_cap = 0; // floats
 };
 
 extern "C" rsl_cuda_stream *rsl_cuda_stream_create(int device_index) {
@@ -480,6 +487,7 @@ extern "C" void rsl_cuda_stream_destroy(rsl_cuda_stream *s) {
         if (e.wq) cudaFree(e.wq);
         if (e.wd) cudaFree(e.wd);
     }
+    if (s->fd_partials) cudaFree(s->fd_partials);
     cudaStreamDestroy(s->stream);
     delete s;
 }
@@ -4654,6 +4662,126 @@ __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
     }
 }
 
+// Split-KV (FlashDecoding) PARTIAL kernel: grid (n_heads, n_splits). Block (hh, sp)
+// runs the SAME online-softmax flash as flash_attn_decode_f32_kernel but over ONLY
+// its KV chunk [sp*chunk, min(kv_len, (sp+1)*chunk)); it writes that chunk's partial
+// — the UNNORMALIZED acc (Σ exp(s_t − m_chunk)·v_t), the chunk max m_chunk, and the
+// chunk denominator l_chunk — to partials[(hh*n_splits+sp)*(head_dim+2)]. The
+// combine kernel rescales + merges the n_splits chunks per head. n_heads*n_splits
+// blocks fill the SMs (vs n_heads), so long-context decode attention saturates more
+// DRAM bandwidth (the fix for the grid-starved 1-block-per-head kernel).
+__global__ void flash_attn_decode_split_f32_kernel(
+    const float *q, const float *k, const float *v, float *partials, int n_heads,
+    int n_gqa, int head_dim, int max_ctx, int kv_len, int n_splits, int chunk,
+    float scale, int window, float softcap) {
+    extern __shared__ float smem[];
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
+    const int hh = blockIdx.x;
+    const int sp = blockIdx.y;
+    if (hh >= n_heads || sp >= n_splits) return;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    const int c0 = sp * chunk;
+    const int c1 = min(kv_len, c0 + chunk);
+    for (int t = c0 + warp; t < c1; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * k[kv_off + d];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * v[kv_off + d];
+        m = m_new;
+    }
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+    float m_g = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    float *pout = partials + (size_t)(hh * n_splits + sp) * (head_dim + 2);
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+#pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        pout[d] = o; // Σ_t exp(s_t − m_g)·v_t over this chunk
+    }
+    if (tid == 0) {
+        pout[head_dim] = m_g;     // chunk max
+        pout[head_dim + 1] = l_g; // chunk denominator Σ exp(s_t − m_g)
+    }
+}
+
+// Split-KV COMBINE kernel: grid (n_heads). Merges the n_splits chunk partials for a
+// head — global max M = max_chunk m_chunk, L = Σ_chunk l_chunk·exp(m_chunk − M),
+// out[d] = (Σ_chunk partial_acc[d]·exp(m_chunk − M)) / L — the exact flash
+// cross-chunk rescale (= one whole-KV softmax; numerically the same answer as the
+// single kernel within fp reassociation).
+__global__ void flash_attn_decode_combine_f32_kernel(const float *partials,
+                                                     float *out, int n_heads,
+                                                     int head_dim, int n_splits) {
+    const int hh = blockIdx.x;
+    if (hh >= n_heads) return;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int stride = head_dim + 2;
+    const float *base = partials + (size_t)hh * n_splits * stride;
+    __shared__ float sM, sInvL;
+    if (tid == 0) {
+        float M = -INFINITY;
+        for (int sp = 0; sp < n_splits; ++sp) M = fmaxf(M, base[sp * stride + head_dim]);
+        float L = 0.f;
+        for (int sp = 0; sp < n_splits; ++sp) {
+            float cm = base[sp * stride + head_dim];
+            L += base[sp * stride + head_dim + 1] * (isfinite(cm) ? expf(cm - M) : 0.f);
+        }
+        sM = M;
+        sInvL = (L > 0.f) ? 1.f / L : 0.f;
+    }
+    __syncthreads();
+    const float M = sM, inv = sInvL;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        for (int sp = 0; sp < n_splits; ++sp) {
+            float cm = base[sp * stride + head_dim];
+            o += base[sp * stride + d] * (isfinite(cm) ? expf(cm - M) : 0.f);
+        }
+        out[hh * head_dim + d] = o * inv;
+    }
+}
+
 // `window` (0 = full causal) + `softcap` (0 = off): SWA / Gemma2 support,
 // threaded straight into the kernel (byte-identical passthroughs at 0/0).
 extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
@@ -4681,6 +4809,58 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) *
                    sizeof(float);
+    // Split-KV (FlashDecoding): when the 1-block-per-head grid starves the SMs AND
+    // there is enough KV to split, run n_splits ≈ SMs/n_heads blocks PER head over
+    // KV chunks, then a combine — n_heads*n_splits blocks fill the SMs so long-
+    // context attention saturates DRAM. Gated by RUSTLLAMA_DECODE_ATTN_SPLIT=1 +
+    // a KV threshold (below it the extra combine kernel isn't worth it). Capture-
+    // safe: the partials scratch is allocated on the first EAGER call and reused on
+    // replay; if capturing while still unallocated, fall back to the single kernel.
+    {
+        static int split_env = -1;
+        if (split_env < 0) {
+            const char *e = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT");
+            split_env = (e && e[0] == '1') ? 1 : 0;
+        }
+        int nsm = 0;
+        cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+        int n_splits = (nsm > 0 && n_heads > 0) ? (nsm + n_heads - 1) / n_heads : 1;
+        if (n_splits > 16) n_splits = 16;
+        const int MIN_SPLIT_KV = 256;
+        bool want_split = split_env && n_splits > 1 && kv_len >= MIN_SPLIT_KV &&
+                          kv_len >= n_splits * 64;
+        if (want_split) {
+            size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s->stream, &cap);
+            if (s->fd_partials_cap < need) {
+                if (cap != cudaStreamCaptureStatusNone) {
+                    want_split = false; // can't cudaMalloc mid graph-capture
+                } else {
+                    if (s->fd_partials) cudaFree(s->fd_partials);
+                    if (cudaMalloc(&s->fd_partials, need * sizeof(float)) != cudaSuccess) {
+                        s->fd_partials = nullptr;
+                        s->fd_partials_cap = 0;
+                        want_split = false;
+                    } else {
+                        s->fd_partials_cap = need;
+                    }
+                }
+            }
+        }
+        if (want_split) {
+            int chunk = (kv_len + n_splits - 1) / n_splits;
+            dim3 sgrid((unsigned)n_heads, (unsigned)n_splits);
+            flash_attn_decode_split_f32_kernel<<<sgrid, block, shmem, s->stream>>>(
+                q, k, v, s->fd_partials, n_heads, n_gqa, head_dim, max_ctx, kv_len, n_splits,
+                chunk, scale, window, softcap);
+            int ct = head_dim < 256 ? ((head_dim + 31) / 32) * 32 : 256;
+            if (ct < 32) ct = 32;
+            flash_attn_decode_combine_f32_kernel<<<(unsigned)n_heads, ct, 0, s->stream>>>(
+                s->fd_partials, out, n_heads, head_dim, n_splits);
+            return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
+        }
+    }
     // ncu-free DECODE-ATTN diagnostic (RUSTLLAMA_DECODE_ATTN_DIAG=1), fired ONCE on
     // a WARM call (skip 64; graph-capture-guarded). Reports time + KV-read BW +
     // grid/SM utilization + occupancy → whether the 1-block-per-head grid starves
