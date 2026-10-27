@@ -2309,6 +2309,124 @@ __global__ void __launch_bounds__(512, 1) gemm_q8_0_w8a8_tc_128_kernel(
     }
 }
 
+// 128x64 register-blocked W8A8 TC GEMM — the occupancy-SAFE rectangular escape the
+// 128x128 bank named ("a SMALLER reg-tile that fits 2 blocks/SM without spilling,
+// e.g. 128x64 -> cacc[2][8]"). Same cp.async double-buffered staging + int8 WMMA +
+// per-32 scale fold as the 64x64 and 128x128 kernels (identical math -> parity-equal,
+// graded vs the fair-W8A8 ref), but BM=128,BN=64: it DOUBLES the weight-row tile so
+// the activation re-read drops to M/128 (vs M/64) while the accumulator stays
+// cacc[2][8] (16 floats = 64 B) — HALF the 128x128's cacc[4][8] (32 floats) that
+// spilled the 64-reg cap. So `__launch_bounds__(512, 2)` targets 2 blocks/SM (67%
+// occupancy, == the 64x64) with NO spill: the halved DRAM traffic lands at full
+// occupancy instead of the 128x128's 1-block/SM latency wall. For the SYMMETRIC
+// Q8_0 TC path weight:activation re-read = BM:BN (both int8), so at 64x64 the two
+// terms are equal and either doubling cuts total re-read traffic 2X->1.5X; 128x64
+// doubles the BM (accumulator-safe) side. Shape-gated to N>=64 so the small-N spec
+// path keeps the 64x64 kernel. Env-gated (RUSTLLAMA_GEMM_128x64) + GEMM_DIAG-reported
+// (regs/spill/activeBlocks) until pod-A/B'd; stays off until the A/B confirms the win.
+template <bool REPACK>
+__global__ void __launch_bounds__(512, 2) gemm_q8_0_w8a8_tc_128x64_kernel(
+    const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
+    const unsigned short *__restrict__ wd, const signed char *__restrict__ xq,
+    const float *__restrict__ xs, float *__restrict__ out, int M, int K, int N) {
+    constexpr int BM = 128, BN = 64, KT = 1, WARPS = 16, KW = KT * 32;
+    __shared__ __align__(16) signed char As[2][BM][KW];
+    __shared__ __align__(16) signed char Bs[2][BN][KW];
+    __shared__ float dw[2][BM][KT];
+    __shared__ float xscl[2][BN][KT];
+    __shared__ int Cs[WARPS][16][16];
+
+    const int rowBase = blockIdx.x * BM;
+    const int tokBase = blockIdx.y * BN;
+    const int warpId = threadIdx.y; // 0..15
+    const int lane = threadIdx.x;   // 0..31
+    const int tid = warpId * 32 + lane;
+    const int nthreads = WARPS * 32; // 512
+    const int spr = K / 32;
+    // 8x2 warp grid over the 8x4 fragment grid: each warp owns a 1x2 fragment strip
+    // (one 16-row band wmr, two adjacent 16-token bands 2*wmc + {0,1}).
+    const int wmr = warpId >> 1; // 0..7 (fragment row)
+    const int wmc = warpId & 1;  // 0..1 (which pair of token-frags)
+
+    float cacc[2][8];
+#pragma unroll
+    for (int f = 0; f < 2; ++f)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) cacc[f][c] = 0.0f;
+
+    const int nTiles = spr; // KT=1 → one 32-wide sub-block per tile
+    rsl_gemm_q8_0_stage_tile_cpasync<REPACK, BM, BN, KT>(0, spr, M, N, K, rowBase, tokBase, tid,
+                                                         nthreads, w, wq, wd, xq, xs, &As[0][0][0],
+                                                         &Bs[0][0][0], &dw[0][0][0], &xscl[0][0][0]);
+    __pipeline_commit();
+
+    for (int t = 0; t < nTiles; ++t) {
+        const int cur = t & 1;
+        if (t + 1 < nTiles) {
+            const int nxt = cur ^ 1;
+            rsl_gemm_q8_0_stage_tile_cpasync<REPACK, BM, BN, KT>(
+                (t + 1) * KT, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, wq, wd, xq, xs,
+                &As[nxt][0][0], &Bs[nxt][0][0], &dw[nxt][0][0], &xscl[nxt][0][0]);
+            __pipeline_commit();
+        }
+        __pipeline_wait_prior((t + 1 < nTiles) ? 1 : 0);
+        __syncthreads();
+        const int sub = 0; // KT=1
+#pragma unroll
+        for (int fi = 0; fi < 2; ++fi) {
+            const int fm = wmr;          // 0..7 fragment row
+            const int fn = 2 * wmc + fi; // 0..3 fragment col
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, signed char,
+                                   nvcuda::wmma::row_major> a_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, signed char,
+                                   nvcuda::wmma::col_major> b_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
+            nvcuda::wmma::fill_fragment(acc_frag, 0);
+#pragma unroll
+            for (int kk = 0; kk < 32; kk += 16) {
+                nvcuda::wmma::load_matrix_sync(a_frag, &As[cur][fm * 16][kk], KW);
+                nvcuda::wmma::load_matrix_sync(b_frag, &Bs[cur][fn * 16][kk], KW);
+                nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+            nvcuda::wmma::store_matrix_sync(&Cs[warpId][0][0], acc_frag, 16,
+                                            nvcuda::wmma::mem_row_major);
+#else
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32, mi = e >> 4, nj = e & 15, acc_i = 0;
+                for (int kk = 0; kk < 32; ++kk)
+                    acc_i += (int)As[cur][fm * 16 + mi][kk] * (int)Bs[cur][fn * 16 + nj][kk];
+                Cs[warpId][mi][nj] = acc_i;
+            }
+#endif
+            __syncwarp();
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32, mi = e >> 4, nj = e & 15;
+                int row = fm * 16 + mi, tok = fn * 16 + nj;
+                cacc[fi][c] +=
+                    xscl[cur][tok][sub] * dw[cur][row][sub] * (float)Cs[warpId][mi][nj];
+            }
+            __syncwarp(); // before this warp reuses Cs for the next fragment
+        }
+        __syncthreads(); // prefetched tile visible + current buffer free to reuse
+    }
+
+    // Write out[token][row] for each of the warp's 2 fragments.
+#pragma unroll
+    for (int fi = 0; fi < 2; ++fi) {
+        const int m0 = rowBase + wmr * 16;
+        const int n0 = tokBase + (2 * wmc + fi) * 16;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int e = lane + c * 32, mi = e >> 4, nj = e & 15;
+            int mg = m0 + mi, ng = n0 + nj;
+            if (mg < M && ng < N) out[(size_t)ng * M + mg] = cacc[fi][c];
+        }
+    }
+}
+
 // One-time repack of a packed Q8_0 weight into the 16-aligned, int4-stageable
 // layout the W8A8 TC GEMM wants: split each 34-byte block (2-byte f16 scale + 32
 // int8) into a contiguous int8 payload `wq[row*K + k]` + an f16-scale array
@@ -2677,6 +2795,15 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
     if (use128_env < 0)
         use128_env = (std::getenv("RUSTLLAMA_GEMM_128") != nullptr) ? 1 : 0;
     const bool use128 = (N >= 128) && use128_env;
+    // 128x64 tile: DEFAULT OFF (RUSTLLAMA_GEMM_128x64=1 to opt in). The occupancy-safe
+    // rectangular escape the 128x128 bank named — half the accumulator (cacc[2][8]),
+    // so `__launch_bounds__(512,2)` keeps 2 blocks/SM with no spill while halving the
+    // activation re-read (M/128 vs M/64). cp.async double-buffered → needs the repacked
+    // (16-aligned) weight; falls through to the 64x64 kernel when the repack is absent.
+    static int use128x64_env = -1;
+    if (use128x64_env < 0)
+        use128x64_env = (std::getenv("RUSTLLAMA_GEMM_128x64") != nullptr) ? 1 : 0;
+    const bool use128x64 = (N >= 64) && use128x64_env && repacked && !use128;
     // One-time occupancy/resource diagnostic (opt-in: RUSTLLAMA_GEMM_DIAG=1). Uses
     // only cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor —
     // NO GPU perf counters — so it works where `ncu` hits ERR_NVGPUCTRPERM (locked
@@ -2738,6 +2865,29 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                              "(localSize>0 => SPILL; activeBlocks==1 & no spill => pure occupancy)\n",
                              fa2.numRegs, fa2.localSizeBytes, fa2.sharedSizeBytes, active2,
                              occ2 * 100.0);
+            }
+            // 128x64 cp.async kernel — the occupancy-safe rectangular escape. The WIN
+            // condition this diag confirms: activeBlocks/SM==2 AND LOCAL(spill)==0 B
+            // (cacc[2][8] = 16 floats should fit the 64-reg cap where the 128x128's
+            // cacc[4][8] = 32 floats spilled). If so, the halved activation re-read
+            // lands at full 64x64 occupancy → the roofline/A/B should show the ~1.5x.
+            cudaFuncAttributes fa3;
+            if (cudaFuncGetAttributes(&fa3, gemm_q8_0_w8a8_tc_128x64_kernel<true>) == cudaSuccess) {
+                int nsm3 = 0, maxThreadsSM3 = 0, active3 = 0;
+                cudaDeviceGetAttribute(&nsm3, cudaDevAttrMultiProcessorCount, s->device);
+                cudaDeviceGetAttribute(&maxThreadsSM3, cudaDevAttrMaxThreadsPerMultiProcessor,
+                                       s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active3, gemm_q8_0_w8a8_tc_128x64_kernel<true>, 512, 0);
+                double occ3 =
+                    maxThreadsSM3 > 0 ? (double)(active3 * 512) / (double)maxThreadsSM3 : 0.0;
+                std::fprintf(stderr,
+                             "[gemm-diag] q8_0_w8a8_tc_128x64 (cp.async, reg-blocked): "
+                             "regs/thread=%d LOCAL(spill)=%zu B static_smem=%zu B/block | "
+                             "block=512thr activeBlocks/SM=%d -> occupancy=%.0f%%  "
+                             "(WANT: spill=0 & activeBlocks/SM=2)\n",
+                             fa3.numRegs, fa3.localSizeBytes, fa3.sharedSizeBytes, active3,
+                             occ3 * 100.0);
             }
         }
     }
@@ -2827,9 +2977,13 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             const int ITERS = 50;
             dim3 g128((unsigned)((M + 127) / 128), (unsigned)((N + 127) / 128));
             dim3 b128(32, 16);
+            dim3 g1x64((unsigned)((M + 127) / 128), (unsigned)((N + 63) / 64));
 #define RSL_RL_GEMM()                                                                      \
     do {                                                                                   \
-        if (use128) {                                                                      \
+        if (use128x64) {                                                                   \
+            gemm_q8_0_w8a8_tc_128x64_kernel<true>                                          \
+                <<<g1x64, b128, 0, s->stream>>>(nullptr, wq, wd, xq, xs, out, M, K, N);    \
+        } else if (use128) {                                                               \
             if (repacked)                                                                  \
                 gemm_q8_0_w8a8_tc_128_kernel<true>                                         \
                     <<<g128, b128, 0, s->stream>>>(nullptr, wq, wd, xq, xs, out, M, K, N); \
@@ -2864,8 +3018,8 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             double w_bytes = (double)M * K + (double)M * (K / 32) * 2.0;
             double a_bytes = (double)N * K + (double)N * (K / 32) * 2.0;
             double o_bytes = (double)M * N * 4.0;
-            double bn = use128 ? 128.0 : (double)RSL_Q4K_TC_BN;
-            double bm = use128 ? 128.0 : (double)RSL_Q4K_TC_BM;
+            double bn = use128x64 ? 64.0 : (use128 ? 128.0 : (double)RSL_Q4K_TC_BN);
+            double bm = use128x64 ? 128.0 : (use128 ? 128.0 : (double)RSL_Q4K_TC_BM);
             double min_bytes = w_bytes + a_bytes + o_bytes;
             double eff_bytes =
                 w_bytes * ((double)N / bn) + a_bytes * ((double)M / bm) + o_bytes;
@@ -2889,6 +3043,15 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             std::fprintf(stderr, "[gemm-roofline] verdict: %s\n", verdict);
             return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
         }
+    }
+    // 128x64 tile — opt-in (RUSTLLAMA_GEMM_128x64=1) + repacked weights, via
+    // `use128x64`. The occupancy-safe bigger-tile escape; A/B-gated until pod-verified.
+    if (use128x64) {
+        dim3 g((unsigned)((M + 127) / 128), (unsigned)((N + 63) / 64));
+        dim3 b(32, 16);
+        gemm_q8_0_w8a8_tc_128x64_kernel<true><<<g, b, 0, s->stream>>>(
+            nullptr, wq, wd, xq, xs, out, M, K, N);
+        return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
     }
     // 128x128 tile — opt-in (RUSTLLAMA_GEMM_128=1) + N>=128, via `use128`. Default
     // OFF: it's correct but net-slower (occupancy-limited — see the note above).
