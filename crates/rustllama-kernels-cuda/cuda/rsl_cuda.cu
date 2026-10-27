@@ -2357,6 +2357,40 @@ __global__ void matvec_q8_0_repacked_kernel(const signed char *wq,
     if (lane == 0) out[row] = acc;
 }
 
+// Forward decl: the saturating float4 copy used to micro-benchmark peak DRAM BW
+// (defined later for the GEMM roofline); the decode-matvec diag below reuses it.
+__global__ void rsl_bw_copy_kernel(const float4 *__restrict__ in,
+                                   float4 *__restrict__ out, long n);
+
+// ncu-free ABLATION twin of matvec_q8_0_repacked_kernel (the decode analog of the
+// GEMM clock64 profiler): identical grid + coalesced access — it loads the SAME
+// wq/wd/x bytes the real row_dot reads — but with TRIVIAL compute (raw integer
+// adds via __float_as_int, no f16/int8 dequant, no FMA). Timing it vs the full
+// kernel splits the decode matvec into its MEMORY floor (this) and its COMPUTE
+// cost (full − this) with no perf counters, so the DECODE_MATVEC_DIAG verdict can
+// say whether the matvec is dequant/dot-bound (→ int-dot) or memory-latency/
+// occupancy-bound (→ more warps / wider loads) or at the bandwidth ceiling.
+__global__ void matvec_q8_0_repacked_loadonly_kernel(const signed char *wq,
+                                                     const unsigned short *wd,
+                                                     const float *x, float *out,
+                                                     int M, int K) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= M) return;
+    int lane = threadIdx.x;
+    int bpr = K / 32;
+    const signed char *wq_row = wq + (size_t)row * K;
+    const unsigned short *wd_row = wd + (size_t)row * bpr;
+    int iacc = 0;
+    for (int b = 0; b < bpr; ++b) {
+        iacc += (int)wd_row[b];                              // f16 scale load (no dequant)
+        iacc += (int)wq_row[(size_t)b * 32 + lane];          // int8 weight load
+        iacc += __float_as_int(x[b * 32 + lane]);            // f32 act load (no float op)
+    }
+    for (int off = warpSize >> 1; off > 0; off >>= 1)
+        iacc += __shfl_down_sync(0xffffffffu, iacc, off);
+    if (lane == 0) out[row] = (float)iacc; // write so the loads aren't eliminated
+}
+
 // Decode matvec over the per-stream Q8_0 repack cache — LOOKUP-ONLY (no malloc,
 // so it is CUDA-graph-capturable): if the repack this weight needs is already
 // cached (the prefill GEMM builds it, keyed by the SAME weight device ptr), run
@@ -2378,6 +2412,113 @@ extern "C" int rsl_cuda_matvec_q8_0_repacked(rsl_cuda_stream *s, const void *w,
     cudaSetDevice(s->device);
     dim3 block(32, 8);
     dim3 grid((unsigned)((M + 7) / 8));
+    // ncu-free DECODE-MATVEC diagnostic (opt-in: RUSTLLAMA_DECODE_MATVEC_DIAG=1),
+    // fired ONCE on the first repacked decode matvec. No perf counters: (1) the
+    // slice's peak DRAM BW via a saturating float4 copy; (2) the full matvec time;
+    // (3) the ABLATION (load-only) time → compute vs memory split; (4) occupancy.
+    // Verdict decides the decode-matvec lever: dequant/dot-bound → int-dot; memory
+    // latency/occupancy-bound → more warps / wider loads; at the BW ceiling →
+    // lower-precision weights only. The decode analog of GEMM_ROOFLINE/GEMM_CYCLES.
+    {
+        static int dmd_done = 0;
+        // Skip during CUDA-graph CAPTURE — the diag's cudaMalloc/events would break
+        // it. The diag runs on the eager path (RUSTLLAMA_DEV_ATTN_GRAPH=0), which is
+        // how you profile anyway; it fires on the first non-captured matvec call.
+        cudaStreamCaptureStatus capst = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s->stream, &capst);
+        if (!dmd_done && capst == cudaStreamCaptureStatusNone &&
+            std::getenv("RUSTLLAMA_DECODE_MATVEC_DIAG") != nullptr) {
+            dmd_done = 1;
+            cudaFuncAttributes fa;
+            if (cudaFuncGetAttributes(&fa, matvec_q8_0_repacked_kernel) == cudaSuccess) {
+                int nsm = 0, maxThreadsSM = 0, active = 0;
+                cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+                cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor,
+                                       s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, matvec_q8_0_repacked_kernel,
+                                                              256, 0);
+                double occ =
+                    maxThreadsSM > 0 ? (double)(active * 256) / (double)maxThreadsSM : 0.0;
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0);
+                cudaEventCreate(&e1);
+                // (1) peak DRAM BW: 128 MB saturating float4 copy.
+                double peak_gbs = 0.0;
+                {
+                    long n4 = (128L << 20) / (long)sizeof(float4);
+                    float4 *ci = nullptr, *co = nullptr;
+                    if (cudaMalloc(&ci, n4 * sizeof(float4)) == cudaSuccess &&
+                        cudaMalloc(&co, n4 * sizeof(float4)) == cudaSuccess) {
+                        cudaMemset(ci, 1, n4 * sizeof(float4));
+                        rsl_bw_copy_kernel<<<65535, 256, 0, s->stream>>>(ci, co, n4);
+                        cudaStreamSynchronize(s->stream);
+                        cudaEventRecord(e0, s->stream);
+                        const int CI = 30;
+                        for (int it = 0; it < CI; it++)
+                            rsl_bw_copy_kernel<<<65535, 256, 0, s->stream>>>(ci, co, n4);
+                        cudaEventRecord(e1, s->stream);
+                        cudaEventSynchronize(e1);
+                        float cms = 0.f;
+                        cudaEventElapsedTime(&cms, e0, e1);
+                        peak_gbs = 2.0 * (double)n4 * sizeof(float4) / ((double)cms / CI / 1e3) / 1e9;
+                    }
+                    if (ci) cudaFree(ci);
+                    if (co) cudaFree(co);
+                }
+                const int ITERS = 100;
+                // (2) full matvec.
+                matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K);
+                cudaStreamSynchronize(s->stream);
+                cudaEventRecord(e0, s->stream);
+                for (int it = 0; it < ITERS; it++)
+                    matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K);
+                cudaEventRecord(e1, s->stream);
+                cudaEventSynchronize(e1);
+                float fms = 0.f;
+                cudaEventElapsedTime(&fms, e0, e1);
+                double full_s = (double)fms / ITERS / 1e3;
+                // (3) ablation: load-only (same bytes, trivial compute).
+                matvec_q8_0_repacked_loadonly_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out,
+                                                                                    M, K);
+                cudaStreamSynchronize(s->stream);
+                cudaEventRecord(e0, s->stream);
+                for (int it = 0; it < ITERS; it++)
+                    matvec_q8_0_repacked_loadonly_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x,
+                                                                                        out, M, K);
+                cudaEventRecord(e1, s->stream);
+                cudaEventSynchronize(e1);
+                float lms = 0.f;
+                cudaEventElapsedTime(&lms, e0, e1);
+                double load_s = (double)lms / ITERS / 1e3;
+                cudaEventDestroy(e0);
+                cudaEventDestroy(e1);
+                // Unique DRAM traffic: M*K int8 weights + M*(K/32) f16 scales + K f32
+                // activation (read once; it is shared across all M rows + L2-cached).
+                double bytes = (double)M * K + (double)M * (K / 32) * 2.0 + (double)K * 4.0;
+                double bw_full = bytes / full_s / 1e9;
+                double bw_load = bytes / load_s / 1e9;
+                double compute_frac = full_s > load_s ? (full_s - load_s) / full_s : 0.0;
+                const char *verdict;
+                if (compute_frac > 0.40)
+                    verdict = "COMPUTE-bound (f16/int8 dequant + FMA) -> int-dot (W8A8) / faster "
+                              "dequant";
+                else if (peak_gbs > 0.0 && bw_load < 0.5 * peak_gbs)
+                    verdict = "MEMORY LATENCY/OCCUPANCY-bound (loads underfill BW) -> more warps / "
+                              "wider (vectorized) loads / ILP";
+                else
+                    verdict = "MEMORY-BANDWIDTH-bound (near copy peak) -> only lower-precision "
+                              "weights reduce it";
+                std::fprintf(
+                    stderr,
+                    "[decode-matvec-diag] q8_0_repacked M=%d K=%d: full=%.1fus load=%.1fus "
+                    "compute=%.0f%% | eff-BW=%.0f load-BW=%.0f peak=%.0f GB/s (%.0f%% of peak) | "
+                    "regs=%d block=256thr activeBlocks/SM=%d occ=%.0f%% -> %s\n",
+                    M, K, full_s * 1e6, load_s * 1e6, compute_frac * 100.0, bw_full, bw_load,
+                    peak_gbs, peak_gbs > 0.0 ? bw_full * 100.0 / peak_gbs : 0.0, fa.numRegs, active,
+                    occ * 100.0, verdict);
+            }
+        }
+    }
     matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K);
     return rsl_cuda_check("rsl_cuda_matvec_q8_0_repacked");
 }
