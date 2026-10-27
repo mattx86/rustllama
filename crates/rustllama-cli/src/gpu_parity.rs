@@ -7124,6 +7124,83 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Q8_0 W8A8 128x64 TILE correctness (opt-in: RUSTLLAMA_GEMM_128x64) ----
+    // The 128x64 prefill GEMM tile is the SAME int8-TC math as the 64x64/128x128
+    // kernels, only the warp->fragment tiling differs — so the one thing that can
+    // break it is an indexing bug in the frag map / scale fold / masked write-out.
+    // This probe grades THAT: it runs ONLY when the env that routes N>=64 through
+    // the 128x64 kernel is set (so the user's A/B run validates it in the same
+    // pass), at N=128 (a full 2 token-blocks so both wmc halves are exercised),
+    // vs the identical fair-W8A8 reference the 64x64 probe uses. The env is read
+    // once by the launcher at first call, so the user must export it at process
+    // start (`RUSTLLAMA_GEMM_128x64=1 rustllama doctor --cuda-parity`).
+    #[allow(clippy::never_loop)]
+    for _t1x64 in 0..1usize {
+        if std::env::var("RUSTLLAMA_GEMM_128x64").is_err() {
+            break; // not opted in → the launcher stays on the 64x64 path, nothing to grade
+        }
+        const N2: usize = 128;
+        let name = "gemm:q8_0_w8a8_tc_128x64";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q8_0").expect("layout");
+        let cpu = cpu_matvec_for("q8_0");
+        let xb_host: Vec<f32> = gen_x(N2 * MV_K, 0x1264);
+        let Some((w, _)) = finite_ref(layout, cpu, &xb_host[..MV_K]) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut cpu_out = vec![0f32; N2 * MV_M];
+        for r in 0..N2 {
+            let xr = int8_act_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
+            let mut row = vec![0f32; MV_M];
+            cpu(&w, &xr, &mut row, MV_M, MV_K);
+            cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
+        }
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &xb_host),
+            ck::CudaDeviceBuffer::alloc(&stream, N2 * MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: live device buffers on `stream` sized for (N2,M)/(N2,K). With the
+        // env set, the launcher routes this N>=64 call through the 128x64 kernel.
+        let res = unsafe {
+            ck::gemm_q8_0_w8a8_tc(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+                N2,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        }
+        let (cos, max_rel) = compare(&cu_download_f32(&ob, N2 * MV_M), &cpu_out);
+        if cos > 0.999 && max_rel < 0.05 {
+            cu_emit(
+                name,
+                "OK",
+                &format!("cos={cos:.6} max_rel={max_rel:.4} (N={N2})"),
+            );
+            *counts.entry("OK").or_default() += 1;
+        } else {
+            cu_emit(
+                name,
+                "MISCOMPUTE",
+                &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+            );
+            *counts.entry("MISCOMPUTE").or_default() += 1;
+        }
+    }
+
     // ---- Q4_K W4A8 DECODE matvec (verdict: matvec:q4_k_w4a8, LOSSY + perf-gated) ----
     // The decode (single-row) twin of the W8A8 GEMM above. Same two-part gate:
     // (1) correctness vs the FAIR W8A8 reference (int8-activation round-trip →
