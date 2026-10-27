@@ -366,6 +366,15 @@ extern "C" {
         m: c_int,
         k: c_int,
     ) -> c_int;
+    // Accumulate variant: out += W·x (FFN final-residual fold); -1 if no repack.
+    fn rsl_cuda_matvec_q8_0_repacked_accum(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
     // Q4_0 / Q5_0 W8A8 DECODE matvecs (single-row, lossy int8-activation; T3b).
     // Selected via `matvec:q4_0_w8a8` / `matvec:q5_0_w8a8` (correct + perf-gated).
     fn rsl_cuda_matvec_q4_0_w8a8(
@@ -2817,6 +2826,19 @@ fn decode_fuse_qknorm_rope_enabled() -> bool {
         std::env::var("RUSTLLAMA_DECODE_FUSE_QKNORM_ROPE")
             .map(|v| v != "0")
             .unwrap_or(true)
+    })
+}
+
+/// Whether the decode block folds the FFN final residual-add INTO the down matvec
+/// (`hidden += W_down·act`, Q8_0 repacked path), deleting the separate `add_f32`
+/// glue kernel. Default OFF (A/B lever `RUSTLLAMA_DECODE_FUSE_FINAL_ADD=1`);
+/// bit-exact, so promoted to default-on once the production-graph A/B confirms it.
+fn decode_fuse_final_add_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DECODE_FUSE_FINAL_ADD")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
@@ -6857,11 +6879,20 @@ impl CudaMatvecCache {
                 if silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_err() {
                     return false;
                 }
-                if !self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) {
-                    return false;
-                }
-                if add_f32(&self.stream, ph, po, d_model).is_err() {
-                    return false;
+                // Fold the final residual (hidden += W_down·act) INTO the down matvec
+                // when enabled + Q8_0 repack available (one kernel instead of matvec
+                // + add_f32); bit-exact. Else the matvec + separate add.
+                let folded = decode_fuse_final_add_enabled()
+                    && self.matvec_q8_0_repacked_accum_dev_io(
+                        wd.0, wd.1, wd.2, p_act, ph, d_model, d_ff,
+                    );
+                if !folded {
+                    if !self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) {
+                        return false;
+                    }
+                    if add_f32(&self.stream, ph, po, d_model).is_err() {
+                        return false;
+                    }
                 }
             }
         }
@@ -8887,6 +8918,44 @@ impl CudaMatvecCache {
         gate_out.copy_from_slice(&both[..m]);
         up_out.copy_from_slice(&both[m..2 * m]);
         true
+    }
+
+    /// Device-I/O ACCUMULATE matvec for the decode FFN down-projection: `out += W·x`
+    /// (Q8_0 repacked path only), folding the FFN final residual (`hidden += ffn_out`)
+    /// INTO the down matvec so the separate `add_f32` glue kernel is deleted —
+    /// bit-exact. Returns false (caller runs `matvec_packed_dev_io` + `add_f32`) when
+    /// the weight isn't Q8_0 / no repack is cached / bad shape.
+    ///
+    /// # Safety
+    /// `x_dev` [k] and `out_dev` [m] are live device f32 buffers on `self.stream`;
+    /// `w_bytes` lives for the call.
+    #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+    pub unsafe fn matvec_q8_0_repacked_accum_dev_io(
+        &mut self,
+        kind: CudaPackedKind,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+    ) -> bool {
+        if !matches!(kind, CudaPackedKind::Q8_0) || m == 0 || k == 0 || k % 32 != 0 {
+            return false;
+        }
+        if w_bytes.len() < m * kind.row_bytes(k) || !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        let rc = rsl_cuda_matvec_q8_0_repacked_accum(
+            self.stream.raw(),
+            w_ptr,
+            x_dev,
+            out_dev,
+            m as c_int,
+            k as c_int,
+        );
+        rc == 0 && consume_error_count() == 0
     }
 
     /// Device-I/O fused gate+up matvec for the decode block: one launch computes

@@ -2345,7 +2345,7 @@ q8_0_repacked_row_dot_warp(const signed char *wq_row, const unsigned short *wd_r
 __global__ void matvec_q8_0_repacked_kernel(const signed char *wq,
                                             const unsigned short *wd,
                                             const float *x, float *out, int M,
-                                            int K) {
+                                            int K, int accum) {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= M) return;
     int lane = threadIdx.x;
@@ -2354,7 +2354,9 @@ __global__ void matvec_q8_0_repacked_kernel(const signed char *wq,
                                            wd + (size_t)row * bpr, x, bpr, lane);
     for (int off = warpSize >> 1; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) out[row] = acc;
+    // `accum` folds the FFN final residual (hidden += W_down·act) INTO this matvec,
+    // deleting the separate add kernel — bit-exact (add after the same dot).
+    if (lane == 0) out[row] = accum ? out[row] + acc : acc;
 }
 
 // Forward decl: the saturating float4 copy used to micro-benchmark peak DRAM BW
@@ -2467,11 +2469,11 @@ extern "C" int rsl_cuda_matvec_q8_0_repacked(rsl_cuda_stream *s, const void *w,
                 }
                 const int ITERS = 100;
                 // (2) full matvec.
-                matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K);
+                matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K, 0);
                 cudaStreamSynchronize(s->stream);
                 cudaEventRecord(e0, s->stream);
                 for (int it = 0; it < ITERS; it++)
-                    matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K);
+                    matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K, 0);
                 cudaEventRecord(e1, s->stream);
                 cudaEventSynchronize(e1);
                 float fms = 0.f;
@@ -2519,8 +2521,32 @@ extern "C" int rsl_cuda_matvec_q8_0_repacked(rsl_cuda_stream *s, const void *w,
             }
         }
     }
-    matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K);
+    matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K, 0);
     return rsl_cuda_check("rsl_cuda_matvec_q8_0_repacked");
+}
+
+// ACCUMULATE variant of the repacked decode matvec: `out[row] += W_down[row]·x`.
+// Folds the FFN final residual (hidden += ffn_out) INTO the down matvec, deleting
+// the separate add_f32 glue kernel — bit-exact. Same lookup-only repack contract
+// (returns -1 if no cached repack → caller runs the byte matvec + separate add).
+extern "C" int rsl_cuda_matvec_q8_0_repacked_accum(rsl_cuda_stream *s,
+                                                   const void *w, const float *x,
+                                                   float *out, int M, int K) {
+    if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % 32) != 0) return -1;
+    const signed char *wq = nullptr;
+    const unsigned short *wd = nullptr;
+    for (auto &e : s->q80_repack)
+        if (e.w == w && e.wq && e.M == M && e.K == K) {
+            wq = e.wq;
+            wd = e.wd;
+            break;
+        }
+    if (!wq) return -1;
+    cudaSetDevice(s->device);
+    dim3 block(32, 8);
+    dim3 grid((unsigned)((M + 7) / 8));
+    matvec_q8_0_repacked_kernel<<<grid, block, 0, s->stream>>>(wq, wd, x, out, M, K, 1);
+    return rsl_cuda_check("rsl_cuda_matvec_q8_0_repacked_accum");
 }
 
 // ---- cudaEvent timing FFI (the sync-free, GRAPH-representative phase timer) ----
