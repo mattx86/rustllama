@@ -643,6 +643,15 @@ pub enum Command {
         /// block is bit-exact, so this gates on speed, not correctness.
         #[arg(long)]
         dev_attn: bool,
+        /// Device-resident PREFILL block A/B (the prefill twin of `--dev-attn`):
+        /// force the block off then on on one f32-KV load, measure PREFILL tok/s,
+        /// and persist a PERF verdict (`prefill:dev_resident_block`) that
+        /// auto-enables the block only where it's measured faster than the host
+        /// prefill path on this device+model. CUDA-only; a `tune --all` sub-stage
+        /// (Stage 1e). The block is bit-exact, so this gates on speed, not
+        /// correctness.
+        #[arg(long)]
+        dev_prefill: bool,
         /// Sweep the MoE tiered-expert VRAM margin (the headroom reserved below
         /// free VRAM when projecting the expert-promotion budget) and persist the
         /// per-model margin with the best decode tok/s. A smaller margin promotes
@@ -1438,6 +1447,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             per_device_perf,
             validate_kernels,
             dev_attn,
+            dev_prefill,
             moe_vram_margin,
             cacheblend,
             batching,
@@ -1536,6 +1546,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 per_device_perf,
                 validate_kernels,
                 dev_attn,
+                dev_prefill,
                 moe_vram_margin,
                 cacheblend,
                 batching,
@@ -1555,7 +1566,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --ssm-prefill-chunked / --parallel-matvec-crossover / \
                      --matvec-min-flops / --ssm-chunk / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
-                     --dev-attn / --moe-vram-margin / --cacheblend / --batching / --all \
+                     --dev-attn / --dev-prefill / --moe-vram-margin / --cacheblend / \
+                     --batching / --all \
                      are exclusive; pick at most one"
                 );
             }
@@ -1757,6 +1769,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     decode_tokens,
                     repeats,
                 );
+            }
+            if dev_prefill {
+                return cmd_tune_dev_prefill(&config_path, model, repeats);
             }
             if moe_vram_margin {
                 return cmd_tune_moe_vram_margin(
@@ -6890,6 +6905,74 @@ fn cmd_tune_dev_attn(
     Ok(())
 }
 
+/// `tune --dev-prefill` (Stage 1e): A/B the device-resident PREFILL block and
+/// persist the PERF verdict `prefill:dev_resident_block`, which
+/// `accel::dev_prefill_enabled` reads to auto-enable the block only where it beats
+/// the host prefill path on this device+model. The block is bit-exact (coherence
+/// validated separately), so this gates on SPEED, not correctness. CUDA-only; on
+/// any other host `measure_dev_prefill` returns BEFORE loading, so it prints
+/// "skipped" and persists nothing — the path stays off (fail-closed). Before this
+/// stage existed the verdict had NO writer, so device-resident prefill defaulted
+/// off on every box unless `RUSTLLAMA_DEV_PREFILL=1` was set by hand.
+fn cmd_tune_dev_prefill(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_dev_prefill, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+
+    println!("rustllama tune --dev-prefill");
+    println!("  model = {}", model_path.display());
+
+    // The block is F32-KV-only; `measure_dev_prefill` forces f32 regardless. Pass
+    // the config's layout / flash / placement so the A/B runs on the same prefill
+    // path serve would. CUDA-only + the engagement check happen inside the
+    // measurement (it returns BEFORE loading off CUDA).
+    let m_cfg = MeasurementConfig {
+        kv_dtype: rustllama_engine::KvDtype::F32,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+
+    let report = measure_dev_prefill(&model_path, &m_cfg, repeats.max(3) as usize)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    match (report.capable, report.off_tps, report.on_tps, report.winner) {
+        (true, Some(off), Some(on), Some(win)) => {
+            println!("  host prefill (OFF) = {off:.1} tok/s");
+            println!(
+                "  dev  prefill (ON)  = {on:.1} tok/s  ({:+.1}%)",
+                (on / off - 1.0) * 100.0
+            );
+            println!(
+                "  → {}",
+                if win {
+                    "ENABLE — device-resident prefill is faster here"
+                } else {
+                    "keep host path — device-resident prefill is not a win here"
+                }
+            );
+            let name = rustllama_tuner::VERDICT_PREFILL_DEV_RESIDENT_BLOCK;
+            persist_kernel_verdicts(&[(name.to_string(), win)])?;
+            println!("  → persisted verdict {name} = {win}");
+        }
+        _ => {
+            println!(
+                "  → not measured ({}); verdict left unset — path stays off",
+                report
+                    .error
+                    .unwrap_or_else(|| "device-resident prefill did not engage".into())
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Persist the per-model MoE VRAM-margin winner (bytes) into the tuner cache,
 /// keyed by model stem under `moe_vram_margin` (mirrors `persist_placement_winner`).
 /// `load_inner` reads it at load so `serve` auto-applies the decode-optimal
@@ -9167,6 +9250,17 @@ fn cmd_tune_all(
                 && t.kernel_build_id == build_id
         })
         .unwrap_or(false);
+    // Device-resident PREFILL perf verdict — build-stamped like dev-attn, its own
+    // (CUDA-only) key. `Some(false)` (measured no-win) still counts as decided, so
+    // use `contains_key`.
+    let has_dev_prefill = cached
+        .as_ref()
+        .map(|t| {
+            t.kernel_verdicts
+                .contains_key(rustllama_tuner::VERDICT_PREFILL_DEV_RESIDENT_BLOCK)
+                && t.kernel_build_id == build_id
+        })
+        .unwrap_or(false);
     // Tree-width winner. It does NOT persist a sentinel on a non-capable model
     // (there is no "off" width vector) — the sweep SKIPs and writes nothing — so
     // `is_some()` is the "already tuned" probe. A SKIPped (write-blind) model
@@ -9311,7 +9405,27 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 1e/10: multi-gpu mode (A/B single / pipeline / tensor — fastest decode; SKIPs on <2 GPUs)");
+    println!("Stage 1e/10: dev-prefill perf (A/B the device-resident prefill block, f32 KV)");
+    println!("--------");
+    if skip(has_dev_prefill) {
+        println!("(skipped: dev-prefill verdict already cached for this build)");
+    } else {
+        // Model-dependent f32-KV prefill A/B; CUDA-only (the stage self-skips off
+        // CUDA). Subprocess like the others for a clean GPU context.
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--dev-prefill",
+            thorough,
+            "1e (dev-prefill perf)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 1e (dev-prefill perf) failed; continuing");
+        }
+    }
+
+    println!();
+    println!("Stage 1f/10: multi-gpu mode (A/B single / pipeline / tensor — fastest decode; SKIPs on <2 GPUs)");
     println!("--------");
     if skip(has_multi_gpu) {
         println!("(skipped: multi-GPU mode already cached)");
@@ -9319,7 +9433,7 @@ fn cmd_tune_all(
         // Measured autotune: reload under each mode + bench. SKIPs internally on a
         // single-GPU host (the common case). Runs AFTER stage 1b so pp/tp placement
         // reads the banked per-device perf. Subprocess for a clean GPU context.
-        let args_1e = vec![
+        let args_1f = vec![
             "--prompt-tokens".to_string(),
             measure_prompt_tokens.to_string(),
             "--decode-tokens".to_string(),
@@ -9332,10 +9446,10 @@ fn cmd_tune_all(
             &model_clone_for_stages,
             "--multi-gpu",
             thorough,
-            "1e (multi-gpu mode)",
-            &args_1e,
+            "1f (multi-gpu mode)",
+            &args_1f,
         ) {
-            tracing::warn!(error = %e, "stage 1e (multi-gpu mode) failed; continuing");
+            tracing::warn!(error = %e, "stage 1f (multi-gpu mode) failed; continuing");
         }
     }
 

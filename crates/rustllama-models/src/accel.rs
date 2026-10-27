@@ -11128,9 +11128,10 @@ fn dev_attn_enabled() -> bool {
 /// where it beat the host prefill path). `RUSTLLAMA_DEV_PREFILL=1` force-enables
 /// (the on-pod A/B lever before the verdict is banked); `=0` force-disables. The
 /// tuner per-arm force override wins over both. Fail-closed: unmeasured /
-/// not-a-win ⇒ off (the host prefill path runs). Correctness is validated
-/// separately (`doctor --cuda-parity prefill:dev_resident_block`), so the gate is
-/// purely perf.
+/// not-a-win ⇒ off (the host prefill path runs). Correctness is established by
+/// coherence runs (the block is the batched twin of the parity-validated per-op
+/// attention + matvec kernels; a dedicated `doctor --cuda-parity` prefill-block
+/// probe is a follow-up), so the gate is purely perf.
 pub fn dev_prefill_enabled() -> bool {
     // PP-2: off under a multi-device pipeline split — the block pins the
     // activation slab on one device across the whole forward.
