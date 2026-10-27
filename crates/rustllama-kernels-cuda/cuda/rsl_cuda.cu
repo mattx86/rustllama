@@ -2804,6 +2804,24 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
     if (use128x64_env < 0)
         use128x64_env = (std::getenv("RUSTLLAMA_GEMM_128x64") != nullptr) ? 1 : 0;
     const bool use128x64 = (N >= 64) && use128x64_env && repacked && !use128;
+    // One-shot gate trace (opt-in: RUSTLLAMA_GEMM_128x64) — the pod A/B showed the
+    // 128x64 path never engaged (identical eff-BW on/off) with the gate LOOKING
+    // correct, so print each input the first time the env is set to localize which
+    // term is false (N<64 / repack-absent / use128 collision / env-not-seen).
+    {
+        static int gate_dbg = 0;
+        const bool want_trace =
+            std::getenv("RUSTLLAMA_GEMM_128x64") || std::getenv("RUSTLLAMA_GEMM_ROOFLINE");
+        if (!gate_dbg && want_trace) {
+            gate_dbg = 1;
+            std::fprintf(stderr,
+                         "[gemm-128x64-gate] use128x64=%d | N=%d (>=64:%d) cached_env=%d "
+                         "fresh_getenv=%d repacked=%d !use128=%d | M=%d K=%d\n",
+                         (int)use128x64, N, (int)(N >= 64), use128x64_env,
+                         (int)(std::getenv("RUSTLLAMA_GEMM_128x64") != nullptr), (int)repacked,
+                         (int)(!use128), M, K);
+        }
+    }
     // One-time occupancy/resource diagnostic (opt-in: RUSTLLAMA_GEMM_DIAG=1). Uses
     // only cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor —
     // NO GPU perf counters — so it works where `ncu` hits ERR_NVGPUCTRPERM (locked
@@ -3027,11 +3045,14 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             double eff_gbs = eff_bytes / t / 1e9;
             double min_gbs = min_bytes / t / 1e9;
             double pct = peak_gbs > 0 ? 100.0 / peak_gbs : 0.0;
+            // Name the kernel RSL_RL_GEMM actually dispatched, so an A/B that flips
+            // RUSTLLAMA_GEMM_128x64 is unambiguous instead of inferring it from eff-BW.
+            const char *kern = use128x64 ? "128x64" : (use128 ? "128x128" : "64x64");
             std::fprintf(stderr,
-                         "[gemm-roofline] q8_0_w8a8_tc M=%d K=%d N=%d weights=%s: "
+                         "[gemm-roofline] q8_0_w8a8_tc[%s] M=%d K=%d N=%d weights=%s: "
                          "%.1f us/call | %.2f int8-TOPS | eff-BW=%.0f GB/s (%.0f%% peak, "
                          "re-read %.1fx) | min-BW=%.0f GB/s (%.0f%% peak) | measured peak=%.0f GB/s\n",
-                         M, K, N, repacked ? "int4-repacked" : "byte-packed", t * 1e6,
+                         kern, M, K, N, repacked ? "int4-repacked" : "byte-packed", t * 1e6,
                          tops, eff_gbs, eff_gbs * pct, (double)N / bn, min_gbs,
                          min_gbs * pct, peak_gbs);
             const char *verdict =
