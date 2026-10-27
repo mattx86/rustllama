@@ -2831,14 +2831,16 @@ fn decode_fuse_qknorm_rope_enabled() -> bool {
 
 /// Whether the decode block folds the FFN final residual-add INTO the down matvec
 /// (`hidden += W_down·act`, Q8_0 repacked path), deleting the separate `add_f32`
-/// glue kernel. Default OFF (A/B lever `RUSTLLAMA_DECODE_FUSE_FINAL_ADD=1`);
-/// bit-exact, so promoted to default-on once the production-graph A/B confirms it.
+/// glue kernel. Default ON (`RUSTLLAMA_DECODE_FUSE_FINAL_ADD=0` disables). Bit-exact
+/// + a confirmed (if small) structural win — pod production-GRAPH A/B: decode
+/// 190.6→192.6 tok/s (+1.0%, OFF/ON ranges non-overlapping). Falls back to the
+/// matvec + separate add when not Q8_0 / no repack cached.
 fn decode_fuse_final_add_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
         std::env::var("RUSTLLAMA_DECODE_FUSE_FINAL_ADD")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
