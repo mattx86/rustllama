@@ -4254,6 +4254,61 @@ extern "C" int rsl_cuda_rope_rows_f32(rsl_cuda_stream *s, float *qk, int n_heads
     return rsl_cuda_check("rsl_cuda_rope_rows_f32");
 }
 
+// FUSED per-head RMSNorm (Qwen3 q/k-norm) + RoPE in ONE launch — the decode glue
+// profiler (RUSTLLAMA_DECODE_BLOCK_DIAG) found decode GLUE-bound (~50%/layer),
+// dominated by the ~8 tiny latency-bound 1-row kernels; qk-norm + rope is 4 of
+// them (norm-q, norm-k, rope-q, rope-k → 2 fused). One block per (row, head):
+// RMSNorm the head_dim vector (×w), sync, then rotate the (j, j+half) pairs.
+// BIT-EXACT to `qk_head_norm_f32` then `rope_rows_f32` (same math, same order).
+__global__ void qk_norm_rope_f32_kernel(float *buf, const float *w,
+                                        const float *inv_freq, int n_heads,
+                                        int head_dim, int base_pos, int n_rows,
+                                        float eps) {
+    int idx = blockIdx.x; // row * n_heads + head
+    int row = idx / n_heads;
+    if (row >= n_rows) return;
+    float *rowp = buf + (size_t)idx * head_dim;
+    int half = head_dim / 2;
+    __shared__ float sh[256];
+    float local = 0.f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) local += rowp[i] * rowp[i];
+    sh[threadIdx.x] = local;
+    __syncthreads();
+    for (int s2 = blockDim.x >> 1; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sh[threadIdx.x] += sh[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / (float)head_dim + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        rowp[i] = rowp[i] * inv * w[i];
+    __syncthreads(); // both halves of each pair must be normalized before rotating
+    for (int j = threadIdx.x; j < half; j += blockDim.x) {
+        float angle = (float)(base_pos + row) * inv_freq[j];
+        float c = cosf(angle), si = sinf(angle);
+        float x0 = rowp[j];
+        float x1 = rowp[j + half];
+        rowp[j] = x0 * c - x1 * si;
+        rowp[j + half] = x0 * si + x1 * c;
+    }
+}
+
+extern "C" int rsl_cuda_qk_norm_rope_f32(rsl_cuda_stream *s, float *buf,
+                                         const float *w, const float *inv_freq,
+                                         int n_heads, int head_dim, int base_pos,
+                                         int n_rows, float eps) {
+    if (!s || !buf || !w || !inv_freq || n_heads <= 0 || head_dim <= 0 ||
+        n_rows <= 0 || base_pos < 0 || (head_dim % 2) != 0 || head_dim > 2048)
+        return -1;
+    cudaSetDevice(s->device);
+    // 256 threads/block — IDENTICAL to `qk_head_norm_f32`'s launch, so the shared
+    // sum-of-squares reduction has the same fp order (bit-exact). The strided loops
+    // cover head_dim (>256 ok) and `half` regardless of the thread count.
+    int b = n_rows * n_heads;
+    qk_norm_rope_f32_kernel<<<b, 256, 0, s->stream>>>(buf, w, inv_freq, n_heads,
+                                                      head_dim, base_pos, n_rows, eps);
+    return rsl_cuda_check("rsl_cuda_qk_norm_rope_f32");
+}
+
 // Scatter n_new post-RoPE K/V rows from the token-major activation layout
 // [n_new, n_kv_heads, head_dim] into the head-major KV mirror
 // [n_kv_heads, max_ctx, head_dim] at column `col_base`, so that

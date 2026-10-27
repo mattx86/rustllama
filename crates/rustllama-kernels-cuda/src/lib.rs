@@ -985,6 +985,18 @@ extern "C" {
         head_dim: c_int,
         eps: f32,
     ) -> c_int;
+    // Fused per-head RMSNorm + RoPE (bit-exact to qk_head_norm_f32 then rope_rows_f32).
+    fn rsl_cuda_qk_norm_rope_f32(
+        s: *mut RslCudaStreamRaw,
+        buf: *mut f32,
+        w: *const f32,
+        inv_freq: *const f32,
+        n_heads: c_int,
+        head_dim: c_int,
+        base_pos: c_int,
+        n_rows: c_int,
+        eps: f32,
+    ) -> c_int;
     fn rsl_cuda_silu_mul_f32(
         s: *mut RslCudaStreamRaw,
         x: *const f32,
@@ -2790,6 +2802,21 @@ fn decode_fused_gate_up_enabled() -> bool {
     })
 }
 
+/// Whether the device-resident DECODE block fuses the Qwen3 qk-head-norm + RoPE
+/// into one kernel per tensor (`RUSTLLAMA_DECODE_FUSE_QKNORM_ROPE=1`). Default OFF
+/// → the separate qk-norm + rope kernels run (byte-identical). The fused kernel is
+/// BIT-EXACT to the two (same reduction + rotation), so this is a pure perf A/B
+/// lever (4 latency-bound 1-row glue kernels → 2). Measured via the production
+/// GRAPH decode tok/s before promotion to a verdict.
+fn decode_fuse_qknorm_rope_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DECODE_FUSE_QKNORM_ROPE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Arm the decode-block TRUE breakdown ONCE (`RUSTLLAMA_DECODE_BLOCK_DIAG=1`):
 /// returns true on the FIRST eager decode-block call only, so that call records
 /// cudaEvents at its section boundaries (start / pre-attn / attn / post-attn /
@@ -3206,6 +3233,43 @@ pub unsafe fn qk_head_norm_f32(
         w,
         n_heads as c_int,
         head_dim as c_int,
+        eps,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Fused per-head RMSNorm + RoPE in one launch — bit-exact to [`qk_head_norm_f32`]
+/// then [`rope_rows_f32`] (same reduction + rotation math/order). The decode
+/// glue-fusion lever (qk-norm + rope were 4 of the ~8 latency-bound 1-row glue
+/// kernels the decode-block diag found at ~50% of the layer).
+///
+/// SAFETY: `buf` is `[n_rows*n_heads*head_dim]` device f32; `w`/`inv_freq` are
+/// device f32 (`[head_dim]` / `[head_dim/2]`).
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn qk_norm_rope_f32(
+    stream: &CudaStream,
+    buf: *mut f32,
+    w: *const f32,
+    inv_freq: *const f32,
+    n_heads: usize,
+    head_dim: usize,
+    base_pos: usize,
+    n_rows: usize,
+    eps: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_qk_norm_rope_f32(
+        stream.raw(),
+        buf,
+        w,
+        inv_freq,
+        n_heads as c_int,
+        head_dim as c_int,
+        base_pos as c_int,
+        n_rows as c_int,
         eps,
     );
     if rc == 0 {
@@ -6625,22 +6689,46 @@ impl CudaMatvecCache {
             db[0] += tmark.elapsed().as_nanos() as u64; // matvec (qkv)
             tmark = std::time::Instant::now();
         }
-        // 3. Qwen3 qk-head-norm; 4. RoPE (both device, in place).
+        // 3. Qwen3 qk-head-norm; 4. RoPE (both device, in place). Fuse norm+rope
+        // into ONE kernel per tensor (4 glue kernels → 2) when enabled AND both
+        // q/k are normed (Qwen3); bit-exact to the separate path. A/B lever.
+        let fuse_qkr = decode_fuse_qknorm_rope_enabled() && q_norm.is_some() && k_norm.is_some();
         unsafe {
-            if q_norm.is_some()
-                && qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_err()
-            {
-                return false;
-            }
-            if k_norm.is_some()
-                && qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_err()
-            {
-                return false;
-            }
-            if rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_err()
-                || rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_err()
-            {
-                return false;
+            if fuse_qkr {
+                if qk_norm_rope_f32(&self.stream, pq, pqn, pif, n_heads, head_dim, pos, 1, rms_eps)
+                    .is_err()
+                    || qk_norm_rope_f32(
+                        &self.stream,
+                        pk,
+                        pkn,
+                        pif,
+                        n_kv_heads,
+                        head_dim,
+                        pos,
+                        1,
+                        rms_eps,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+            } else {
+                if q_norm.is_some()
+                    && qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_err()
+                {
+                    return false;
+                }
+                if k_norm.is_some()
+                    && qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps)
+                        .is_err()
+                {
+                    return false;
+                }
+                if rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_err()
+                    || rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_err()
+                {
+                    return false;
+                }
             }
         }
         if prof {
