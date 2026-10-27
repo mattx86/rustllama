@@ -2174,15 +2174,27 @@ __device__ __forceinline__ void rsl_gemm_q8_0_stage_tile_cpasync(
 // (prefill) so the small-N spec path keeps the un-padded 64x64 kernel.
 //
 // `__launch_bounds__(512, 1)` (1 block/SM, NOT 2): the GEMM_DIAG proved occupancy
-// is NOT the lever here — both this and the 64x64 kernel hit activeBlocks/SM=2,
-// but at a (512,2) 64-reg cap the cacc[4][8] accumulator (32 floats = 128 B) spills
-// to local, so every accumulate hits local memory → eff-BW pinned at 30% vs the
-// 64x64 kernel's 85% (DRAM peak). The 128 tile already HALVES weight re-reads
-// (8x→4x per the roofline), so un-spilling it is the path to the ~2x: 1 block/SM
-// gives the full 128-reg budget → cacc lives in registers (no spill). Dropping the
-// 2nd block/SM is affordable because cp.async double-buffering — not thread
-// occupancy — is what hides DRAM latency here: 16 warps with async loads in flight
-// keep the memory pipe full on this DRAM-bound kernel.
+// was NOT the lever — both this and the 64x64 kernel hit activeBlocks/SM=2, but at
+// a (512,2) 64-reg cap the cacc[4][8] accumulator (32 floats = 128 B) spilled to
+// local, so every accumulate hit local memory → eff-BW pinned at 30% vs the 64x64
+// kernel's 85% (DRAM peak). The 128 tile HALVES weight re-reads (8x→4x per the
+// roofline), so un-spilling it was the hoped path to the ~2x: 1 block/SM gives the
+// full 128-reg budget → cacc lives in registers (no spill), with cp.async double-
+// buffering (not thread occupancy) meant to hide DRAM latency at 16 warps.
+//
+// MEASURED (RTX PRO 6000 Blackwell MIG 1g.24gb, sm_120) — BANKED, a DEAD END on
+// this tile: the un-spill worked exactly as predicted (regs 64→128, LOCAL(spill)
+// 128→0 B) and the kernel got faster (200→142 us/call, eff-BW 30%→43%), but 1
+// block/SM (33% occupancy) left it LATENCY/OCCUPANCY-bound — 43% eff-BW still LOSES
+// to the 64x64 kernel's 85% (130 us/call), so despite moving half the bytes the 128
+// tile is net SLOWER. At the full-prefill level it was a wash (Qwen3-0.6B 512-tok
+// prefill: 210.55 ms with this on vs 210.53 ms off — the GEMM is too small a slice
+// to move). The 64K-reg/SM file simply cannot hold the 2x2 reg-blocked accumulator
+// (128 regs) AND run 2 blocks/SM — a hardware wall independent of model size, so the
+// 64x64 kernel stays the production GEMM and this path stays env-gated OFF
+// (RUSTLLAMA_GEMM_128). Only worth revisiting with a SMALLER reg-tile that fits 2
+// blocks/SM without spilling (e.g. 128x64 → cacc[2][8] = 64 B → ≤64 regs) or on a
+// non-MIG box with ncu access to profile the 1-block/SM stall directly.
 template <bool REPACK>
 __global__ void __launch_bounds__(512, 1) gemm_q8_0_w8a8_tc_128_kernel(
     const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
@@ -2501,11 +2513,13 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             }
             // 128x128 cp.async kernel — regs/thread, static shared/block,
             // activeBlocks/SM (occupancy), and localSizeBytes (>0 = REGISTER SPILL to
-            // local memory). The first diag pass (at (512,2)) answered the occupancy-
-            // vs-spill question: activeBlocks/SM=2 (== the 64x64 kernel, so occupancy
-            // is NOT the lever) but LOCAL=128 B — the 64-reg cap forced cacc[4][8] to
-            // spill. That drove the (512,2)→(512,1) relax above (full 128-reg budget);
-            // this line now confirms it: LOCAL should read 0 B at activeBlocks/SM=1.
+            // local memory). History: the (512,2) diag pass showed activeBlocks/SM=2
+            // (== the 64x64 kernel, so occupancy was never the lever) but LOCAL=128 B
+            // — the 64-reg cap spilled cacc[4][8]. The (512,2)→(512,1) relax un-spilled
+            // it (now LOCAL=0 B at activeBlocks/SM=1, confirmed on sm_120), but 33%
+            // occupancy left it latency-bound (43% eff-BW) — still slower than the
+            // 64x64 kernel. See the kernel header for the full BANKED verdict; this
+            // diag stays as the in-tree tool for a smaller-tile revisit / an ncu box.
             cudaFuncAttributes fa2;
             if (cudaFuncGetAttributes(&fa2, gemm_q8_0_w8a8_tc_128_kernel<true>) == cudaSuccess) {
                 int nsm2 = 0, maxThreadsSM2 = 0, active2 = 0;
