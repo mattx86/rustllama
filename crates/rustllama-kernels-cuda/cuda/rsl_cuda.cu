@@ -2323,7 +2323,24 @@ __global__ void __launch_bounds__(512, 1) gemm_q8_0_w8a8_tc_128_kernel(
 // terms are equal and either doubling cuts total re-read traffic 2X->1.5X; 128x64
 // doubles the BM (accumulator-safe) side. Shape-gated to N>=64 so the small-N spec
 // path keeps the 64x64 kernel. Env-gated (RUSTLLAMA_GEMM_128x64) + GEMM_DIAG-reported
-// (regs/spill/activeBlocks) until pod-A/B'd; stays off until the A/B confirms the win.
+// (regs/spill/activeBlocks).
+//
+// MEASURED (RTX PRO 6000 Blackwell MIG 1g.24gb, sm_120, Qwen3-0.6B Q8_0) — BANKED,
+// a DEAD END like the 128x128: the occupancy escape WORKED (GEMM_DIAG: regs=64,
+// LOCAL spill=40 B, activeBlocks/SM=2 — the 2-blocks target held where the 128x128
+// couldn't), but the kernel is LATENCY/OCCUPANCY-bound, not BW-bound: 170.1 us/call
+// @ eff-BW 182 GB/s (50% peak) vs the 64x64's 130.7 us/call @ 304 GB/s (85%). It
+// moves LESS data (halved activation re-read) but at far lower effective bandwidth
+// -> ~30% SLOWER. Same wall as the 128x128 (43% eff-BW): the bigger tile's heavier
+// per-block work (the 40 B spill + 2 fragments/warp + 2x the Cs shared round-trip)
+// can't be hidden at 2 blocks/SM on a 46-SM MIG slice — not enough resident blocks
+// to cover the added latency. The lean 64x64 (1 frag/warp, no spill, 1 Cs) hides
+// memory latency better at the SAME occupancy, so it stays the production GEMM. The
+// re-read-reduction lever is correct in theory (the data drops) but blocked by the
+// MIG slice's SM count; it would likely win on the FULL 188-SM GPU (enough blocks to
+// hide the latency) — an SM-count-gated autotune choice, not a MIG win. Parity-OK
+// (cos=1.000000 vs the fair-W8A8 ref). Stays env-gated OFF; revisit on a full GPU
+// or an ncu box to profile the per-block stall.
 template <bool REPACK>
 __global__ void __launch_bounds__(512, 2) gemm_q8_0_w8a8_tc_128x64_kernel(
     const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
@@ -3066,7 +3083,8 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
         }
     }
     // 128x64 tile — opt-in (RUSTLLAMA_GEMM_128x64=1) + repacked weights, via
-    // `use128x64`. The occupancy-safe bigger-tile escape; A/B-gated until pod-verified.
+    // `use128x64`. BANKED a DEAD END (latency-bound, 170 vs 130 us/call on the MIG
+    // slice — see the kernel header); default OFF, kept for a full-GPU / ncu revisit.
     if (use128x64) {
         dim3 g((unsigned)((M + 127) / 128), (unsigned)((N + 63) / 64));
         dim3 b(32, 16);
