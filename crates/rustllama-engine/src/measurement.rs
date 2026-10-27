@@ -4504,6 +4504,17 @@ pub fn measure_dev_prefill(
         (Some(median), None)
     };
 
+    // The device-resident prefill block lives ONLY on the batched prefill path
+    // (`forward_prefill_batched_inner`, gated by `accel::prefill_batched()`); the
+    // serial per-token prefill never enters it. serve / `model bench` enable it
+    // from `[inference].prefill_batched` (default on), but a standalone measurement
+    // (`tune --dev-prefill` outside `tune --all`) must not depend on that — force
+    // it on for the A/B so the block is reachable, then restore. (If serve has
+    // batched prefill off, the block never runs there anyway, so the verdict is
+    // simply never consulted — no mis-prediction.)
+    let prev_batched = rustllama_models::accel::prefill_batched();
+    rustllama_models::accel::set_prefill_batched(true);
+
     // OFF arm: the host prefill path (current production). ON arm: the device-
     // resident block, with the hit counter snapshotted to confirm it fired.
     rustllama_models::accel::set_dev_prefill_force(Some(false));
@@ -4514,8 +4525,9 @@ pub fn measure_dev_prefill(
     let (on_tps, on_err) = bench(&mut cpu);
     let engaged = rustllama_models::accel::dev_prefill_hits() > hits_before;
 
-    // Clear the override → the verdict decides at serve time.
+    // Clear the overrides → serve-time config/verdicts decide from here.
     rustllama_models::accel::set_dev_prefill_force(None);
+    rustllama_models::accel::set_prefill_batched(prev_batched);
 
     if !engaged {
         return Ok(DevPrefillReport {
