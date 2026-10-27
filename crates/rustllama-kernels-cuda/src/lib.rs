@@ -2760,8 +2760,21 @@ fn q8_repack_decode_enabled() -> bool {
 /// matvec launch (`RUSTLLAMA_DECODE_FUSED_GATE_UP=1`). Default OFF → the two
 /// separate `matvec_packed_dev_io` calls run (byte-identical to today). The fused
 /// kernel is BIT-EXACT to the two calls (same per-format row_dot), so this is a
-/// pure perf A/B lever: one launch + activation read once vs two. Measured on the
-/// pod via the `DB_FFN` profiler slice before it's promoted to a verdict.
+/// pure perf A/B lever: one launch + activation read once vs two.
+///
+/// MEASURED (RTX PRO 6000 Blackwell MIG 1g.24gb, sm_120): a NET LOSS in
+/// production — stays OFF. The eager profiler showed the fused ffn-matvec slice
+/// DROP (87.5→69.3 us) because the eager path pays per-kernel launch overhead that
+/// collapsing 2 launches→1 saves. But production runs the per-layer CUDA GRAPH
+/// (launches already eliminated), and there the fused kernel is INTRINSICALLY
+/// slower than two back-to-back matvecs (the combined 2M-output launch has worse
+/// occupancy/access than two overlapping M-output launches): graph decode
+/// regressed 199.9→182.8 tok/s (-8.5%). So decode matvec is kernel-EXECUTION-bound
+/// (the n=1 memory-access pattern), not launch/fusion-bound; fusion repackages the
+/// row_dot without improving it and the repackaging hurts. Kept in-tree (bit-exact,
+/// env-gated off) for a non-MIG ncu box where the fused kernel could be retuned to
+/// win; the same wall applies to qkv fusion (not built). Same launch-overhead-vs-
+/// real-kernel-time trap as the whole-step graph + the 128x128 GEMM tile.
 fn decode_fused_gate_up_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
