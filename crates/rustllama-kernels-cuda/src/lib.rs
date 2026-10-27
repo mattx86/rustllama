@@ -1802,12 +1802,23 @@ pub mod phase_prof {
     static PB_ATTN: AtomicU64 = AtomicU64::new(0);
     static PB_D2H: AtomicU64 = AtomicU64::new(0);
     static PB_CALLS: AtomicU64 = AtomicU64::new(0);
-    /// Record one device-resident prefill-block layer's H2D/compute/attn/D2H ns.
-    pub fn add_prefill_block(h2d: u64, compute: u64, attn: u64, d2h: u64) {
+    // Sub-split of PB_COMPUTE (which lumps the 7 batched GEMMs + the glue kernels:
+    // rmsnorm / qk-norm / rope / silu_mul / add). PB_GEMM = all 7 projection+FFN
+    // GEMMs (qkv/o/gate/up/down); PB_FFN = the 3 FFN GEMMs alone (gate/up/down).
+    // glue = compute - gemm. Lets the ncu-free profiler say whether the prefill
+    // compute is GEMM-bound (→ the ncu-gated GEMM wall) or glue-bound (→ kernel
+    // fusion) and whether the FFN or the attn projections dominate the GEMM time.
+    static PB_GEMM: AtomicU64 = AtomicU64::new(0);
+    static PB_FFN: AtomicU64 = AtomicU64::new(0);
+    /// Record one device-resident prefill-block layer's H2D/compute/attn/D2H ns,
+    /// plus the GEMM (all 7) and FFN-GEMM (gate/up/down) sub-slices of compute.
+    pub fn add_prefill_block(h2d: u64, compute: u64, attn: u64, d2h: u64, gemm: u64, ffn: u64) {
         PB_H2D.fetch_add(h2d, Ordering::Relaxed);
         PB_COMPUTE.fetch_add(compute, Ordering::Relaxed);
         PB_ATTN.fetch_add(attn, Ordering::Relaxed);
         PB_D2H.fetch_add(d2h, Ordering::Relaxed);
+        PB_GEMM.fetch_add(gemm, Ordering::Relaxed);
+        PB_FFN.fetch_add(ffn, Ordering::Relaxed);
         PB_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     // Device-resident DECODE block (`decode_attn_block_f32`, eager path —
@@ -1858,6 +1869,8 @@ pub mod phase_prof {
             &PB_COMPUTE,
             &PB_ATTN,
             &PB_D2H,
+            &PB_GEMM,
+            &PB_FFN,
             &PB_CALLS,
             &DB_MATVEC,
             &DB_ATTN,
@@ -1898,6 +1911,9 @@ pub mod phase_prof {
             );
         }
         if pb > 0 {
+            let gemm = ld(&PB_GEMM);
+            let ffn = ld(&PB_FFN);
+            let glue = ld(&PB_COMPUTE).saturating_sub(gemm);
             s += &format!(
                 "  dev-prefill block (per layer): calls={pb} h2d={:.1} compute={:.1} attn={:.1} d2h={:.1} total={:.1}\n",
                 per(ld(&PB_H2D), pb),
@@ -1905,6 +1921,18 @@ pub mod phase_prof {
                 per(ld(&PB_ATTN), pb),
                 per(ld(&PB_D2H), pb),
                 per(ld(&PB_H2D) + ld(&PB_COMPUTE) + ld(&PB_ATTN) + ld(&PB_D2H), pb)
+            );
+            s += &format!(
+                "    compute split: gemm={:.1} (ffn={:.1} qkvo={:.1}) glue={:.1}  [gemm {:.0}% of compute]\n",
+                per(gemm, pb),
+                per(ffn, pb),
+                per(gemm.saturating_sub(ffn), pb),
+                per(glue, pb),
+                if ld(&PB_COMPUTE) > 0 {
+                    gemm as f64 * 100.0 / ld(&PB_COMPUTE) as f64
+                } else {
+                    0.0
+                }
             );
         }
         if pg > 0 {
@@ -6755,6 +6783,12 @@ impl CudaMatvecCache {
         // is the signal). pb = [h2d, compute, attn, d2h] ns.
         let prof = phase_prof::enabled();
         let mut pb = [0u64; 4];
+        // Sub-split of the compute phase (pb[1]): GEMM-only vs glue. gemm_ns sums
+        // the 7 batched GEMMs (qkv/o/gate/up/down); ffn_ns is the FFN subset
+        // (gate/up/down, with the tiny silu/add lumped in). Only measured under
+        // RUSTLLAMA_PHASE_PROFILE; each group is bracketed with its own stream sync.
+        let mut gemm_ns = 0u64;
+        let mut ffn_ns = 0u64;
         let mut tmark = std::time::Instant::now();
         if upload_hidden
             && !self
@@ -6821,6 +6855,12 @@ impl CudaMatvecCache {
                 return false;
             }
         }
+        let g_qkv = if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         if !unsafe {
             self.matvec_packed_batched_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model, n_new)
         } || !unsafe {
@@ -6829,6 +6869,10 @@ impl CudaMatvecCache {
             self.matvec_packed_batched_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model, n_new)
         } {
             return false;
+        }
+        if let Some(t) = g_qkv {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            gemm_ns += t.elapsed().as_nanos() as u64;
         }
         // 3. Qwen3 per-head q/k RMSNorm over all n_new*heads rows (shared weight);
         // 4. batched RoPE (each row at kv_len_base+row).
@@ -6936,10 +6980,20 @@ impl CudaMatvecCache {
             tmark = std::time::Instant::now();
         }
         // 7. o projection (batched device-I/O); 8. fused residual + post-attn RMSNorm.
+        let g_o = if prof {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         if !unsafe {
             self.matvec_packed_batched_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q, n_new)
         } {
             return false;
+        }
+        if let Some(t) = g_o {
+            unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+            gemm_ns += t.elapsed().as_nanos() as u64;
         }
         unsafe {
             if add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, n_new, d_model, rms_eps).is_err() {
@@ -6948,6 +7002,12 @@ impl CudaMatvecCache {
         }
         // 8b. Optional dense SwiGLU FFN, device-resident.
         if let Some((wg, wu, wd, _)) = dense_ffn {
+            let g_ffn = if prof {
+                unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             unsafe {
                 if !self.matvec_packed_batched_dev_io(
                     wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model, n_new,
@@ -6967,6 +7027,14 @@ impl CudaMatvecCache {
                 if add_f32(&self.stream, ph, po, n_new * d_model).is_err() {
                     return false;
                 }
+            }
+            // FFN GEMM time (gate/up/down; the tiny silu/add are lumped in). Counts
+            // toward both the FFN-specific slice and the whole-GEMM slice.
+            if let Some(t) = g_ffn {
+                unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
+                let e = t.elapsed().as_nanos() as u64;
+                ffn_ns += e;
+                gemm_ns += e;
             }
         }
         if prof {
@@ -7016,7 +7084,7 @@ impl CudaMatvecCache {
         if prof {
             unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
             pb[3] += tmark.elapsed().as_nanos() as u64; // D2H (K/V + hidden)
-            phase_prof::add_prefill_block(pb[0], pb[1], pb[2], pb[3]);
+            phase_prof::add_prefill_block(pb[0], pb[1], pb[2], pb[3], gemm_ns, ffn_ns);
         }
         consume_error_count() == 0
     }
