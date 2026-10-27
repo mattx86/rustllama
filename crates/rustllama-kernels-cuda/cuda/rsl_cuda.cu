@@ -4677,10 +4677,66 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
     dim3 block(32, RSL_FLASH_DECODE_W);  // W warps per head
-    dim3 grid((unsigned)n_heads);        // one block per head → fills all SMs
+    dim3 grid((unsigned)n_heads);        // one block per head
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) *
                    sizeof(float);
+    // ncu-free DECODE-ATTN diagnostic (RUSTLLAMA_DECODE_ATTN_DIAG=1), fired ONCE on
+    // a WARM call (skip 64; graph-capture-guarded). Reports time + KV-read BW +
+    // grid/SM utilization + occupancy → whether the 1-block-per-head grid starves
+    // the SMs (n_heads < SM count ⇒ split-KV / FlashDecoding is the lever) and
+    // whether the kernel is latency-bound (short KV) or memory-bound (long KV).
+    {
+        static int dad_calls = 0, dad_done = 0;
+        cudaStreamCaptureStatus capst = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s->stream, &capst);
+        if (!dad_done && capst == cudaStreamCaptureStatusNone &&
+            std::getenv("RUSTLLAMA_DECODE_ATTN_DIAG") != nullptr && dad_calls++ >= 64) {
+            dad_done = 1;
+            cudaFuncAttributes fa;
+            if (cudaFuncGetAttributes(&fa, flash_attn_decode_f32_kernel) == cudaSuccess) {
+                int nsm = 0, active = 0;
+                cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active, flash_attn_decode_f32_kernel, (int)(block.x * block.y), shmem);
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0);
+                cudaEventCreate(&e1);
+                flash_attn_decode_f32_kernel<<<grid, block, shmem, s->stream>>>(
+                    q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window,
+                    softcap); // warmup
+                cudaStreamSynchronize(s->stream);
+                cudaEventRecord(e0, s->stream);
+                const int IT = 200;
+                for (int it = 0; it < IT; it++)
+                    flash_attn_decode_f32_kernel<<<grid, block, shmem, s->stream>>>(
+                        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window,
+                        softcap);
+                cudaEventRecord(e1, s->stream);
+                cudaEventSynchronize(e1);
+                float ms = 0.f;
+                cudaEventElapsedTime(&ms, e0, e1);
+                cudaEventDestroy(e0);
+                cudaEventDestroy(e1);
+                double us = (double)ms / IT * 1e3;
+                double kv_bytes = (double)kv_len * n_kv_heads * head_dim * 2.0 * 4.0;
+                double bw = us > 0.0 ? kv_bytes / (us * 1e-6) / 1e9 : 0.0;
+                int sms_used = n_heads < nsm ? n_heads : nsm;
+                const char *verdict =
+                    n_heads < nsm
+                        ? "GRID-UNDERUTILIZED (n_heads < SMs) -> split-KV (FlashDecoding): more "
+                          "blocks/head over KV chunks + a combine"
+                        : "grid fills the SMs";
+                std::fprintf(
+                    stderr,
+                    "[decode-attn-diag] flash_decode kv_len=%d n_heads=%d n_kv_heads=%d head_dim=%d: "
+                    "%.1f us/call | KV-read-BW=%.0f GB/s | grid=%d blocks, SMs=%d (~%d used, %.0f%% "
+                    "util), regs=%d occ_blocks/SM=%d -> %s\n",
+                    kv_len, n_heads, n_kv_heads, head_dim, us, bw, n_heads, nsm, sms_used,
+                    nsm > 0 ? (double)sms_used / nsm * 100.0 : 0.0, fa.numRegs, active, verdict);
+            }
+        }
+    }
     flash_attn_decode_f32_kernel<<<grid, block, shmem, s->stream>>>(
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale,
         window, softcap);
