@@ -11153,6 +11153,25 @@ pub fn dev_prefill_enabled() -> bool {
     )
 }
 
+/// Whether the FP16 tensor-core flash-attn prefill kernel runs (vs the scalar f32
+/// one) inside the device-resident prefill block. Correctness+perf gated on verdict
+/// [`VERDICT_ATTN_PREFILL_TC`] (banked by `tune --validate-kernels` where the TC
+/// kernel matched the CPU reference within the fp16 tolerance AND measured faster
+/// than the scalar kernel). `RUSTLLAMA_FLASH_PREFILL_TC=1` force-enables (the
+/// on-pod A/B lever before the verdict is banked); `=0` force-disables. Fail-closed:
+/// unmeasured / not-a-win ⇒ off (the scalar flash-prefill runs). Lossy (fp16), so
+/// correctness is graded, not assumed (`doctor --cuda-parity attn:prefill_tc`).
+pub fn prefill_flash_tc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("RUSTLLAMA_FLASH_PREFILL_TC").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => kernel_verdict(rustllama_tuner::VERDICT_ATTN_PREFILL_TC),
+        },
+    )
+}
+
 /// Whether the Feature-1b CUDA-graph attention block is enabled. **AUTOMATIC, no
 /// env var** — the graph twin of [`dev_attn_enabled`], perf-gated on verdict
 /// [`VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH`] (persisted by `tune --dev-attn`
@@ -11569,6 +11588,8 @@ pub fn try_prefill_attn_block_cuda_f32(
         q4k_w8a8_tc_enabled(),
         q4k_gemm_f32_enabled(),
     );
+    // Tensor-core (fp16) vs scalar flash-attn for this block's attention.
+    g.set_prefill_flash_tc(prefill_flash_tc_enabled());
     // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
     // dims (caller contract); the cache owns the stream + mirror.
     let ok = unsafe {

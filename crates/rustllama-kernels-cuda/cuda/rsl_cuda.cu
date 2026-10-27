@@ -4772,6 +4772,196 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_f32");
 }
 
+// Tensor-core (FP16 WMMA) flash-attention prefill — the TC twin of
+// `flash_attn_prefill_f32_kernel`. IDENTICAL math/semantics (scale, Gemma2
+// softcap, causal + SWA window, GQA, output layout), but QK^T and P·V run on
+// 16x16x16 half WMMA and the online softmax runs in shared memory. The opaque
+// accumulator fragments are touched ONLY via store/load_matrix_sync (no
+// fragment-layout assumptions → portable across sm_75..sm_120). One warp per
+// (16-query tile, head); BQ = BK = 16. head_dim must be a multiple of 16 (the
+// launcher gates it; non-multiples fall back to the scalar kernel). LOSSY: Q/K/V
+// are rounded to fp16 for the matmuls (fp32 accumulate), so it is graded against
+// the CPU reference with an fp16-appropriate tolerance (`doctor --cuda-parity
+// attn:prefill_tc`), not bit-exact. Shared layout (dynamic): Qh|Kh|Vh|Ph (half)
+// then Osh|Ssh|m|l|rsc (float) — Ph has an even element count so Osh is 4-aligned.
+__global__ void flash_attn_prefill_f16_tc_kernel(const float *q, const float *k,
+                                                 const float *v, float *out,
+                                                 int n_heads, int n_gqa,
+                                                 int head_dim, int max_ctx,
+                                                 int kv_len_base, int n_new,
+                                                 float scale, int window,
+                                                 float softcap) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+    using namespace nvcuda;
+    const int D = head_dim;
+    extern __shared__ char smem_raw[];
+    half *Qh = (half *)smem_raw;
+    half *Kh = Qh + 16 * D;
+    half *Vh = Kh + 16 * D;
+    half *Ph = Vh + 16 * D;
+    float *Osh = (float *)(Ph + 16 * 16);
+    float *Ssh = Osh + 16 * D;
+    float *mrow = Ssh + 16 * 16;
+    float *lrow = mrow + 16;
+    float *rsc = lrow + 16;
+
+    const int lane = threadIdx.x; // 0..31 (one warp)
+    const int hh = blockIdx.y;    // attention head
+    const int q_base = blockIdx.x * 16;
+    const int kv_h = hh / n_gqa;
+
+    // Stage Q [16, D] → half (inactive query rows padded 0); zero the O accumulator.
+    for (int e = lane; e < 16 * D; e += 32) {
+        int row = e / D, d = e - row * D;
+        int qp = q_base + row;
+        Qh[e] = (qp < n_new) ? __float2half(q[(qp * n_heads + hh) * D + d])
+                             : __float2half(0.f);
+        Osh[e] = 0.f;
+    }
+    if (lane < 16) {
+        mrow[lane] = -INFINITY;
+        lrow[lane] = 0.f;
+    }
+    __syncwarp();
+
+    const int q_last = min(q_base + 15, n_new - 1);
+    const int p_block_max = kv_len_base + q_last;
+
+    for (int t0 = 0; t0 <= p_block_max; t0 += 16) {
+        // Stage this K/V tile [t0, t0+16) for kv head kv_h → half.
+        for (int e = lane; e < 16 * D; e += 32) {
+            int row = e / D, d = e - row * D;
+            int t = t0 + row;
+            if (t < max_ctx) {
+                int off = (kv_h * max_ctx + t) * D + d;
+                Kh[e] = __float2half(k[off]);
+                Vh[e] = __float2half(v[off]);
+            } else {
+                Kh[e] = __float2half(0.f);
+                Vh[e] = __float2half(0.f);
+            }
+        }
+        __syncwarp();
+
+        // S[16,16] = Q·K^T, contracting D in 16-wide WMMA steps.
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_s;
+        wmma::fill_fragment(acc_s, 0.f);
+        for (int dk = 0; dk < D; dk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &Qh[dk], D); // Q[q, dk+kk]
+            wmma::load_matrix_sync(bf, &Kh[dk], D); // K[pos, dk+kk] as K^T
+            wmma::mma_sync(acc_s, af, bf, acc_s);
+        }
+        wmma::store_matrix_sync(Ssh, acc_s, 16, wmma::mem_row_major);
+        __syncwarp();
+
+        // Online softmax, one query row per lane (lanes 0..15). Writes the half P
+        // tile + the per-row O rescale; invalid (causal/SWA/inactive) cols → p=0.
+        if (lane < 16) {
+            int i = lane;
+            int qp = q_base + i;
+            if (qp < n_new) {
+                int p_self = kv_len_base + qp;
+                int t_start =
+                    (window > 0 && p_self - window + 1 > 0) ? (p_self - window + 1) : 0;
+                float rowmax = -INFINITY;
+                for (int c = 0; c < 16; ++c) {
+                    int pos = t0 + c;
+                    if (pos <= p_self && pos >= t_start) {
+                        float s = Ssh[i * 16 + c] * scale;
+                        if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+                        Ssh[i * 16 + c] = s;
+                        rowmax = fmaxf(rowmax, s);
+                    } else {
+                        Ssh[i * 16 + c] = -INFINITY;
+                    }
+                }
+                float m_old = mrow[i];
+                float m_new = fmaxf(m_old, rowmax);
+                float rescale = isfinite(m_old) ? expf(m_old - m_new) : 0.f;
+                float ltile = 0.f;
+                for (int c = 0; c < 16; ++c) {
+                    float s = Ssh[i * 16 + c];
+                    float p = isfinite(s) ? expf(s - m_new) : 0.f;
+                    Ph[i * 16 + c] = __float2half(p);
+                    ltile += p;
+                }
+                lrow[i] = lrow[i] * rescale + ltile;
+                mrow[i] = m_new;
+                rsc[i] = rescale;
+            } else {
+                for (int c = 0; c < 16; ++c) Ph[i * 16 + c] = __float2half(0.f);
+                rsc[i] = 1.f;
+            }
+        }
+        __syncwarp();
+
+        // Rescale O by the per-row correction, then O += P·V (accumulate through
+        // the fragment loaded from the rescaled Osh), D output in 16-wide steps.
+        for (int e = lane; e < 16 * D; e += 32) Osh[e] *= rsc[e / D];
+        __syncwarp();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+        wmma::load_matrix_sync(pf, Ph, 16);
+        for (int dn = 0; dn < D; dn += 16) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_o;
+            wmma::load_matrix_sync(acc_o, &Osh[dn], D, wmma::mem_row_major);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+            wmma::load_matrix_sync(vf, &Vh[dn], D); // V[pos, dn+n]
+            wmma::mma_sync(acc_o, pf, vf, acc_o);
+            wmma::store_matrix_sync(&Osh[dn], acc_o, D, wmma::mem_row_major);
+        }
+        __syncwarp();
+    }
+
+    // Normalize by the softmax denominator and write out (active rows only).
+    for (int e = lane; e < 16 * D; e += 32) {
+        int row = e / D, d = e - row * D;
+        int qp = q_base + row;
+        if (qp < n_new) {
+            float inv = (lrow[row] > 0.f) ? 1.f / lrow[row] : 0.f;
+            out[(qp * n_heads + hh) * D + d] = Osh[e] * inv;
+        }
+    }
+#else
+    (void)q; (void)k; (void)v; (void)out; (void)n_heads; (void)n_gqa;
+    (void)head_dim; (void)max_ctx; (void)kv_len_base; (void)n_new;
+    (void)scale; (void)window; (void)softcap;
+#endif
+}
+
+// Launcher for the TC flash-attn prefill. Same signature as the scalar
+// `rsl_cuda_flash_attn_prefill_f32`; returns -1 (→ Rust falls back to the scalar
+// kernel) when head_dim is not 16-aligned or the shape is otherwise unsupported.
+extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
+                                                  const float *q, const float *k,
+                                                  const float *v, float *out,
+                                                  int n_heads, int n_kv_heads,
+                                                  int head_dim, int max_ctx,
+                                                  int kv_len_base, int n_new,
+                                                  int window, float softcap) {
+    if (!s || !q || !k || !v || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 ||
+        n_new <= 0)
+        return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return -1;
+    if ((head_dim % 16) != 0) return -1; // the WMMA path needs 16-aligned head_dim
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    cudaSetDevice(s->device);
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int D = head_dim;
+    size_t shmem = (size_t)(16 * D * 3 + 16 * 16) * sizeof(half) +
+                   (size_t)(16 * D + 16 * 16 + 16 + 16 + 16) * sizeof(float);
+    dim3 block(32, 1);
+    dim3 grid((unsigned)((n_new + 15) / 16), (unsigned)n_heads);
+    flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
+        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
+        window, softcap);
+    return rsl_cuda_check("rsl_cuda_flash_attn_prefill_f16_tc");
+}
+
 // Greedy argmax over an F32 logits buffer (mirrors rsl_sampler_argmax_usm):
 // writes the index of the max logit to out_idx[0]. Single block; each thread
 // strides the vocab, then a block reduction picks the winner (lowest index

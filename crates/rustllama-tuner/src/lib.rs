@@ -253,6 +253,16 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK: &str = "attn:dev_resident_block";
 /// PERF-gated (correctness via `doctor --cuda-parity prefill:dev_resident_block`)
 /// — fail-closed off; `RUSTLLAMA_DEV_PREFILL=1` force-enables for the on-pod A/B.
 pub const VERDICT_PREFILL_DEV_RESIDENT_BLOCK: &str = "prefill:dev_resident_block";
+/// FP16 tensor-core flash-attn PREFILL kernel (`flash_attn_prefill_f16_tc_kernel`):
+/// the WMMA twin of the scalar `flash_attn_prefill_f32_kernel`, run inside the
+/// device-resident prefill block where it beats the scalar kernel. Flash-attn is
+/// ~30% of the prefill layer and the scalar kernel is compute-bound on the
+/// per-position online softmax; the TC path moves QK^T + P·V onto 16x16x16 half
+/// tensor cores. LOSSY (fp16), so graded vs the CPU reference with an
+/// fp16-appropriate tolerance (`doctor --cuda-parity attn:prefill_tc`) AND
+/// perf-gated. Read by `accel::prefill_flash_tc_enabled`; fail-closed off,
+/// `RUSTLLAMA_FLASH_PREFILL_TC=1` force-enables for the on-pod A/B.
+pub const VERDICT_ATTN_PREFILL_TC: &str = "attn:prefill_tc";
 /// GPU paged attention (Phase C): the CUDA block-table flash-decode kernel
 /// (`flash_attn_decode_paged_f32`) graded vs the CPU gather + flash-decode
 /// reference over pass / SWA / soft-cap. Read by `accel::dev_attn_paged_enabled`;

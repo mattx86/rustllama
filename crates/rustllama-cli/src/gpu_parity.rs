@@ -8332,13 +8332,70 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     let _ = cu_download_f32(&ob, tnew * th * thd);
                     let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
                     let c0 = Instant::now();
-                    let _ = ref_flash_prefill(&q, &kc, &vc, th, tkv, thd, tmax, kv_base, tnew);
+                    let cpu_ref =
+                        ref_flash_prefill(&q, &kc, &vc, th, tkv, thd, tmax, kv_base, tnew);
                     let cpu_ms = c0.elapsed().as_secs_f64() * 1000.0;
                     let speedup = if gpu_ms > 0.0 { cpu_ms / gpu_ms } else { 0.0 };
                     println!(
                         "  attn:prefill TIMING [{th}h/{tkv}kv/{thd}d, {tnew} new tokens]: \
                          GPU {gpu_ms:.3} ms/launch vs CPU ref {cpu_ms:.1} ms (~{speedup:.0}x)"
                     );
+                    // FP16 tensor-core flash-attn at the SAME shape → attn:prefill_tc:
+                    // graded vs the CPU reference (fp16 tolerance) AND timed against the
+                    // scalar kernel. Banks OK only when CORRECT and ≥10% faster
+                    // (fail-closed: correct-but-slower ⇒ SLOW ⇒ off; head_dim=128 here
+                    // is 16-aligned so the TC path runs).
+                    let tc_launch = |ob: &mut ck::CudaDeviceBuffer| unsafe {
+                        ck::flash_attn_prefill_f16_tc(
+                            &stream,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr() as *const f32,
+                            vb.as_ptr() as *const f32,
+                            ob.as_mut_ptr() as *mut f32,
+                            th,
+                            tkv,
+                            thd,
+                            tmax,
+                            kv_base,
+                            tnew,
+                            0,
+                            0.0,
+                        )
+                    };
+                    match tc_launch(&mut ob) {
+                        Ok(()) => {
+                            let tc_out = cu_download_f32(&ob, tnew * th * thd);
+                            let (cos, max_rel) = compare(&tc_out, &cpu_ref);
+                            let t2 = Instant::now();
+                            for _ in 0..ITERS {
+                                let _ = tc_launch(&mut ob);
+                            }
+                            let _ = cu_download_f32(&ob, tnew * th * thd);
+                            let tc_ms = t2.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
+                            let correct = cos > 0.99;
+                            let faster = tc_ms < 0.9 * gpu_ms;
+                            let key: &'static str = if !correct {
+                                "MISCOMPUTE"
+                            } else if faster {
+                                "OK"
+                            } else {
+                                "SLOW"
+                            };
+                            *counts.entry(key).or_default() += 1;
+                            cu_emit(
+                                "attn:prefill_tc",
+                                key,
+                                &format!(
+                                    "cos={cos:.6} max_rel={max_rel:.4} tc={tc_ms:.3}ms scalar={gpu_ms:.3}ms ({})",
+                                    if faster { "\u{2265}10% faster" } else { "not \u{2265}10% faster" }
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            cu_emit("attn:prefill_tc", "KERNEL_ERR", &format!("{e}"));
+                            *counts.entry("KERNEL_ERR").or_default() += 1;
+                        }
+                    }
                 }
             }
         }

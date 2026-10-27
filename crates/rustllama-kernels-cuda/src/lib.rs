@@ -1072,6 +1072,25 @@ extern "C" {
         softcap: f32,
     ) -> c_int;
 
+    // Tensor-core (FP16 WMMA) twin of the above — same signature + semantics,
+    // lossy (fp16 QK/PV). Returns -1 on an unsupported shape (non-16-aligned
+    // head_dim) so the caller falls back to the scalar kernel.
+    fn rsl_cuda_flash_attn_prefill_f16_tc(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len_base: c_int,
+        n_new: c_int,
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
+
     // Quantized-KV flash attention (F32 Q/out, packed K/V dequantized
     // on the fly). K/V are packed-byte device pointers.
     fn rsl_cuda_flash_attn_decode_q4_0(
@@ -3380,6 +3399,49 @@ pub unsafe fn flash_attn_prefill_f32(
     }
 }
 
+/// Tensor-core (FP16 WMMA) FlashAttention prefill — the lossy TC twin of
+/// [`flash_attn_prefill_f32`], same args + semantics. Returns `Err` on an
+/// unsupported shape (non-16-aligned head_dim) so the caller can fall back to the
+/// scalar kernel. Correctness graded vs the CPU reference with an fp16 tolerance
+/// (`doctor --cuda-parity attn:prefill_tc`).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_f16_tc(
+    stream: &CudaStream,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    window: i32,
+    softcap: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_prefill_f16_tc(
+        stream.raw(),
+        q,
+        k,
+        v,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
 /// Quantized-KV FlashAttention decode for a Q4_0 KV cache. `q`/`out` are
 /// F32 device pointers `[n_heads, head_dim]`; `k_packed`/`v_packed` are the
 /// packed Q4_0 KV cache `[n_kv_heads, max_ctx, (head_dim/32)*18]` bytes.
@@ -4897,6 +4959,11 @@ pub struct CudaMatvecCache {
     prefill_q8_0_f32: bool,
     prefill_q4_k_w8a8_tc: bool,
     prefill_q4_k_f32: bool,
+    // Use the FP16-WMMA tensor-core flash-attn prefill kernel (vs the scalar f32
+    // one) inside the device-resident prefill block. Set by `accel` from the
+    // `attn:prefill_tc` verdict before the block runs; lossy (fp16), fail-closed
+    // off. The block checks head_dim % 16 == 0 before using it (scalar otherwise).
+    prefill_flash_tc: bool,
     // Device-resident PREFILL activation slab (the batched analogue of
     // `attn_act`): hidden|h_norm|q|k|v|attn_out|o|h_norm2[|gate|up|act], each
     // ×n_new rows. Separate from the single-row `attn_act` so prefill and decode
@@ -5027,6 +5094,7 @@ impl CudaMatvecCache {
             prefill_q8_0_f32: false,
             prefill_q4_k_w8a8_tc: false,
             prefill_q4_k_f32: false,
+            prefill_flash_tc: false,
             prefill_act: None,
             stream_window_layers: 0,
             current_layer_tag: 0,
@@ -6080,6 +6148,14 @@ impl CudaMatvecCache {
         self.prefill_q4_k_f32 = q4_k_f32;
     }
 
+    /// Select the FP16-WMMA tensor-core flash-attn prefill kernel (vs the scalar
+    /// f32 one) for the device-resident prefill block's attention. `accel` sets
+    /// this from the `attn:prefill_tc` verdict before the block runs; lossy, so
+    /// fail-closed off by default.
+    pub fn set_prefill_flash_tc(&mut self, enabled: bool) {
+        self.prefill_flash_tc = enabled;
+    }
+
     /// Batched device-I/O GEMM — the N-row analogue of
     /// [`Self::matvec_packed_dev_io`] for the device-resident PREFILL block.
     /// `x_dev` = `[n, k]`, `out_dev` = `[n, m]` are activation-slab device
@@ -6953,24 +7029,45 @@ impl CudaMatvecCache {
         // 6. Flash-prefill: n_new causal queries over the mirror [0, kv_len_base+n_new).
         let km_ptr = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
         let vm_ptr = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
+        // FP16 tensor-core flash-attn when the verdict enabled it (accel set
+        // `prefill_flash_tc`) AND head_dim is 16-aligned; scalar f32 otherwise. The
+        // TC kernel is lossy (fp16) but graded vs the CPU ref (attn:prefill_tc).
+        let use_flash_tc = self.prefill_flash_tc && head_dim % 16 == 0;
         unsafe {
-            if flash_attn_prefill_f32(
-                &self.stream,
-                pq,
-                km_ptr,
-                vm_ptr,
-                pat,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_ctx,
-                kv_len_base,
-                n_new,
-                window,
-                softcap,
-            )
-            .is_err()
-            {
+            let flash_res = if use_flash_tc {
+                flash_attn_prefill_f16_tc(
+                    &self.stream,
+                    pq,
+                    km_ptr,
+                    vm_ptr,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window,
+                    softcap,
+                )
+            } else {
+                flash_attn_prefill_f32(
+                    &self.stream,
+                    pq,
+                    km_ptr,
+                    vm_ptr,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window,
+                    softcap,
+                )
+            };
+            if flash_res.is_err() {
                 return false;
             }
         }
