@@ -4826,11 +4826,21 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     // Split-KV (FlashDecoding): FIXED grid (n_heads × n_splits), chunk computed
     // inside the kernel from kv_len → CAPTURE-STABLE, so it runs inside the decode
     // graph (the production path). Engages only when RUSTLLAMA_DECODE_ATTN_SPLIT=1
-    // AND the partials scratch is ALREADY allocated — it's pre-allocated in the
-    // prefill launcher (non-captured, before the decode graph is first captured);
-    // cudaMalloc is illegal during capture, so there is NO allocation here. If the
-    // scratch is absent (prefill didn't run / split off), the single kernel runs.
-    // At short ctx the extra splits are empty cheap no-ops + a tiny combine.
+    // AND the partials scratch is ALREADY allocated (pre-allocated in the prefill
+    // launcher before the decode graph's first capture; cudaMalloc is illegal during
+    // capture, so there is NO allocation here).
+    //
+    // MEASURED — BANKED, a net LOSS in the production graph, stays DEFAULT-OFF. The
+    // diag correctly found the attention grid-STARVED (35% SM util, 79/360 GB/s at
+    // kv=514), and split-KV IS the textbook fix: EAGER it won (long-ctx decode
+    // 93.2→98.8, +6%). But the v2 graph integration (which works — split captures
+    // into the decode graph) showed split LOSES there: graph long-ctx decode
+    // 136.2→128.6 = -5.6%. The eager win was the launch-overhead trap AGAIN (4th
+    // time: whole-step graph, 128x128 GEMM, gate+up matvec, this) — once the graph
+    // collapses launches, the split-kernel's SM-util gain is smaller than the combine
+    // kernel + extra graph nodes, and the single kernel at 22% peak BW is as good as
+    // it gets in the graph on this slice. Kept in-tree env-gated for a non-MIG ncu box
+    // (to profile the real stall) or a single-kernel grid-sync combine (no 2nd node).
     {
         static int split_env = -1;
         if (split_env < 0) {
