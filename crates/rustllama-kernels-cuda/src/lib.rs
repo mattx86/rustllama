@@ -6694,7 +6694,7 @@ impl CudaMatvecCache {
             }
         };
         brec(&mut bev, self.stream.raw()); // E0: block start
-        // 1. attn RMSNorm; 2. q/k/v projections (device-I/O, no copy).
+                                           // 1. attn RMSNorm; 2. q/k/v projections (device-I/O, no copy).
         unsafe {
             if rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_err() {
                 return false;
@@ -6722,8 +6722,18 @@ impl CudaMatvecCache {
         let fuse_qkr = decode_fuse_qknorm_rope_enabled() && q_norm.is_some() && k_norm.is_some();
         unsafe {
             if fuse_qkr {
-                if qk_norm_rope_f32(&self.stream, pq, pqn, pif, n_heads, head_dim, pos, 1, rms_eps)
-                    .is_err()
+                if qk_norm_rope_f32(
+                    &self.stream,
+                    pq,
+                    pqn,
+                    pif,
+                    n_heads,
+                    head_dim,
+                    pos,
+                    1,
+                    rms_eps,
+                )
+                .is_err()
                     || qk_norm_rope_f32(
                         &self.stream,
                         pk,
@@ -6764,15 +6774,15 @@ impl CudaMatvecCache {
             tmark = std::time::Instant::now();
         }
         brec(&mut bev, self.stream.raw()); // E1: end of pre-attn (rmsnorm+qkv+qknorm+rope)
-        // 5. Download post-RoPE K/V into the caller's host KV-cache row, then
-        //    scatter the SAME post-RoPE device K/V into the F32 mirror at `pos`,
-        //    one kv-head at a time (head-major). A2: the mirror write is now an
-        //    on-chip DEVICE→DEVICE copy straight from the activation slab
-        //    (pk/pv) instead of re-uploading the just-downloaded host rows —
-        //    byte-identical to the old host round-trip (same source, same mirror
-        //    offsets) but without the redundant H2D re-upload. This mirrors the
-        //    graph twin's step 5. The host download stays: `k_row_out`/`v_row_out`
-        //    are the caller's output (its host KV cache).
+                                           // 5. Download post-RoPE K/V into the caller's host KV-cache row, then
+                                           //    scatter the SAME post-RoPE device K/V into the F32 mirror at `pos`,
+                                           //    one kv-head at a time (head-major). A2: the mirror write is now an
+                                           //    on-chip DEVICE→DEVICE copy straight from the activation slab
+                                           //    (pk/pv) instead of re-uploading the just-downloaded host rows —
+                                           //    byte-identical to the old host round-trip (same source, same mirror
+                                           //    offsets) but without the redundant H2D re-upload. This mirrors the
+                                           //    graph twin's step 5. The host download stays: `k_row_out`/`v_row_out`
+                                           //    are the caller's output (its host KV cache).
         {
             let a = self.attn_act.as_ref().unwrap();
             let kb: &mut [u8] = unsafe {
@@ -6839,7 +6849,7 @@ impl CudaMatvecCache {
             tmark = std::time::Instant::now();
         }
         brec(&mut bev, self.stream.raw()); // E2: end of attn (kv-write + flash-decode)
-        // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
+                                           // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
         if !unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) } {
             return false;
         }
@@ -6906,10 +6916,10 @@ impl CudaMatvecCache {
             tmark = std::time::Instant::now();
         }
         brec(&mut bev, self.stream.raw()); // E3: end of post-attn (o + residual + FFN)
-        // 9. Download the updated hidden (hidden += o [+ ffn_out]). The post-attn
-        // norm (h_norm2) is downloaded only when the FFN ran on the HOST — when
-        // the device FFN above consumed it, the caller skips the host FFN so it's
-        // unused.
+                                           // 9. Download the updated hidden (hidden += o [+ ffn_out]). The post-attn
+                                           // norm (h_norm2) is downloaded only when the FFN ran on the HOST — when
+                                           // the device FFN above consumed it, the caller skips the host FFN so it's
+                                           // unused.
         {
             let a = self.attn_act.as_ref().unwrap();
             // Download hidden unless it stays resident for the next layer

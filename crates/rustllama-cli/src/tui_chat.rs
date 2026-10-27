@@ -1642,6 +1642,7 @@ mod tests {
             top_p: None,
             top_k: None,
             repeat_penalty: None,
+            presence_penalty: None,
             should_quit: false,
             auto_tools: false,
             clarify_enabled: true,
