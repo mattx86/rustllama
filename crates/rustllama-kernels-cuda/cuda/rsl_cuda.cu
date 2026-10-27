@@ -4577,6 +4577,16 @@ extern "C" int rsl_cuda_embedding_lookup_f32(rsl_cuda_stream *s,
 // away), so a non-SWA / non-Gemma2 model is byte-identical to the pre-feature
 // kernel. The per-warp `t < t_start` skip is WARP-UNIFORM (t depends on `warp`,
 // not `lane`), so it cannot desync the __shfl reduction below.
+// Split-KV n_splits: ≈ SMs/n_heads (fill the SMs), clamped [1, 16]. MUST match
+// between the prefill prealloc (which sizes `fd_partials`) and the decode launch.
+static inline int rsl_decode_attn_n_splits(int nsm, int n_heads) {
+    if (nsm <= 0 || n_heads <= 0) return 1;
+    int ns = (nsm + n_heads - 1) / n_heads;
+    if (ns < 1) ns = 1;
+    if (ns > 16) ns = 16;
+    return ns;
+}
+
 __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
                                              const float *v, float *out,
                                              int n_heads, int n_gqa,
@@ -4672,8 +4682,8 @@ __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
 // DRAM bandwidth (the fix for the grid-starved 1-block-per-head kernel).
 __global__ void flash_attn_decode_split_f32_kernel(
     const float *q, const float *k, const float *v, float *partials, int n_heads,
-    int n_gqa, int head_dim, int max_ctx, int kv_len, int n_splits, int chunk,
-    float scale, int window, float softcap) {
+    int n_gqa, int head_dim, int max_ctx, int kv_len, int n_splits, float scale,
+    int window, float softcap) {
     extern __shared__ float smem[];
     float *sh_acc = smem;
     float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
@@ -4681,6 +4691,10 @@ __global__ void flash_attn_decode_split_f32_kernel(
     const int hh = blockIdx.x;
     const int sp = blockIdx.y;
     if (hh >= n_heads || sp >= n_splits) return;
+    // chunk is computed from kv_len INSIDE the kernel (not a launch arg) so the grid
+    // (n_heads, n_splits) is FIXED — graph-capturable, with kv_len the updatable
+    // param. A split past kv_len (c0 >= kv_len) is an empty cheap no-op (short ctx).
+    const int chunk = (kv_len + n_splits - 1) / n_splits;
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int kv_h = hh / n_gqa;
@@ -4809,56 +4823,36 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) *
                    sizeof(float);
-    // Split-KV (FlashDecoding): when the 1-block-per-head grid starves the SMs AND
-    // there is enough KV to split, run n_splits ≈ SMs/n_heads blocks PER head over
-    // KV chunks, then a combine — n_heads*n_splits blocks fill the SMs so long-
-    // context attention saturates DRAM. Gated by RUSTLLAMA_DECODE_ATTN_SPLIT=1 +
-    // a KV threshold (below it the extra combine kernel isn't worth it). Capture-
-    // safe: the partials scratch is allocated on the first EAGER call and reused on
-    // replay; if capturing while still unallocated, fall back to the single kernel.
+    // Split-KV (FlashDecoding): FIXED grid (n_heads × n_splits), chunk computed
+    // inside the kernel from kv_len → CAPTURE-STABLE, so it runs inside the decode
+    // graph (the production path). Engages only when RUSTLLAMA_DECODE_ATTN_SPLIT=1
+    // AND the partials scratch is ALREADY allocated — it's pre-allocated in the
+    // prefill launcher (non-captured, before the decode graph is first captured);
+    // cudaMalloc is illegal during capture, so there is NO allocation here. If the
+    // scratch is absent (prefill didn't run / split off), the single kernel runs.
+    // At short ctx the extra splits are empty cheap no-ops + a tiny combine.
     {
         static int split_env = -1;
         if (split_env < 0) {
             const char *e = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT");
             split_env = (e && e[0] == '1') ? 1 : 0;
         }
-        int nsm = 0;
-        cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
-        int n_splits = (nsm > 0 && n_heads > 0) ? (nsm + n_heads - 1) / n_heads : 1;
-        if (n_splits > 16) n_splits = 16;
-        const int MIN_SPLIT_KV = 256;
-        bool want_split = split_env && n_splits > 1 && kv_len >= MIN_SPLIT_KV &&
-                          kv_len >= n_splits * 64;
-        if (want_split) {
+        if (split_env) {
+            int nsm = 0;
+            cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+            int n_splits = rsl_decode_attn_n_splits(nsm, n_heads);
             size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
-            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-            cudaStreamIsCapturing(s->stream, &cap);
-            if (s->fd_partials_cap < need) {
-                if (cap != cudaStreamCaptureStatusNone) {
-                    want_split = false; // can't cudaMalloc mid graph-capture
-                } else {
-                    if (s->fd_partials) cudaFree(s->fd_partials);
-                    if (cudaMalloc(&s->fd_partials, need * sizeof(float)) != cudaSuccess) {
-                        s->fd_partials = nullptr;
-                        s->fd_partials_cap = 0;
-                        want_split = false;
-                    } else {
-                        s->fd_partials_cap = need;
-                    }
-                }
+            if (n_splits > 1 && s->fd_partials && s->fd_partials_cap >= need) {
+                dim3 sgrid((unsigned)n_heads, (unsigned)n_splits);
+                flash_attn_decode_split_f32_kernel<<<sgrid, block, shmem, s->stream>>>(
+                    q, k, v, s->fd_partials, n_heads, n_gqa, head_dim, max_ctx, kv_len, n_splits,
+                    scale, window, softcap);
+                int ct = head_dim < 256 ? ((head_dim + 31) / 32) * 32 : 256;
+                if (ct < 32) ct = 32;
+                flash_attn_decode_combine_f32_kernel<<<(unsigned)n_heads, ct, 0, s->stream>>>(
+                    s->fd_partials, out, n_heads, head_dim, n_splits);
+                return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
             }
-        }
-        if (want_split) {
-            int chunk = (kv_len + n_splits - 1) / n_splits;
-            dim3 sgrid((unsigned)n_heads, (unsigned)n_splits);
-            flash_attn_decode_split_f32_kernel<<<sgrid, block, shmem, s->stream>>>(
-                q, k, v, s->fd_partials, n_heads, n_gqa, head_dim, max_ctx, kv_len, n_splits,
-                chunk, scale, window, softcap);
-            int ct = head_dim < 256 ? ((head_dim + 31) / 32) * 32 : 256;
-            if (ct < 32) ct = 32;
-            flash_attn_decode_combine_f32_kernel<<<(unsigned)n_heads, ct, 0, s->stream>>>(
-                s->fd_partials, out, n_heads, head_dim, n_splits);
-            return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
         }
     }
     // ncu-free DECODE-ATTN diagnostic (RUSTLLAMA_DECODE_ATTN_DIAG=1), fired ONCE on
@@ -5217,6 +5211,35 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
     if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return -1;
     if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     cudaSetDevice(s->device);
+    // Pre-allocate the DECODE split-KV partials scratch here: prefill runs before
+    // the first decode AND is not graph-captured, so this is the one safe place to
+    // cudaMalloc it (illegal during the decode graph's capture). Sized identically
+    // to the decode launch (rsl_decode_attn_n_splits). Only when split is enabled;
+    // idempotent (reused across prefill chunks + the whole generation).
+    {
+        static int split_env = -1;
+        if (split_env < 0) {
+            const char *e = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT");
+            split_env = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (split_env) {
+            int nsm = 0;
+            cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+            int n_splits = rsl_decode_attn_n_splits(nsm, n_heads);
+            size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s->stream, &cap);
+            if (n_splits > 1 && cap == cudaStreamCaptureStatusNone && s->fd_partials_cap < need) {
+                if (s->fd_partials) cudaFree(s->fd_partials);
+                if (cudaMalloc(&s->fd_partials, need * sizeof(float)) == cudaSuccess)
+                    s->fd_partials_cap = need;
+                else {
+                    s->fd_partials = nullptr;
+                    s->fd_partials_cap = 0;
+                }
+            }
+        }
+    }
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
     size_t shmem = (size_t)2 * RSL_FLASH_PREFILL_BK * head_dim * sizeof(float);
