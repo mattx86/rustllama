@@ -2756,6 +2756,21 @@ fn q8_repack_decode_enabled() -> bool {
     })
 }
 
+/// Whether the device-resident DECODE block fuses the dense FFN gate+up into one
+/// matvec launch (`RUSTLLAMA_DECODE_FUSED_GATE_UP=1`). Default OFF → the two
+/// separate `matvec_packed_dev_io` calls run (byte-identical to today). The fused
+/// kernel is BIT-EXACT to the two calls (same per-format row_dot), so this is a
+/// pure perf A/B lever: one launch + activation read once vs two. Measured on the
+/// pod via the `DB_FFN` profiler slice before it's promoted to a verdict.
+fn decode_fused_gate_up_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DECODE_FUSED_GATE_UP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Single-row Q8_0 W8A8 int-dot DECODE matvec (int8 activations, LOSSY) — the
 /// MMVQ-style decode analog of [`matvec_q4_k_w4a8`] for Q8_0 (symmetric: no
 /// min term). `out` = [M], `x` = [K], `w` = Q8_0 packed [M,K].
@@ -6666,8 +6681,16 @@ impl CudaMatvecCache {
         // layer is done on device and the caller skips the host FFN.
         if let Some((wg, wu, wd, _)) = dense_ffn {
             unsafe {
-                if !self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model)
-                    || !self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model)
+                // Fused gate+up: one launch computes both projections reading h_norm2
+                // once (bit-exact to the two matvecs). A/B lever; falls back to the
+                // two separate matvecs on an unsupported kind / failure.
+                let fused = decode_fused_gate_up_enabled()
+                    && self.matvec_gate_up_fused_dev_io(
+                        wg.0, wg.1, wg.2, wu.1, wu.2, phn2, p_gate, p_up, d_ff, d_model,
+                    );
+                if !fused
+                    && (!self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model)
+                        || !self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model))
                 {
                     return false;
                 }
@@ -8672,6 +8695,94 @@ impl CudaMatvecCache {
         gate_out.copy_from_slice(&both[..m]);
         up_out.copy_from_slice(&both[m..2 * m]);
         true
+    }
+
+    /// Device-I/O fused gate+up matvec for the decode block: one launch computes
+    /// `gate_out = gate_w @ x` and `up_out = up_w @ x` reading the activation ONCE,
+    /// with `x_ptr`/`gate_out_ptr`/`up_out_ptr` ALREADY device-resident (the decode
+    /// activation slab — no stage/download, unlike [`Self::matvec_gate_up_fused`]).
+    /// BIT-EXACT to two separate [`Self::matvec_packed_dev_io`] calls (same
+    /// per-format row_dot), so the only question is perf (one launch vs two). Only
+    /// the common dense quants carry a fused kernel; other kinds / bad shape return
+    /// false and the caller runs the two-matvec fallback.
+    ///
+    /// # Safety
+    /// `x_ptr` [k] and `gate_out_ptr`/`up_out_ptr` [m] are live device f32 buffers
+    /// on `self.stream`; the weight byte-slices live for the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matvec_gate_up_fused_dev_io(
+        &mut self,
+        kind: CudaPackedKind,
+        gate_key: usize,
+        gate_bytes: &[u8],
+        up_key: usize,
+        up_bytes: &[u8],
+        x_ptr: *const f32,
+        gate_out_ptr: *mut f32,
+        up_out_ptr: *mut f32,
+        m: usize,
+        k: usize,
+    ) -> bool {
+        if m == 0 || k == 0 || x_ptr.is_null() || gate_out_ptr.is_null() || up_out_ptr.is_null() {
+            return false;
+        }
+        let row_bytes = m * kind.row_bytes(k);
+        if k % kind.k_alignment() != 0 || gate_bytes.len() < row_bytes || up_bytes.len() < row_bytes
+        {
+            return false;
+        }
+        if !self.ensure_weight(gate_key, gate_bytes) || !self.ensure_weight(up_key, up_bytes) {
+            return false;
+        }
+        let gw_ptr = self.weights[&gate_key].ptr;
+        let uw_ptr = self.weights[&up_key].ptr;
+        // SAFETY: gw/uw are cached device weights sized (M,K); x/gate/up are caller-
+        // guaranteed live device buffers on this stream; the wrapper synchronizes.
+        let res = match kind {
+            CudaPackedKind::Q8_0 => matvec_q8_0_gate_up_fused(
+                &self.stream,
+                gw_ptr,
+                uw_ptr,
+                x_ptr,
+                gate_out_ptr,
+                up_out_ptr,
+                m,
+                k,
+            ),
+            CudaPackedKind::Q4_K => matvec_q4_k_gate_up_fused(
+                &self.stream,
+                gw_ptr,
+                uw_ptr,
+                x_ptr,
+                gate_out_ptr,
+                up_out_ptr,
+                m,
+                k,
+            ),
+            CudaPackedKind::Q6_K => matvec_q6_k_gate_up_fused(
+                &self.stream,
+                gw_ptr,
+                uw_ptr,
+                x_ptr,
+                gate_out_ptr,
+                up_out_ptr,
+                m,
+                k,
+            ),
+            CudaPackedKind::Q5_K => matvec_q5_k_gate_up_fused(
+                &self.stream,
+                gw_ptr,
+                uw_ptr,
+                x_ptr,
+                gate_out_ptr,
+                up_out_ptr,
+                m,
+                k,
+            ),
+            // No fused kernel for the remaining kinds → caller falls back.
+            _ => return false,
+        };
+        res.is_ok() && consume_error_count() == 0
     }
 
     /// Batched packed matvec over `n` input rows. `x` = [N,K] row-major,
