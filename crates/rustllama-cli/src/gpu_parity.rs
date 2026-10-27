@@ -7183,22 +7183,16 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             *counts.entry("KERNEL_ERR").or_default() += 1;
             continue;
         }
-        let (cos, max_rel) = compare(&cu_download_f32(&ob, N2 * MV_M), &cpu_out);
-        if cos > 0.999 && max_rel < 0.05 {
-            cu_emit(
-                name,
-                "OK",
-                &format!("cos={cos:.6} max_rel={max_rel:.4} (N={N2})"),
-            );
-            *counts.entry("OK").or_default() += 1;
-        } else {
-            cu_emit(
-                name,
-                "MISCOMPUTE",
-                &format!("cos={cos:.6} max_rel={max_rel:.4}"),
-            );
-            *counts.entry("MISCOMPUTE").or_default() += 1;
-        }
+        // Grade with the abs-floored TC grader (cu_tc_grade), NOT compare()'s bare
+        // max_rel: a W8A8 GEMM has near-zero reference elements where
+        // |g-c|/(|c|+1e-3) false-trips — `cos=1.000000` but max_rel blows up on one
+        // ref≈0 element (the documented trap; the N=8 probe above only dodges it
+        // because its data has no such element). cu_tc_grade uses numpy-allclose
+        // (abs_tol = 2% of the output peak) so quant noise on a near-zero element
+        // passes while a GROSS frag-map/scale bug still fails — AND it localizes the
+        // worst element to (row, col) so a real bug points at the clustered rows.
+        let gpu_out = cu_download_f32(&ob, N2 * MV_M);
+        cu_tc_grade(name, &gpu_out, &cpu_out, MV_M, &mut counts);
     }
 
     // ---- Q4_K W4A8 DECODE matvec (verdict: matvec:q4_k_w4a8, LOSSY + perf-gated) ----
