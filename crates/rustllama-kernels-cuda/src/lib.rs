@@ -2798,17 +2798,27 @@ fn decode_fused_gate_up_enabled() -> bool {
 /// with the matvec-diag matvec time, this splits the non-matvec decode cost (glue
 /// vs attn vs xfer) truly — the "which glue to fuse" question.
 fn decode_block_diag_arm() -> bool {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static DONE: AtomicBool = AtomicBool::new(false);
+    static CALLS: AtomicU32 = AtomicU32::new(0);
     let en = *ENABLED.get_or_init(|| {
         std::env::var("RUSTLLAMA_DECODE_BLOCK_DIAG")
             .map(|v| v == "1")
             .unwrap_or(false)
     });
-    // First call wins the compare_exchange → arms exactly one block.
-    en && DONE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+    if !en {
+        return false;
+    }
+    // Skip a WARMUP window (first ~64 block calls ≈ 2+ decode tokens' worth of
+    // layers) so the armed block measures STEADY-STATE kernel time — NOT the cold
+    // first call, where one-time weight H2D uploads + JIT and (if co-run) the
+    // matvec-diag's 128 MB self-timing land in the pre-attn interval and dwarf the
+    // kernels. By call 64 those are done. Then the first eligible call arms once.
+    if CALLS.fetch_add(1, Ordering::Relaxed) < 64 {
+        return false;
+    }
+    DONE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
 }
 
