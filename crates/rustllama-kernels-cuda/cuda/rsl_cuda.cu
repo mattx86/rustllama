@@ -2172,8 +2172,19 @@ __device__ __forceinline__ void rsl_gemm_q8_0_stage_tile_cpasync(
 // int8 WMMA math + per-32 scale fold as the 64x64 kernel → parity-equal (graded by
 // doctor --cuda-parity vs the fair-W8A8 ref). Launcher shape-gates it to N>=128
 // (prefill) so the small-N spec path keeps the un-padded 64x64 kernel.
+//
+// `__launch_bounds__(512, 1)` (1 block/SM, NOT 2): the GEMM_DIAG proved occupancy
+// is NOT the lever here — both this and the 64x64 kernel hit activeBlocks/SM=2,
+// but at a (512,2) 64-reg cap the cacc[4][8] accumulator (32 floats = 128 B) spills
+// to local, so every accumulate hits local memory → eff-BW pinned at 30% vs the
+// 64x64 kernel's 85% (DRAM peak). The 128 tile already HALVES weight re-reads
+// (8x→4x per the roofline), so un-spilling it is the path to the ~2x: 1 block/SM
+// gives the full 128-reg budget → cacc lives in registers (no spill). Dropping the
+// 2nd block/SM is affordable because cp.async double-buffering — not thread
+// occupancy — is what hides DRAM latency here: 16 warps with async loads in flight
+// keep the memory pipe full on this DRAM-bound kernel.
 template <bool REPACK>
-__global__ void __launch_bounds__(512, 2) gemm_q8_0_w8a8_tc_128_kernel(
+__global__ void __launch_bounds__(512, 1) gemm_q8_0_w8a8_tc_128_kernel(
     const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
     const unsigned short *__restrict__ wd, const signed char *__restrict__ xq,
     const float *__restrict__ xs, float *__restrict__ out, int M, int K, int N) {
@@ -2488,12 +2499,13 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                     fa.numRegs, fa.sharedSizeBytes, fa.maxThreadsPerBlock, nsm, maxThreadsSM,
                     maxSharedSM, threads, active, occ * 100.0, grid.x, grid.y, M, N, K);
             }
-            // 128x128 cp.async kernel — the occupancy-vs-SPILL answer: regs/thread,
-            // static shared/block, activeBlocks/SM (occupancy), and localSizeBytes
-            // (>0 = REGISTER SPILL to local memory). If activeBlocks/SM==1 AND
-            // localSize==0 → pure occupancy (the Cs-elimination 16KB→2 blocks/SM fix
-            // is worth it); if localSize>0 → cacc[4][8] spilled (the tile is too big
-            // for the reg budget = dead end on this slice without a smaller tile).
+            // 128x128 cp.async kernel — regs/thread, static shared/block,
+            // activeBlocks/SM (occupancy), and localSizeBytes (>0 = REGISTER SPILL to
+            // local memory). The first diag pass (at (512,2)) answered the occupancy-
+            // vs-spill question: activeBlocks/SM=2 (== the 64x64 kernel, so occupancy
+            // is NOT the lever) but LOCAL=128 B — the 64-reg cap forced cacc[4][8] to
+            // spill. That drove the (512,2)→(512,1) relax above (full 128-reg budget);
+            // this line now confirms it: LOCAL should read 0 B at activeBlocks/SM=1.
             cudaFuncAttributes fa2;
             if (cudaFuncGetAttributes(&fa2, gemm_q8_0_w8a8_tc_128_kernel<true>) == cudaSuccess) {
                 int nsm2 = 0, maxThreadsSM2 = 0, active2 = 0;
