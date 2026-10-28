@@ -6046,45 +6046,67 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
     float scale = 1.0f / sqrtf((float)head_dim);
     int D = head_dim;
 
-    // Wide-query-tile v2 selector (the FLASH_PREFILL_DIAG-steered fix).
-    // flash_attn_prefill_f16_tc_v2_kernel<NW> gives a block BQ=16*NW query rows over
-    // NW warps that share ONE K/V tile → ~NW-fold less K/V global re-read than the
-    // 1-warp kernel's 53.7x. DEFAULT = BQ=32 (NW=2): pod A/B on sm_120 MIG measured
-    // 1.22x prefill @2048 vs the 1-warp kernel (kernel 2899→2315 us/call) at cos=1.0
-    // vs the CPU ref, and it's the consistent sweet spot — 2 blocks/SM (latency
-    // hiding), no >48 KB shared opt-in. Gated TRANSITIVELY by the attn:prefill_tc
-    // verdict: the block only takes this TC path where that verdict passed, and the
-    // probe now grades THIS kernel (the launcher defaults to it). RUSTLLAMA_FLASH_-
-    // PREFILL_V2 overrides: 64 (NW=4, needs the shared opt-in — faster kernel but 1
-    // block/SM = noisier end-to-end on a shared slice), 16 / 0 force the original
-    // 1-warp kernel (the A/B lever). Read once.
-    static int v2_bq = -1;
-    if (v2_bq < 0) {
+    // --- Prefill-attention kernel selection ---
+    // DEFAULT = register-O BQ=64 for head_dim==128
+    // (flash_attn_prefill_f16_tc_rego_kernel<4,128>): pod A/B on sm_120 MIG measured
+    // 1.37x prefill @2048 vs the v2/BQ=32 kernel and 1.68x vs the original 1-warp
+    // kernel (attn kernel 2312→1112 us/call, ~1.9x), cos=1.0 vs the CPU ref, 17% occ
+    // (2 blocks/SM) with NO register spill (231 regs fit the launch_bounds budget).
+    // O lives in per-thread registers + a tiny reused 16x16 scratch, freeing the
+    // shared BQ×D O accumulator that pinned v2 at 8% occ. For head_dim != 128 (rego
+    // is templated on HD) the default is v2/BQ=32 (wide-query-tile, shared O; 1.22x
+    // over the 1-warp kernel). Gated TRANSITIVELY by the attn:prefill_tc verdict —
+    // the block only takes the TC path where that passed, and the probe grades
+    // whichever kernel the launcher defaults to.
+    //
+    // A/B overrides (read once): RUSTLLAMA_FLASH_PREFILL_REGO = 32|64 forces
+    // register-O at that BQ (0/other disables rego → v2); RUSTLLAMA_FLASH_PREFILL_V2 =
+    // 32|64 forces the shared-O v2 at that BQ, 16|0 forces the original 1-warp kernel
+    // (V2 has final say, so =64 cleanly A/Bs v2 against the rego default).
+    enum RslPfKind { RSL_PF_1WARP = 0, RSL_PF_V2 = 1, RSL_PF_REGO = 2 };
+    static int env_read = 0;
+    static int re_env = -1, ve_env = -1; // -1 = unset, else the parsed int
+    if (!env_read) {
+        env_read = 1;
+        const char *er = std::getenv("RUSTLLAMA_FLASH_PREFILL_REGO");
+        re_env = er ? std::atoi(er) : -1;
         const char *ev = std::getenv("RUSTLLAMA_FLASH_PREFILL_V2");
-        if (!ev) {
-            v2_bq = 32; // default: wide-query-tile v2, BQ=32
-        } else {
-            int want = std::atoi(ev);
-            v2_bq = (want == 32 || want == 64) ? want : 0; // 16/0/other → 1-warp
+        ve_env = ev ? std::atoi(ev) : -1;
+    }
+    int akind, abq;
+    if (D == 128) {
+        akind = RSL_PF_REGO;
+        abq = 64;
+    } else {
+        akind = RSL_PF_V2;
+        abq = 32;
+    }
+    if (re_env != -1) { // REGO override
+        if (re_env == 32 || re_env == 64) {
+            akind = RSL_PF_REGO;
+            abq = re_env;
+        } else { // disable rego
+            akind = RSL_PF_V2;
+            abq = 32;
         }
     }
-    const int nw = (v2_bq == 64) ? 4 : (v2_bq == 32) ? 2 : 0; // 0 = legacy 1-warp
-
-    // Register-O selector (the occupancy lever past v2's 8% wall).
-    // RUSTLLAMA_FLASH_PREFILL_REGO = 32 (NW2) or 64 (NW4) routes to
-    // flash_attn_prefill_f16_tc_rego_kernel<NW,128>: O in per-thread registers + a
-    // tiny reused 16x16 scratch instead of the BQ×D Osh → ~35 KB/block at BQ=64 →
-    // 2 blocks/SM (16% occ, 2x v2's 8%) at the same re-read. HD is templated 128, so
-    // it only engages for head_dim==128 (Qwen3 et al.); other dims fall back to v2.
-    // Opt-in A/B lever; overrides v2 when set. Read once.
-    static int rego_bq = -1;
-    if (rego_bq < 0) {
-        const char *er = std::getenv("RUSTLLAMA_FLASH_PREFILL_REGO");
-        int w = er ? std::atoi(er) : 0;
-        rego_bq = (w == 32 || w == 64) ? w : 0;
+    if (ve_env != -1) { // V2 override (final say)
+        if (ve_env == 32 || ve_env == 64) {
+            akind = RSL_PF_V2;
+            abq = ve_env;
+        } else { // 16/0 → 1-warp
+            akind = RSL_PF_1WARP;
+            abq = 16;
+        }
     }
-    const bool use_rego = (rego_bq != 0) && (D == 128);
-    const int rego_nw = (rego_bq == 64) ? 4 : 2;
+    if (akind == RSL_PF_REGO && D != 128) { // rego is HD==128 only
+        akind = RSL_PF_V2;
+        abq = 32;
+    }
+
+    const bool use_rego = (akind == RSL_PF_REGO);
+    const int rego_nw = (abq == 64) ? 4 : 2; // only meaningful when use_rego
+    const int nw = use_rego ? 0 : ((akind == RSL_PF_V2) ? (abq / 16) : 0); // 0 = 1-warp
     const char *klabel = use_rego ? "_rego" : (nw > 0 ? "_v2" : "");
 
     // Effective query tile of the ACTIVE kernel (16 = legacy 1-warp).
