@@ -5649,6 +5649,190 @@ __global__ void flash_attn_prefill_f16_tc_kernel(const float *q, const float *k,
 #endif
 }
 
+// Wide-query-tile twin of `flash_attn_prefill_f16_tc_kernel` (the FLASH_PREFILL_DIAG
+// fix). A block owns BQ = 16*NW query rows across NW warps (warp w owns rows
+// [w*16, w*16+16)), and the WHOLE BLOCK stages ONE K/V tile into shared, reused
+// across all NW warps' MMAs. The 1-warp kernel re-streams the entire [0, its_max]
+// K/V from global for EVERY 16-query block (the diag measured 53.7x re-read); here
+// each K/V tile is read once per BQ queries instead of once per 16 → ~NW-fold less
+// K/V global traffic (and fewer memory round-trips to stall on at the 8% occupancy
+// the diag found). The PER-WARP math — QK^T WMMA, shared-mem online softmax, the
+// Osh rescale + P·V WMMA — is IDENTICAL to the 1-warp kernel (so correctness carries
+// over; graded vs the CPU ref by `doctor --cuda-parity attn:prefill_tc`); the only
+// changes are (a) the K/V stage is cooperative over the whole block, (b) the loop
+// bound is the BLOCK's max query position (the per-element causal/SWA mask in the
+// softmax is unchanged, so warps whose rows are all < t0 simply mask to p=0), and
+// (c) a __syncthreads (not __syncwarp) brackets the shared K/V tile. Shared layout
+// mirrors the 1-warp kernel, scaled by BQ: Qh|Kh|Vh|Ph (half) then Osh|Ssh|m|l|rsc
+// (float). NW=2 (BQ=32) ≈ 35 KB (no opt-in); NW=4 (BQ=64) ≈ 62 KB (needs the
+// dynamic-shared opt-in, set by the launcher). LOSSY (fp16 QK/PV), same as the twin.
+template <int NW>
+__global__ void flash_attn_prefill_f16_tc_v2_kernel(const float *q, const float *k,
+                                                    const float *v, float *out,
+                                                    int n_heads, int n_gqa,
+                                                    int head_dim, int max_ctx,
+                                                    int kv_len_base, int n_new,
+                                                    float scale, int window,
+                                                    float softcap) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+    using namespace nvcuda;
+    const int D = head_dim;
+    const int BQ = 16 * NW;
+    extern __shared__ char smem_raw[];
+    half *Qh = (half *)smem_raw;      // [BQ, D]
+    half *Kh = Qh + BQ * D;           // [16, D]  (one shared K/V tile)
+    half *Vh = Kh + 16 * D;           // [16, D]
+    half *Ph = Vh + 16 * D;           // [BQ, 16]
+    float *Osh = (float *)(Ph + BQ * 16);
+    float *Ssh = Osh + BQ * D;        // [BQ, 16]
+    float *mrow = Ssh + BQ * 16;      // [BQ]
+    float *lrow = mrow + BQ;          // [BQ]
+    float *rsc = lrow + BQ;           // [BQ]
+
+    const int tid = threadIdx.x;       // 0 .. NW*32-1
+    const int warp = tid >> 5;         // 0 .. NW-1
+    const int lane = tid & 31;         // 0 .. 31
+    const int nthr = NW * 32;
+    const int hh = blockIdx.y;         // attention head
+    const int q_base = blockIdx.x * BQ;
+    const int kv_h = hh / n_gqa;
+
+    // Stage Q [BQ, D] → half cooperatively (inactive query rows padded 0); zero O.
+    for (int e = tid; e < BQ * D; e += nthr) {
+        int row = e / D, d = e - row * D;
+        int qp = q_base + row;
+        Qh[e] = (qp < n_new) ? __float2half(q[(qp * n_heads + hh) * D + d])
+                             : __float2half(0.f);
+        Osh[e] = 0.f;
+    }
+    if (tid < BQ) {
+        mrow[tid] = -INFINITY;
+        lrow[tid] = 0.f;
+    }
+    __syncthreads();
+
+    // Loop bound = the max query position in the WHOLE block (every warp's needed
+    // K/V tiles get staged; the per-row causal mask excludes the rest).
+    const int q_last_block = min(q_base + BQ - 1, n_new - 1);
+    const int p_block_max = kv_len_base + q_last_block;
+
+    // This warp's sub-tile views (16 query rows at warp*16).
+    const int wq_base = q_base + warp * 16;
+    half *Qw = Qh + warp * 16 * D;
+    half *Pw = Ph + warp * 16 * 16;
+    float *Ow = Osh + warp * 16 * D;
+    float *Sw = Ssh + warp * 16 * 16;
+    float *mw = mrow + warp * 16;
+    float *lw = lrow + warp * 16;
+    float *rw = rsc + warp * 16;
+
+    for (int t0 = 0; t0 <= p_block_max; t0 += 16) {
+        // Cooperative stage of this K/V tile [t0, t0+16) for kv head kv_h → half.
+        for (int e = tid; e < 16 * D; e += nthr) {
+            int row = e / D, d = e - row * D;
+            int t = t0 + row;
+            if (t < max_ctx) {
+                int off = (kv_h * max_ctx + t) * D + d;
+                Kh[e] = __float2half(k[off]);
+                Vh[e] = __float2half(v[off]);
+            } else {
+                Kh[e] = __float2half(0.f);
+                Vh[e] = __float2half(0.f);
+            }
+        }
+        __syncthreads();
+
+        // --- per-warp body: IDENTICAL math to the 1-warp kernel, on this warp's
+        // 16-query sub-tile against the shared K/V tile. ---
+        // S[16,16] = Qw·K^T, contracting D in 16-wide WMMA steps.
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_s;
+        wmma::fill_fragment(acc_s, 0.f);
+        for (int dk = 0; dk < D; dk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &Qw[dk], D);
+            wmma::load_matrix_sync(bf, &Kh[dk], D);
+            wmma::mma_sync(acc_s, af, bf, acc_s);
+        }
+        wmma::store_matrix_sync(Sw, acc_s, 16, wmma::mem_row_major);
+        __syncwarp();
+
+        // Online softmax, one query row per lane (lanes 0..15). Writes the half P
+        // tile + the per-row O rescale; invalid (causal/SWA/inactive) cols → p=0.
+        if (lane < 16) {
+            int i = lane;
+            int qp = wq_base + i;
+            if (qp < n_new) {
+                int p_self = kv_len_base + qp;
+                int t_start =
+                    (window > 0 && p_self - window + 1 > 0) ? (p_self - window + 1) : 0;
+                float rowmax = -INFINITY;
+                for (int c = 0; c < 16; ++c) {
+                    int pos = t0 + c;
+                    if (pos <= p_self && pos >= t_start) {
+                        float s = Sw[i * 16 + c] * scale;
+                        if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+                        Sw[i * 16 + c] = s;
+                        rowmax = fmaxf(rowmax, s);
+                    } else {
+                        Sw[i * 16 + c] = -INFINITY;
+                    }
+                }
+                float m_old = mw[i];
+                float m_new = fmaxf(m_old, rowmax);
+                float rescale = isfinite(m_old) ? expf(m_old - m_new) : 0.f;
+                float ltile = 0.f;
+                for (int c = 0; c < 16; ++c) {
+                    float s = Sw[i * 16 + c];
+                    float p = isfinite(s) ? expf(s - m_new) : 0.f;
+                    Pw[i * 16 + c] = __float2half(p);
+                    ltile += p;
+                }
+                lw[i] = lw[i] * rescale + ltile;
+                mw[i] = m_new;
+                rw[i] = rescale;
+            } else {
+                for (int c = 0; c < 16; ++c) Pw[i * 16 + c] = __float2half(0.f);
+                rw[i] = 1.f;
+            }
+        }
+        __syncwarp();
+
+        // Rescale O by the per-row correction, then O += P·V (D in 16-wide steps).
+        for (int e = lane; e < 16 * D; e += 32) Ow[e] *= rw[e / D];
+        __syncwarp();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+        wmma::load_matrix_sync(pf, Pw, 16);
+        for (int dn = 0; dn < D; dn += 16) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_o;
+            wmma::load_matrix_sync(acc_o, &Ow[dn], D, wmma::mem_row_major);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+            wmma::load_matrix_sync(vf, &Vh[dn], D);
+            wmma::mma_sync(acc_o, pf, vf, acc_o);
+            wmma::store_matrix_sync(&Ow[dn], acc_o, D, wmma::mem_row_major);
+        }
+        // Block-wide barrier: all warps must finish consuming Kh/Vh before the next
+        // iteration's cooperative stage overwrites the shared K/V tile.
+        __syncthreads();
+    }
+
+    // Normalize by the softmax denominator and write out (active rows only).
+    for (int e = lane; e < 16 * D; e += 32) {
+        int row = e / D, d = e - row * D;
+        int qp = wq_base + row;
+        if (qp < n_new) {
+            int lr = warp * 16 + row;
+            float inv = (lrow[lr] > 0.f) ? 1.f / lrow[lr] : 0.f;
+            out[(qp * n_heads + hh) * D + d] = Ow[e] * inv;
+        }
+    }
+#else
+    (void)q; (void)k; (void)v; (void)out; (void)n_heads; (void)n_gqa;
+    (void)head_dim; (void)max_ctx; (void)kv_len_base; (void)n_new;
+    (void)scale; (void)window; (void)softcap;
+#endif
+}
+
 // Launcher for the TC flash-attn prefill. Same signature as the scalar
 // `rsl_cuda_flash_attn_prefill_f32`; returns -1 (→ Rust falls back to the scalar
 // kernel) when head_dim is not 16-aligned or the shape is otherwise unsupported.
@@ -5671,78 +5855,124 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
     int D = head_dim;
-    size_t shmem = (size_t)(16 * D * 3 + 16 * 16) * sizeof(half) +
-                   (size_t)(16 * D + 16 * 16 + 16 + 16 + 16) * sizeof(float);
-    dim3 block(32, 1);
-    dim3 grid((unsigned)((n_new + 15) / 16), (unsigned)n_heads);
+
+    // Wide-query-tile v2 selector (the FLASH_PREFILL_DIAG-steered fix).
+    // RUSTLLAMA_FLASH_PREFILL_V2 = 32 (NW=2) or 64 (NW=4) routes to
+    // flash_attn_prefill_f16_tc_v2_kernel<NW> (one shared K/V stage per BQ=16*NW
+    // queries → ~NW-fold less K/V global re-read than the 1-warp kernel's 53.7x);
+    // unset / any other value → the original 1-warp kernel, byte-identical. Read
+    // once. This is the on-pod A/B lever before a verdict is banked.
+    static int v2_bq = -1;
+    if (v2_bq < 0) {
+        const char *ev = std::getenv("RUSTLLAMA_FLASH_PREFILL_V2");
+        int want = ev ? std::atoi(ev) : 0;
+        v2_bq = (want == 32 || want == 64) ? want : 0;
+    }
+    const int nw = (v2_bq == 64) ? 4 : (v2_bq == 32) ? 2 : 0; // 0 = legacy 1-warp
+    const int active_bq = (nw > 0) ? (16 * nw) : 16;
+
+    // Shared footprint of the ACTIVE kernel (bytes), mirroring its layout.
+    auto shmem_for_bq = [&](int bq) -> size_t {
+        return (size_t)(bq * D + 16 * D + 16 * D + bq * 16) * sizeof(half) +
+               (size_t)(bq * D + bq * 16 + bq + bq + bq) * sizeof(float);
+    };
+    size_t shmem = shmem_for_bq(active_bq);
+    dim3 block((unsigned)((nw > 0) ? nw * 32 : 32), 1);
+    dim3 grid((unsigned)((n_new + active_bq - 1) / active_bq), (unsigned)n_heads);
+
+    // BQ=64 (NW=4) needs >48 KB dynamic shared → opt in once per instantiation.
+    if (nw == 4) {
+        static int optin4 = 0;
+        if (!optin4) {
+            optin4 = 1;
+            cudaFuncSetAttribute(flash_attn_prefill_f16_tc_v2_kernel<4>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)shmem);
+        }
+    }
+
     // ncu-free TC-PREFILL-ATTN diagnostic (RUSTLLAMA_FLASH_PREFILL_DIAG=1), fired
-    // ONCE on a WARM call (skip 64). Confirms the suspected headroom BEFORE a
-    // flash-attn-2 rewrite: this kernel is 1 warp/block over a 16-query tile, so
-    // (a) occupancy is dynamic-shared-limited (~22 KB/block for head_dim=128) and
-    // (b) EVERY 16-query block re-streams the whole [0, its_max] K/V from global —
-    // GQA re-read (grid.y = n_heads, not n_kv_heads) ON TOP OF the causal-triangle
-    // re-read. Uses only cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocks... +
-    // cudaEvents (NO perf counters), so it works where ncu hits ERR_NVGPUCTRPERM
-    // (RunPod/MIG). Reports occupancy, a timed us/call, and the analytic K/V
-    // re-read factor (actual tile-reads / read-each-once ideal) vs its implied BW —
-    // ideal-BW >> measured peak ⇒ L2 absorbs the redundancy (occupancy/latency is
-    // the wall), ideal-BW ~ peak ⇒ DRAM-bound on redundant traffic (the re-read IS
-    // the wall). Either way the fix is the same: a wider query tile (BQ=64/128,
-    // multi-warp, one shared K/V stage per block) raises occupancy AND cuts the
-    // re-read ~BQ/16x.
+    // ONCE on a WARM call (skip 64). Localizes the headroom the flash-attn-2 rewrite
+    // targets: the 1-warp kernel is dynamic-shared-limited (~22 KB/block, 8% occ)
+    // AND re-streams the whole [0, its_max] K/V from global for every 16-query block
+    // (GQA re-read on top of the causal-triangle re-read). Uses only
+    // cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocks... + cudaEvents (NO perf
+    // counters), so it works where ncu hits ERR_NVGPUCTRPERM (RunPod/MIG). Reports
+    // occupancy, a timed us/call, and the analytic K/V re-read factor vs its implied
+    // BW — ideal-BW >> peak ⇒ L2 absorbs the redundancy (occupancy/latency is the
+    // wall), ideal-BW ~ peak ⇒ DRAM-bound on redundant traffic. Reports whichever
+    // kernel is ACTIVE (v2 cuts the re-read by active_bq/16), so the A/B shows the
+    // mechanism move on-device, not just the end-to-end time.
     {
         static int fpd_calls = 0, fpd_done = 0;
         if (!fpd_done && std::getenv("RUSTLLAMA_FLASH_PREFILL_DIAG") != nullptr &&
             fpd_calls++ >= 64) {
             fpd_done = 1;
+            const int threads = (int)(block.x * block.y);
+            const int IT = 200;
+            int nsm = 0, maxThreadsSM = 0, maxSharedSM = 0, active = 0;
+            int dregs = 0;
+            size_t dlocal = 0;
+            float ms = 0.f;
+            int ok = 0;
+            cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+            cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor,
+                                   s->device);
+            cudaDeviceGetAttribute(&maxSharedSM, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                                   s->device);
+            // Measure the active kernel: resource attrs + occupancy + warm 200-iter
+            // timing (idempotent q/k/v → out). Branch on NW (compile-time template).
             cudaFuncAttributes fa;
-            if (cudaFuncGetAttributes(&fa, flash_attn_prefill_f16_tc_kernel) ==
-                cudaSuccess) {
-                int nsm = 0, maxThreadsSM = 0, maxSharedSM = 0, active = 0;
-                const int threads = (int)(block.x * block.y);
-                cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
-                cudaDeviceGetAttribute(&maxThreadsSM,
-                                       cudaDevAttrMaxThreadsPerMultiProcessor, s->device);
-                cudaDeviceGetAttribute(&maxSharedSM,
-                                       cudaDevAttrMaxSharedMemoryPerMultiprocessor,
-                                       s->device);
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &active, flash_attn_prefill_f16_tc_kernel, threads, shmem);
+#define RSL_FPDIAG_RUN(KERN)                                                          \
+    do {                                                                             \
+        if (cudaFuncGetAttributes(&fa, KERN) == cudaSuccess) {                       \
+            dregs = fa.numRegs;                                                      \
+            dlocal = fa.localSizeBytes;                                              \
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, KERN, threads,    \
+                                                          shmem);                    \
+            cudaEvent_t e0, e1;                                                      \
+            cudaEventCreate(&e0);                                                    \
+            cudaEventCreate(&e1);                                                    \
+            KERN<<<grid, block, shmem, s->stream>>>(q, k, v, out, n_heads, n_gqa,    \
+                                                    head_dim, max_ctx, kv_len_base,  \
+                                                    n_new, scale, window, softcap);  \
+            cudaStreamSynchronize(s->stream);                                        \
+            cudaEventRecord(e0, s->stream);                                          \
+            for (int it = 0; it < IT; it++)                                          \
+                KERN<<<grid, block, shmem, s->stream>>>(                             \
+                    q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base,    \
+                    n_new, scale, window, softcap);                                  \
+            cudaEventRecord(e1, s->stream);                                          \
+            cudaEventSynchronize(e1);                                                \
+            cudaEventElapsedTime(&ms, e0, e1);                                       \
+            cudaEventDestroy(e0);                                                    \
+            cudaEventDestroy(e1);                                                    \
+            ok = 1;                                                                  \
+        }                                                                           \
+    } while (0)
+            if (nw == 4) {
+                RSL_FPDIAG_RUN(flash_attn_prefill_f16_tc_v2_kernel<4>);
+            } else if (nw == 2) {
+                RSL_FPDIAG_RUN(flash_attn_prefill_f16_tc_v2_kernel<2>);
+            } else {
+                RSL_FPDIAG_RUN(flash_attn_prefill_f16_tc_kernel);
+            }
+#undef RSL_FPDIAG_RUN
+            if (ok) {
+                double us = (double)ms / IT * 1e3;
                 double occ = maxThreadsSM > 0
                                  ? (double)(active * threads) / (double)maxThreadsSM
                                  : 0.0;
-                // Timed us/call (warm), 200 iters on the real buffers — the kernel is
-                // idempotent in q/k/v → out, so re-launching recomputes the same out.
-                cudaEvent_t e0, e1;
-                cudaEventCreate(&e0);
-                cudaEventCreate(&e1);
-                flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
-                    q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new,
-                    scale, window, softcap); // warmup
-                cudaStreamSynchronize(s->stream);
-                cudaEventRecord(e0, s->stream);
-                const int IT = 200;
-                for (int it = 0; it < IT; it++)
-                    flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
-                        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base,
-                        n_new, scale, window, softcap);
-                cudaEventRecord(e1, s->stream);
-                cudaEventSynchronize(e1);
-                float ms = 0.f;
-                cudaEventElapsedTime(&ms, e0, e1);
-                cudaEventDestroy(e0);
-                cudaEventDestroy(e1);
-                double us = (double)ms / IT * 1e3;
-                // Ideal (read each K/V position once) vs actual tile re-reads. Each of
-                // the grid.y = n_heads blocks loops t0 over [0, kv_base+its_q_last] in
-                // 16-tiles, reading K+V (f32) each tile; sum that against the single
-                // read of the [0, kv_base+n_new) K/V for n_kv_heads.
+                // Ideal (read each K/V position once) vs actual tile re-reads. With
+                // BQ-wide blocks the block count is ceil(n_new/BQ); each block loops
+                // t0 over [0, kv_base+its_q_last] in 16-row K/V tiles, staged ONCE and
+                // reused across the block's BQ queries → ~BQ/16-fold less than 1-warp.
                 double ideal_kv =
                     (double)(kv_len_base + n_new) * n_kv_heads * head_dim * 2.0 * 4.0;
                 long long tiles = 0;
-                const int nqb = (n_new + 15) / 16;
+                const int nqb = (n_new + active_bq - 1) / active_bq;
                 for (int b = 0; b < nqb; b++) {
-                    int q_last = b * 16 + 15;
+                    int q_last = b * active_bq + active_bq - 1;
                     if (q_last > n_new - 1) q_last = n_new - 1;
                     int pmax = kv_len_base + q_last;
                     tiles += (long long)(pmax / 16 + 1);
@@ -5753,23 +5983,33 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
                 double actual_bw = us > 0.0 ? actual_kv / (us * 1e-6) / 1e9 : 0.0;
                 std::fprintf(
                     stderr,
-                    "[flash-prefill-diag] f16_tc n_new=%d kv_base=%d n_heads=%d "
+                    "[flash-prefill-diag] f16_tc%s n_new=%d kv_base=%d n_heads=%d "
                     "n_kv_heads=%d head_dim=%d: %.1f us/call | regs=%d LOCAL(spill)=%zu B "
-                    "dyn_smem=%zu B/block | block=%dthr(1 warp) SMs=%d maxThreads/SM=%d "
+                    "dyn_smem=%zu B/block | block=%dthr(%d warp) SMs=%d maxThreads/SM=%d "
                     "maxSmem/SM=%dB activeBlocks/SM=%d -> occupancy=%.0f%% | grid=%ux%u | "
                     "KV re-read=%.1fx (ideal %.1f MB -> actual %.0f MB) ideal-BW=%.0f "
-                    "actual-BW=%.0f GB/s (WANT: wider query tile + multi-warp block -> "
-                    "raise occ & cut re-read)\n",
-                    n_new, kv_len_base, n_heads, n_kv_heads, head_dim, us, fa.numRegs,
-                    fa.localSizeBytes, shmem, threads, nsm, maxThreadsSM, maxSharedSM,
-                    active, occ * 100.0, grid.x, grid.y, actual_kv / ideal_kv,
-                    ideal_kv / 1e6, actual_kv / 1e6, ideal_bw, actual_bw);
+                    "actual-BW=%.0f GB/s (BQ=%d; v2 cuts re-read ~BQ/16x)\n",
+                    nw > 0 ? "_v2" : "", n_new, kv_len_base, n_heads, n_kv_heads,
+                    head_dim, us, dregs, dlocal, shmem, threads, threads / 32, nsm,
+                    maxThreadsSM, maxSharedSM, active, occ * 100.0, grid.x, grid.y,
+                    actual_kv / ideal_kv, ideal_kv / 1e6, actual_kv / 1e6, ideal_bw,
+                    actual_bw, active_bq);
             }
         }
     }
-    flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
-        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
-        window, softcap);
+    if (nw == 4) {
+        flash_attn_prefill_f16_tc_v2_kernel<4><<<grid, block, shmem, s->stream>>>(
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
+            window, softcap);
+    } else if (nw == 2) {
+        flash_attn_prefill_f16_tc_v2_kernel<2><<<grid, block, shmem, s->stream>>>(
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
+            window, softcap);
+    } else {
+        flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
+            window, softcap);
+    }
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_f16_tc");
 }
 
