@@ -5833,6 +5833,196 @@ __global__ void flash_attn_prefill_f16_tc_v2_kernel(const float *q, const float 
 #endif
 }
 
+// REGISTER-O twin of the v2 kernel (the occupancy lever past v2's 8% wall). v2
+// keeps the BQ×D O accumulator in SHARED (Osh), which caps blocks/SM (62 KB/block
+// at BQ=64 → 1 block/SM = 8% occ). Here O lives in PER-THREAD REGISTERS: each warp
+// owns 16 query rows × HD cols (= HD/16 * 8 floats/lane, HD compile-time so the
+// Oreg array stays in registers — a runtime head_dim would spill it to local), and
+// each KV tile's P·V result is staged through a TINY per-warp 16×16 scratch (Osc,
+// reused per D-chunk AND per tile) instead of a persistent Osh. That drops shared
+// from ~62 KB → ~35 KB at BQ=64 → 2 blocks/SM (16% occ, 2× v2) while keeping the
+// PROVEN wmma math (QK^T + per-chunk P·V) — no raw PTX mma. The online-softmax
+// rescale is applied to Oreg in registers (Oreg = Oreg*rescale + thisTile·V), which
+// is exactly what Osh's store/scale/reload did. Templated on HD (head_dim) so the
+// chunk loop unrolls; the launcher instantiates HD=128 and falls back to v2 for
+// other dims. LOSSY (fp16), graded vs the CPU ref by `attn:prefill_tc`.
+template <int NW, int HD>
+__global__ void __launch_bounds__(NW * 32, 2) flash_attn_prefill_f16_tc_rego_kernel(
+    const float *q, const float *k, const float *v, float *out, int n_heads,
+    int n_gqa, int head_dim, int max_ctx, int kv_len_base, int n_new, float scale,
+    int window, float softcap) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+    using namespace nvcuda;
+    const int D = HD;              // compile-time head_dim
+    const int BQ = 16 * NW;
+    const int NCH = HD / 16;       // D-chunks per warp-row-tile (compile-time)
+    (void)head_dim;                // == HD (launcher gates it); HD is authoritative
+    extern __shared__ char smem_raw[];
+    half *Qh = (half *)smem_raw;   // [BQ, D]
+    half *Kh = Qh + BQ * D;        // [16, D]  (one shared K/V tile)
+    half *Vh = Kh + 16 * D;        // [16, D]
+    half *Ph = Vh + 16 * D;        // [BQ, 16]
+    float *Ssh = (float *)(Ph + BQ * 16); // [BQ, 16]
+    float *Osc = Ssh + BQ * 16;    // [NW, 16, 16]  per-warp P·V scratch (reused)
+    float *mrow = Osc + NW * 16 * 16; // [BQ]
+    float *lrow = mrow + BQ;       // [BQ]
+    float *rsc = lrow + BQ;        // [BQ]
+
+    const int tid = threadIdx.x;   // 0 .. NW*32-1
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int nthr = NW * 32;
+    const int hh = blockIdx.y;
+    const int q_base = blockIdx.x * BQ;
+    const int kv_h = hh / n_gqa;
+
+    // Register O: this warp owns 16 rows × D cols. Within each D-chunk's 16×16
+    // scratch (row-major, idx = r*16 + cc), lane owns idx = lane + 32*kk (kk 0..7).
+    // Oreg[c*8 + kk] holds chunk c's (row=idx/16, col=16c+idx%16) element.
+    float Oreg[NCH * 8];
+#pragma unroll
+    for (int i = 0; i < NCH * 8; i++) Oreg[i] = 0.f;
+
+    // Stage Q [BQ, D] → half cooperatively (inactive query rows padded 0).
+    for (int e = tid; e < BQ * D; e += nthr) {
+        int row = e / D, d = e - row * D;
+        int qp = q_base + row;
+        Qh[e] = (qp < n_new) ? __float2half(q[(qp * n_heads + hh) * D + d])
+                             : __float2half(0.f);
+    }
+    if (tid < BQ) {
+        mrow[tid] = -INFINITY;
+        lrow[tid] = 0.f;
+    }
+    __syncthreads();
+
+    const int q_last_block = min(q_base + BQ - 1, n_new - 1);
+    const int p_block_max = kv_len_base + q_last_block;
+
+    const int wq_base = q_base + warp * 16;
+    half *Qw = Qh + warp * 16 * D;
+    half *Pw = Ph + warp * 16 * 16;
+    float *Sw = Ssh + warp * 16 * 16;
+    float *mw = mrow + warp * 16;
+    float *lw = lrow + warp * 16;
+    float *rw = rsc + warp * 16;
+    float *Oscw = Osc + warp * 16 * 16;
+
+    for (int t0 = 0; t0 <= p_block_max; t0 += 16) {
+        for (int e = tid; e < 16 * D; e += nthr) {
+            int row = e / D, d = e - row * D;
+            int t = t0 + row;
+            if (t < max_ctx) {
+                int off = (kv_h * max_ctx + t) * D + d;
+                Kh[e] = __float2half(k[off]);
+                Vh[e] = __float2half(v[off]);
+            } else {
+                Kh[e] = __float2half(0.f);
+                Vh[e] = __float2half(0.f);
+            }
+        }
+        __syncthreads();
+
+        // S[16,16] = Qw·K^T (wmma), then online softmax → Pw + per-row rescale rw.
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_s;
+        wmma::fill_fragment(acc_s, 0.f);
+        for (int dk = 0; dk < D; dk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, &Qw[dk], D);
+            wmma::load_matrix_sync(bf, &Kh[dk], D);
+            wmma::mma_sync(acc_s, af, bf, acc_s);
+        }
+        wmma::store_matrix_sync(Sw, acc_s, 16, wmma::mem_row_major);
+        __syncwarp();
+
+        if (lane < 16) {
+            int i = lane;
+            int qp = wq_base + i;
+            if (qp < n_new) {
+                int p_self = kv_len_base + qp;
+                int t_start =
+                    (window > 0 && p_self - window + 1 > 0) ? (p_self - window + 1) : 0;
+                float rowmax = -INFINITY;
+                for (int c = 0; c < 16; ++c) {
+                    int pos = t0 + c;
+                    if (pos <= p_self && pos >= t_start) {
+                        float s = Sw[i * 16 + c] * scale;
+                        if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+                        Sw[i * 16 + c] = s;
+                        rowmax = fmaxf(rowmax, s);
+                    } else {
+                        Sw[i * 16 + c] = -INFINITY;
+                    }
+                }
+                float m_old = mw[i];
+                float m_new = fmaxf(m_old, rowmax);
+                float rescale = isfinite(m_old) ? expf(m_old - m_new) : 0.f;
+                float ltile = 0.f;
+                for (int c = 0; c < 16; ++c) {
+                    float s = Sw[i * 16 + c];
+                    float p = isfinite(s) ? expf(s - m_new) : 0.f;
+                    Pw[i * 16 + c] = __float2half(p);
+                    ltile += p;
+                }
+                lw[i] = lw[i] * rescale + ltile;
+                mw[i] = m_new;
+                rw[i] = rescale;
+            } else {
+                for (int c = 0; c < 16; ++c) Pw[i * 16 + c] = __float2half(0.f);
+                rw[i] = 1.f;
+            }
+        }
+        __syncwarp();
+
+        // O += P·V, per D-chunk, accumulated in REGISTERS with the per-row rescale.
+        // Each chunk: wmma P·V (16×16) → the warp's 16×16 scratch → each lane folds
+        // its 8 owned elements into Oreg (Oreg = Oreg*rescale + thisTile). Osc is
+        // reused per chunk (one __syncwarp brackets the store/read).
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+        wmma::load_matrix_sync(pf, Pw, 16);
+#pragma unroll
+        for (int c = 0; c < NCH; ++c) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_o;
+            wmma::fill_fragment(acc_o, 0.f);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+            wmma::load_matrix_sync(vf, &Vh[c * 16], D);
+            wmma::mma_sync(acc_o, pf, vf, acc_o);
+            wmma::store_matrix_sync(Oscw, acc_o, 16, wmma::mem_row_major);
+            __syncwarp();
+#pragma unroll
+            for (int kk = 0; kk < 8; ++kk) {
+                int idx = lane + 32 * kk; // 0..255 within the 16×16 chunk
+                int row = idx >> 4;       // idx / 16
+                Oreg[c * 8 + kk] = Oreg[c * 8 + kk] * rw[row] + Oscw[idx];
+            }
+            __syncwarp(); // before the next chunk overwrites Oscw
+        }
+        __syncthreads(); // before the next KV tile overwrites Kh/Vh
+    }
+
+    // Normalize by the softmax denominator and write out (active rows only).
+#pragma unroll
+    for (int c = 0; c < NCH; ++c) {
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            int idx = lane + 32 * kk;
+            int row = idx >> 4, cc = idx & 15;
+            int qp = wq_base + row;
+            if (qp < n_new) {
+                int lr = warp * 16 + row;
+                float inv = (lrow[lr] > 0.f) ? 1.f / lrow[lr] : 0.f;
+                out[(qp * n_heads + hh) * D + c * 16 + cc] = Oreg[c * 8 + kk] * inv;
+            }
+        }
+    }
+#else
+    (void)q; (void)k; (void)v; (void)out; (void)n_heads; (void)n_gqa;
+    (void)head_dim; (void)max_ctx; (void)kv_len_base; (void)n_new;
+    (void)scale; (void)window; (void)softcap;
+#endif
+}
+
 // Launcher for the TC flash-attn prefill. Same signature as the scalar
 // `rsl_cuda_flash_attn_prefill_f32`; returns -1 (→ Rust falls back to the scalar
 // kernel) when head_dim is not 16-aligned or the shape is otherwise unsupported.
@@ -5879,19 +6069,46 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
         }
     }
     const int nw = (v2_bq == 64) ? 4 : (v2_bq == 32) ? 2 : 0; // 0 = legacy 1-warp
-    const int active_bq = (nw > 0) ? (16 * nw) : 16;
 
-    // Shared footprint of the ACTIVE kernel (bytes), mirroring its layout.
-    auto shmem_for_bq = [&](int bq) -> size_t {
+    // Register-O selector (the occupancy lever past v2's 8% wall).
+    // RUSTLLAMA_FLASH_PREFILL_REGO = 32 (NW2) or 64 (NW4) routes to
+    // flash_attn_prefill_f16_tc_rego_kernel<NW,128>: O in per-thread registers + a
+    // tiny reused 16x16 scratch instead of the BQ×D Osh → ~35 KB/block at BQ=64 →
+    // 2 blocks/SM (16% occ, 2x v2's 8%) at the same re-read. HD is templated 128, so
+    // it only engages for head_dim==128 (Qwen3 et al.); other dims fall back to v2.
+    // Opt-in A/B lever; overrides v2 when set. Read once.
+    static int rego_bq = -1;
+    if (rego_bq < 0) {
+        const char *er = std::getenv("RUSTLLAMA_FLASH_PREFILL_REGO");
+        int w = er ? std::atoi(er) : 0;
+        rego_bq = (w == 32 || w == 64) ? w : 0;
+    }
+    const bool use_rego = (rego_bq != 0) && (D == 128);
+    const int rego_nw = (rego_bq == 64) ? 4 : 2;
+    const char *klabel = use_rego ? "_rego" : (nw > 0 ? "_v2" : "");
+
+    // Effective query tile of the ACTIVE kernel (16 = legacy 1-warp).
+    const int active_bq = use_rego ? (16 * rego_nw) : ((nw > 0) ? (16 * nw) : 16);
+
+    // Shared footprint of the ACTIVE kernel (bytes), mirroring its layout. v2 keeps
+    // the BQ×D O accumulator in shared; rego replaces it with a per-warp 16x16
+    // scratch (NW*256 floats), so its float half is much smaller.
+    auto shmem_v2_for = [&](int bq) -> size_t {
         return (size_t)(bq * D + 16 * D + 16 * D + bq * 16) * sizeof(half) +
                (size_t)(bq * D + bq * 16 + bq + bq + bq) * sizeof(float);
     };
-    size_t shmem = shmem_for_bq(active_bq);
-    dim3 block((unsigned)((nw > 0) ? nw * 32 : 32), 1);
+    auto shmem_rego_for = [&](int bq, int nwx) -> size_t {
+        return (size_t)(bq * D + 16 * D + 16 * D + bq * 16) * sizeof(half) +
+               (size_t)(bq * 16 + nwx * 16 * 16 + bq + bq + bq) * sizeof(float);
+    };
+    size_t shmem = use_rego ? shmem_rego_for(active_bq, rego_nw)
+                            : shmem_v2_for(active_bq);
+    dim3 block((unsigned)(active_bq / 16 * 32), 1);
     dim3 grid((unsigned)((n_new + active_bq - 1) / active_bq), (unsigned)n_heads);
 
-    // BQ=64 (NW=4) needs >48 KB dynamic shared → opt in once per instantiation.
-    if (nw == 4) {
+    // v2 BQ=64 (NW=4) needs >48 KB dynamic shared → opt in once. rego BQ=64 is
+    // ~35 KB, so no opt-in there.
+    if (!use_rego && nw == 4) {
         static int optin4 = 0;
         if (!optin4) {
             optin4 = 1;
@@ -5900,6 +6117,12 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
                                  (int)shmem);
         }
     }
+
+// Alias the rego template-ids (the <NW,128> comma breaks macro-arg parsing when
+// passed directly to RSL_FPDIAG_RUN; these expand after that macro has taken its
+// single arg, and `ALIAS<<<...>>>` is a valid launch).
+#define RSL_REGO_K2 flash_attn_prefill_f16_tc_rego_kernel<2, 128>
+#define RSL_REGO_K4 flash_attn_prefill_f16_tc_rego_kernel<4, 128>
 
     // ncu-free TC-PREFILL-ATTN diagnostic (RUSTLLAMA_FLASH_PREFILL_DIAG=1), fired
     // ONCE on a WARM call (skip 64). Localizes the headroom the flash-attn-2 rewrite
@@ -5960,7 +6183,11 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
             ok = 1;                                                                  \
         }                                                                           \
     } while (0)
-            if (nw == 4) {
+            if (use_rego && rego_nw == 4) {
+                RSL_FPDIAG_RUN(RSL_REGO_K4);
+            } else if (use_rego && rego_nw == 2) {
+                RSL_FPDIAG_RUN(RSL_REGO_K2);
+            } else if (nw == 4) {
                 RSL_FPDIAG_RUN(flash_attn_prefill_f16_tc_v2_kernel<4>);
             } else if (nw == 2) {
                 RSL_FPDIAG_RUN(flash_attn_prefill_f16_tc_v2_kernel<2>);
@@ -5998,8 +6225,9 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
                     "dyn_smem=%zu B/block | block=%dthr(%d warp) SMs=%d maxThreads/SM=%d "
                     "maxSmem/SM=%dB activeBlocks/SM=%d -> occupancy=%.0f%% | grid=%ux%u | "
                     "KV re-read=%.1fx (ideal %.1f MB -> actual %.0f MB) ideal-BW=%.0f "
-                    "actual-BW=%.0f GB/s (BQ=%d; v2 cuts re-read ~BQ/16x)\n",
-                    nw > 0 ? "_v2" : "", n_new, kv_len_base, n_heads, n_kv_heads,
+                    "actual-BW=%.0f GB/s (BQ=%d; v2/rego cut re-read ~BQ/16x, rego "
+                    "also frees Osh→regs for occupancy)\n",
+                    klabel, n_new, kv_len_base, n_heads, n_kv_heads,
                     head_dim, us, dregs, dlocal, shmem, threads, threads / 32, nsm,
                     maxThreadsSM, maxSharedSM, active, occ * 100.0, grid.x, grid.y,
                     actual_kv / ideal_kv, ideal_kv / 1e6, actual_kv / 1e6, ideal_bw,
@@ -6007,7 +6235,15 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
             }
         }
     }
-    if (nw == 4) {
+    if (use_rego && rego_nw == 4) {
+        RSL_REGO_K4<<<grid, block, shmem, s->stream>>>(
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
+            window, softcap);
+    } else if (use_rego && rego_nw == 2) {
+        RSL_REGO_K2<<<grid, block, shmem, s->stream>>>(
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
+            window, softcap);
+    } else if (nw == 4) {
         flash_attn_prefill_f16_tc_v2_kernel<4><<<grid, block, shmem, s->stream>>>(
             q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
             window, softcap);
@@ -6020,6 +6256,8 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
             q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
             window, softcap);
     }
+#undef RSL_REGO_K2
+#undef RSL_REGO_K4
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_f16_tc");
 }
 
