@@ -5857,16 +5857,26 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
     int D = head_dim;
 
     // Wide-query-tile v2 selector (the FLASH_PREFILL_DIAG-steered fix).
-    // RUSTLLAMA_FLASH_PREFILL_V2 = 32 (NW=2) or 64 (NW=4) routes to
-    // flash_attn_prefill_f16_tc_v2_kernel<NW> (one shared K/V stage per BQ=16*NW
-    // queries → ~NW-fold less K/V global re-read than the 1-warp kernel's 53.7x);
-    // unset / any other value → the original 1-warp kernel, byte-identical. Read
-    // once. This is the on-pod A/B lever before a verdict is banked.
+    // flash_attn_prefill_f16_tc_v2_kernel<NW> gives a block BQ=16*NW query rows over
+    // NW warps that share ONE K/V tile → ~NW-fold less K/V global re-read than the
+    // 1-warp kernel's 53.7x. DEFAULT = BQ=32 (NW=2): pod A/B on sm_120 MIG measured
+    // 1.22x prefill @2048 vs the 1-warp kernel (kernel 2899→2315 us/call) at cos=1.0
+    // vs the CPU ref, and it's the consistent sweet spot — 2 blocks/SM (latency
+    // hiding), no >48 KB shared opt-in. Gated TRANSITIVELY by the attn:prefill_tc
+    // verdict: the block only takes this TC path where that verdict passed, and the
+    // probe now grades THIS kernel (the launcher defaults to it). RUSTLLAMA_FLASH_-
+    // PREFILL_V2 overrides: 64 (NW=4, needs the shared opt-in — faster kernel but 1
+    // block/SM = noisier end-to-end on a shared slice), 16 / 0 force the original
+    // 1-warp kernel (the A/B lever). Read once.
     static int v2_bq = -1;
     if (v2_bq < 0) {
         const char *ev = std::getenv("RUSTLLAMA_FLASH_PREFILL_V2");
-        int want = ev ? std::atoi(ev) : 0;
-        v2_bq = (want == 32 || want == 64) ? want : 0;
+        if (!ev) {
+            v2_bq = 32; // default: wide-query-tile v2, BQ=32
+        } else {
+            int want = std::atoi(ev);
+            v2_bq = (want == 32 || want == 64) ? want : 0; // 16/0/other → 1-warp
+        }
     }
     const int nw = (v2_bq == 64) ? 4 : (v2_bq == 32) ? 2 : 0; // 0 = legacy 1-warp
     const int active_bq = (nw > 0) ? (16 * nw) : 16;
