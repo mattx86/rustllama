@@ -5675,6 +5675,98 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
                    (size_t)(16 * D + 16 * 16 + 16 + 16 + 16) * sizeof(float);
     dim3 block(32, 1);
     dim3 grid((unsigned)((n_new + 15) / 16), (unsigned)n_heads);
+    // ncu-free TC-PREFILL-ATTN diagnostic (RUSTLLAMA_FLASH_PREFILL_DIAG=1), fired
+    // ONCE on a WARM call (skip 64). Confirms the suspected headroom BEFORE a
+    // flash-attn-2 rewrite: this kernel is 1 warp/block over a 16-query tile, so
+    // (a) occupancy is dynamic-shared-limited (~22 KB/block for head_dim=128) and
+    // (b) EVERY 16-query block re-streams the whole [0, its_max] K/V from global —
+    // GQA re-read (grid.y = n_heads, not n_kv_heads) ON TOP OF the causal-triangle
+    // re-read. Uses only cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocks... +
+    // cudaEvents (NO perf counters), so it works where ncu hits ERR_NVGPUCTRPERM
+    // (RunPod/MIG). Reports occupancy, a timed us/call, and the analytic K/V
+    // re-read factor (actual tile-reads / read-each-once ideal) vs its implied BW —
+    // ideal-BW >> measured peak ⇒ L2 absorbs the redundancy (occupancy/latency is
+    // the wall), ideal-BW ~ peak ⇒ DRAM-bound on redundant traffic (the re-read IS
+    // the wall). Either way the fix is the same: a wider query tile (BQ=64/128,
+    // multi-warp, one shared K/V stage per block) raises occupancy AND cuts the
+    // re-read ~BQ/16x.
+    {
+        static int fpd_calls = 0, fpd_done = 0;
+        if (!fpd_done && std::getenv("RUSTLLAMA_FLASH_PREFILL_DIAG") != nullptr &&
+            fpd_calls++ >= 64) {
+            fpd_done = 1;
+            cudaFuncAttributes fa;
+            if (cudaFuncGetAttributes(&fa, flash_attn_prefill_f16_tc_kernel) ==
+                cudaSuccess) {
+                int nsm = 0, maxThreadsSM = 0, maxSharedSM = 0, active = 0;
+                const int threads = (int)(block.x * block.y);
+                cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+                cudaDeviceGetAttribute(&maxThreadsSM,
+                                       cudaDevAttrMaxThreadsPerMultiProcessor, s->device);
+                cudaDeviceGetAttribute(&maxSharedSM,
+                                       cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                                       s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active, flash_attn_prefill_f16_tc_kernel, threads, shmem);
+                double occ = maxThreadsSM > 0
+                                 ? (double)(active * threads) / (double)maxThreadsSM
+                                 : 0.0;
+                // Timed us/call (warm), 200 iters on the real buffers — the kernel is
+                // idempotent in q/k/v → out, so re-launching recomputes the same out.
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0);
+                cudaEventCreate(&e1);
+                flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
+                    q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new,
+                    scale, window, softcap); // warmup
+                cudaStreamSynchronize(s->stream);
+                cudaEventRecord(e0, s->stream);
+                const int IT = 200;
+                for (int it = 0; it < IT; it++)
+                    flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
+                        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base,
+                        n_new, scale, window, softcap);
+                cudaEventRecord(e1, s->stream);
+                cudaEventSynchronize(e1);
+                float ms = 0.f;
+                cudaEventElapsedTime(&ms, e0, e1);
+                cudaEventDestroy(e0);
+                cudaEventDestroy(e1);
+                double us = (double)ms / IT * 1e3;
+                // Ideal (read each K/V position once) vs actual tile re-reads. Each of
+                // the grid.y = n_heads blocks loops t0 over [0, kv_base+its_q_last] in
+                // 16-tiles, reading K+V (f32) each tile; sum that against the single
+                // read of the [0, kv_base+n_new) K/V for n_kv_heads.
+                double ideal_kv =
+                    (double)(kv_len_base + n_new) * n_kv_heads * head_dim * 2.0 * 4.0;
+                long long tiles = 0;
+                const int nqb = (n_new + 15) / 16;
+                for (int b = 0; b < nqb; b++) {
+                    int q_last = b * 16 + 15;
+                    if (q_last > n_new - 1) q_last = n_new - 1;
+                    int pmax = kv_len_base + q_last;
+                    tiles += (long long)(pmax / 16 + 1);
+                }
+                double actual_kv =
+                    (double)tiles * n_heads * 16.0 * head_dim * 2.0 * 4.0;
+                double ideal_bw = us > 0.0 ? ideal_kv / (us * 1e-6) / 1e9 : 0.0;
+                double actual_bw = us > 0.0 ? actual_kv / (us * 1e-6) / 1e9 : 0.0;
+                std::fprintf(
+                    stderr,
+                    "[flash-prefill-diag] f16_tc n_new=%d kv_base=%d n_heads=%d "
+                    "n_kv_heads=%d head_dim=%d: %.1f us/call | regs=%d LOCAL(spill)=%zu B "
+                    "dyn_smem=%zu B/block | block=%dthr(1 warp) SMs=%d maxThreads/SM=%d "
+                    "maxSmem/SM=%dB activeBlocks/SM=%d -> occupancy=%.0f%% | grid=%ux%u | "
+                    "KV re-read=%.1fx (ideal %.1f MB -> actual %.0f MB) ideal-BW=%.0f "
+                    "actual-BW=%.0f GB/s (WANT: wider query tile + multi-warp block -> "
+                    "raise occ & cut re-read)\n",
+                    n_new, kv_len_base, n_heads, n_kv_heads, head_dim, us, fa.numRegs,
+                    fa.localSizeBytes, shmem, threads, nsm, maxThreadsSM, maxSharedSM,
+                    active, occ * 100.0, grid.x, grid.y, actual_kv / ideal_kv,
+                    ideal_kv / 1e6, actual_kv / 1e6, ideal_bw, actual_bw);
+            }
+        }
+    }
     flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
         window, softcap);
