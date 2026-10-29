@@ -4583,6 +4583,43 @@ extern "C" int rsl_cuda_kv_scatter_rows_f32(rsl_cuda_stream *s, float *mirror,
     return rsl_cuda_check("rsl_cuda_kv_scatter_rows_f32");
 }
 
+// f16 twin of kv_scatter_rows_f32_kernel: scatter n_new post-RoPE rows (f32 in the
+// activation slab) into the head-major KV mirror at col_base, CONVERTING to f16 on
+// store. Serves BOTH the prefill write (n_new rows) and the decode write (n_new=1)
+// when the shared KV mirror is stored f16 (whole-mirror f16 KV). Byte layout of the
+// source + destination index math are identical to the f32 kernel; only the element
+// type of `mirror` and the `__float2half` on store differ.
+__global__ void kv_scatter_rows_f16_kernel(__half *mirror, const float *src,
+                                           int n_new, int n_kv_heads,
+                                           int head_dim, int max_ctx,
+                                           int col_base) {
+    long total = (long)n_new * n_kv_heads * head_dim;
+    long flat = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat >= total) return;
+    int e = (int)(flat % head_dim);
+    long t2 = flat / head_dim;
+    int h = (int)(t2 % n_kv_heads);
+    int i = (int)(t2 / n_kv_heads);
+    long dst = ((long)h * max_ctx + col_base + i) * head_dim + e;
+    mirror[dst] = __float2half(src[flat]);
+}
+
+extern "C" int rsl_cuda_kv_scatter_rows_f16(rsl_cuda_stream *s, __half *mirror,
+                                            const float *src, int n_new,
+                                            int n_kv_heads, int head_dim,
+                                            int max_ctx, int col_base) {
+    if (!s || !mirror || !src || n_new <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+        max_ctx <= 0 || col_base < 0 || col_base + n_new > max_ctx)
+        return -1;
+    cudaSetDevice(s->device);
+    long total = (long)n_new * n_kv_heads * head_dim;
+    int t = 256;
+    int b = (int)((total + t - 1) / t);
+    kv_scatter_rows_f16_kernel<<<b, t, 0, s->stream>>>(
+        mirror, src, n_new, n_kv_heads, head_dim, max_ctx, col_base);
+    return rsl_cuda_check("rsl_cuda_kv_scatter_rows_f16");
+}
+
 // Stream-based DEVICE-RESIDENT RMSNorm (no internal malloc/copy, unlike
 // rsl_cuda_rmsnorm_f32 which round-trips host arrays) — for the on-device
 // activation-residency decode path (#2). x/w/y are DEVICE pointers on the
@@ -5129,6 +5166,121 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
 }
 
+// f16-KV twin of flash_attn_decode_f32_kernel (whole-mirror f16 KV): IDENTICAL
+// online-softmax / GQA / SWA-window / Gemma2-softcap math, but K and V are read
+// from the f16 KV mirror via __half2float on load (q/out stay f32). Half the KV
+// bytes streamed → attention is latency/BW-lighter. Numerically f16-lossy vs the
+// f32 kernel (graded by the `attn:kv_mirror_f16` probe with an f16 tolerance).
+__global__ void flash_attn_decode_f16kv_kernel(const float *q, const __half *k,
+                                               const __half *v, float *out,
+                                               int n_heads, int n_gqa,
+                                               int head_dim, int max_ctx,
+                                               int kv_len, float scale,
+                                               int window, float softcap) {
+    extern __shared__ float smem[];
+    float *sh_acc = smem;                                   // [W * head_dim]
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;   // [W]
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;                // [W]
+
+    const int hh = blockIdx.x;            // one block per head
+    if (hh >= n_heads) return;
+    const int lane = threadIdx.x;         // 0..31
+    const int warp = threadIdx.y;         // 0..W-1
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * __half2float(k[kv_off + d]);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * __half2float(v[kv_off + d]);
+        m = m_new;
+    }
+
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+
+    float m_g = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        #pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] *
+                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
+}
+
+// f16-KV decode flash launcher (whole-mirror f16 KV). Same grid/block/shmem as
+// rsl_cuda_flash_attn_decode_f32; k/v point into the f16 KV mirror. No split-KV /
+// diag paths (those live on the f32 entry).
+extern "C" int rsl_cuda_flash_attn_decode_f16kv(rsl_cuda_stream *s,
+                                                const float *q, const __half *k,
+                                                const __half *v, float *out,
+                                                int n_heads, int n_kv_heads,
+                                                int head_dim, int max_ctx,
+                                                int kv_len, int window,
+                                                float softcap) {
+    if (!s || !q || !k || !v || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0)
+        return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return -1;
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float),
+                        s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_f16kv");
+    }
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 block(32, RSL_FLASH_DECODE_W);
+    dim3 grid((unsigned)n_heads);
+    size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
+                            2 * RSL_FLASH_DECODE_W) *
+                   sizeof(float);
+    flash_attn_decode_f16kv_kernel<<<grid, block, shmem, s->stream>>>(
+        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window,
+        softcap);
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_f16kv");
+}
+
 // GPU paged attention (Phase B): block-table flash-decode. A COPY of
 // flash_attn_decode_f32_kernel with ONE semantic change — K/V are read from the
 // paged-pool device mirror (one whole-pool slab, byte-identical geometry to the
@@ -5509,7 +5661,7 @@ __global__ void flash_attn_prefill_f16_tc_kernel(const float *q, const float *k,
                                                  int head_dim, int max_ctx,
                                                  int kv_len_base, int n_new,
                                                  float scale, int window,
-                                                 float softcap) {
+                                                 float softcap, int kv_f16) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
     using namespace nvcuda;
     const int D = head_dim;
@@ -5553,8 +5705,8 @@ __global__ void flash_attn_prefill_f16_tc_kernel(const float *q, const float *k,
             int t = t0 + row;
             if (t < max_ctx) {
                 int off = (kv_h * max_ctx + t) * D + d;
-                Kh[e] = __float2half(k[off]);
-                Vh[e] = __float2half(v[off]);
+                Kh[e] = kv_f16 ? ((const __half *)k)[off] : __float2half(k[off]);
+                Vh[e] = kv_f16 ? ((const __half *)v)[off] : __float2half(v[off]);
             } else {
                 Kh[e] = __float2half(0.f);
                 Vh[e] = __float2half(0.f);
@@ -5673,7 +5825,7 @@ __global__ void flash_attn_prefill_f16_tc_v2_kernel(const float *q, const float 
                                                     int head_dim, int max_ctx,
                                                     int kv_len_base, int n_new,
                                                     float scale, int window,
-                                                    float softcap) {
+                                                    float softcap, int kv_f16) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
     using namespace nvcuda;
     const int D = head_dim;
@@ -5733,8 +5885,8 @@ __global__ void flash_attn_prefill_f16_tc_v2_kernel(const float *q, const float 
             int t = t0 + row;
             if (t < max_ctx) {
                 int off = (kv_h * max_ctx + t) * D + d;
-                Kh[e] = __float2half(k[off]);
-                Vh[e] = __float2half(v[off]);
+                Kh[e] = kv_f16 ? ((const __half *)k)[off] : __float2half(k[off]);
+                Vh[e] = kv_f16 ? ((const __half *)v)[off] : __float2half(v[off]);
             } else {
                 Kh[e] = __float2half(0.f);
                 Vh[e] = __float2half(0.f);
@@ -5850,7 +6002,7 @@ template <int NW, int HD>
 __global__ void __launch_bounds__(NW * 32, 2) flash_attn_prefill_f16_tc_rego_kernel(
     const float *q, const float *k, const float *v, float *out, int n_heads,
     int n_gqa, int head_dim, int max_ctx, int kv_len_base, int n_new, float scale,
-    int window, float softcap) {
+    int window, float softcap, int kv_f16) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
     using namespace nvcuda;
     const int D = HD;              // compile-time head_dim
@@ -5914,8 +6066,8 @@ __global__ void __launch_bounds__(NW * 32, 2) flash_attn_prefill_f16_tc_rego_ker
             int t = t0 + row;
             if (t < max_ctx) {
                 int off = (kv_h * max_ctx + t) * D + d;
-                Kh[e] = __float2half(k[off]);
-                Vh[e] = __float2half(v[off]);
+                Kh[e] = kv_f16 ? ((const __half *)k)[off] : __float2half(k[off]);
+                Vh[e] = kv_f16 ? ((const __half *)v)[off] : __float2half(v[off]);
             } else {
                 Kh[e] = __float2half(0.f);
                 Vh[e] = __float2half(0.f);
@@ -6032,7 +6184,8 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
                                                   int n_heads, int n_kv_heads,
                                                   int head_dim, int max_ctx,
                                                   int kv_len_base, int n_new,
-                                                  int window, float softcap) {
+                                                  int window, float softcap,
+                                                  int kv_f16) {
     if (!s || !q || !k || !v || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 ||
         n_new <= 0)
@@ -6190,13 +6343,14 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
             cudaEventCreate(&e1);                                                    \
             KERN<<<grid, block, shmem, s->stream>>>(q, k, v, out, n_heads, n_gqa,    \
                                                     head_dim, max_ctx, kv_len_base,  \
-                                                    n_new, scale, window, softcap);  \
+                                                    n_new, scale, window, softcap,   \
+                                                    kv_f16);                         \
             cudaStreamSynchronize(s->stream);                                        \
             cudaEventRecord(e0, s->stream);                                          \
             for (int it = 0; it < IT; it++)                                          \
                 KERN<<<grid, block, shmem, s->stream>>>(                             \
                     q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base,    \
-                    n_new, scale, window, softcap);                                  \
+                    n_new, scale, window, softcap, kv_f16);                          \
             cudaEventRecord(e1, s->stream);                                          \
             cudaEventSynchronize(e1);                                                \
             cudaEventElapsedTime(&ms, e0, e1);                                       \
@@ -6260,23 +6414,23 @@ extern "C" int rsl_cuda_flash_attn_prefill_f16_tc(rsl_cuda_stream *s,
     if (use_rego && rego_nw == 4) {
         RSL_REGO_K4<<<grid, block, shmem, s->stream>>>(
             q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
-            window, softcap);
+            window, softcap, kv_f16);
     } else if (use_rego && rego_nw == 2) {
         RSL_REGO_K2<<<grid, block, shmem, s->stream>>>(
             q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
-            window, softcap);
+            window, softcap, kv_f16);
     } else if (nw == 4) {
         flash_attn_prefill_f16_tc_v2_kernel<4><<<grid, block, shmem, s->stream>>>(
             q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
-            window, softcap);
+            window, softcap, kv_f16);
     } else if (nw == 2) {
         flash_attn_prefill_f16_tc_v2_kernel<2><<<grid, block, shmem, s->stream>>>(
             q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
-            window, softcap);
+            window, softcap, kv_f16);
     } else {
         flash_attn_prefill_f16_tc_kernel<<<grid, block, shmem, s->stream>>>(
             q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale,
-            window, softcap);
+            window, softcap, kv_f16);
     }
 #undef RSL_REGO_K2
 #undef RSL_REGO_K4

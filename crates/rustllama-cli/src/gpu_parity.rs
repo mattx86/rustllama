@@ -8161,6 +8161,100 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             }
         }
 
+        // attn:kv_mirror_f16 (whole-mirror f16 KV): the f16-KV decode flash
+        // (`flash_attn_decode_f16kv`) reads K/V from an f16 mirror; graded vs the
+        // SAME f32 CPU flash-decode reference with an f16-appropriate tolerance (f16
+        // KV is lossy). head_dim=128 (the feature only engages for 16-aligned
+        // head_dim). Same 3 folded cases (passthrough / swa16 / softcap50). The
+        // (lossy) f16-of-the-f32-history IS the kernel's real input, so a kernel bug
+        // still shows (cos collapses). WRITE-BLIND (no NVIDIA here) — pod-validated.
+        {
+            let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
+                (8usize, 2usize, 128usize, 256usize, 200usize);
+            let q = gen_x(n_heads * head_dim, 71);
+            let kc = gen_x(n_kv_heads * max_ctx * head_dim, 73);
+            let vc = gen_x(n_kv_heads * max_ctx * head_dim, 79);
+            let to_f16_bytes = |v: &[f32]| -> Vec<u8> {
+                let bits: Vec<u16> = v
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits())
+                    .collect();
+                unsafe { std::slice::from_raw_parts(bits.as_ptr() as *const u8, bits.len() * 2) }
+                    .to_vec()
+            };
+            let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+            if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
+                cu_upload_f32(&stream, &q),
+                ck::CudaDeviceBuffer::from_host(&stream, &to_f16_bytes(&kc)),
+                ck::CudaDeviceBuffer::from_host(&stream, &to_f16_bytes(&vc)),
+                ck::CudaDeviceBuffer::alloc(&stream, n_heads * head_dim * 4),
+            ) {
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in dec_cases {
+                    let mut cpu = vec![0f32; n_heads * head_dim];
+                    k::gqa_attention_flash_decode_capped_windowed(
+                        &q,
+                        &kc,
+                        &vc,
+                        &mut cpu,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
+                    );
+                    // SAFETY: q/out f32 [n_heads*head_dim]; k/v f16 [n_kv_heads*max_ctx*head_dim].
+                    let res = unsafe {
+                        ck::flash_attn_decode_f16kv(
+                            &stream,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr() as *const u16,
+                            vb.as_ptr() as *const u16,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len,
+                            window as i32,
+                            softcap,
+                        )
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e}"));
+                        break;
+                    }
+                    let (cos, max_rel) = compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
+                        cu_emit("attn:kv_mirror_f16", "KERNEL_ERR", &e);
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        // f16 KV is lossy → an f16-appropriate tolerance (a real bug
+                        // collapses cos well below this).
+                        let key: &'static str = if worst_cos > 0.995 && worst_rel < 0.05 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            "attn:kv_mirror_f16",
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} f16-KV (pass+swa16+cap50)"),
+                        );
+                    }
+                }
+            }
+        }
+
         // attn:paged_decode_cuda (GPU paged attention, Phase C): the block-table
         // flash-decode graded vs the SAME CPU reference, with a SCATTERED block
         // table so the page indirection is genuinely exercised. The synthetic
@@ -8431,6 +8525,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                             tnew,
                             0,
                             0.0,
+                            false, // kv_f16: this probe uses an f32 K/V history
                         )
                     };
                     match tc_launch(&mut ob) {

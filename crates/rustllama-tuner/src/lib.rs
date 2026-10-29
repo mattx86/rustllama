@@ -263,6 +263,21 @@ pub const VERDICT_PREFILL_DEV_RESIDENT_BLOCK: &str = "prefill:dev_resident_block
 /// perf-gated. Read by `accel::prefill_flash_tc_enabled`; fail-closed off,
 /// `RUSTLLAMA_FLASH_PREFILL_TC=1` force-enables for the on-pod A/B.
 pub const VERDICT_ATTN_PREFILL_TC: &str = "attn:prefill_tc";
+/// Whole-mirror f16 KV: store the shared device attention KV mirror (read by BOTH
+/// the prefill flash-TC and the decode flash) as f16 instead of f32 — half the KV
+/// bytes streamed in attention. Host KV stays f32. LOSSY (f16 KV), so graded vs the
+/// f32 CPU flash-decode reference with an f16-appropriate tolerance (`doctor
+/// --cuda-parity attn:kv_mirror_f16`). Read by `accel::kv_mirror_f16_enabled`;
+/// fail-closed off, `RUSTLLAMA_KV_MIRROR_F16=1` force-enables for the on-pod A/B.
+/// The caller additionally gates on 16-aligned head_dim + the TC prefill path.
+pub const VERDICT_ATTN_KV_MIRROR_F16: &str = "attn:kv_mirror_f16";
+/// Perf gate for whole-mirror f16 KV (companion to [`VERDICT_ATTN_KV_MIRROR_F16`]):
+/// banked ONLY where f16 KV is measured FASTER than f32 in the production path. No
+/// autotune stage banks it yet, so it stays UNBANKED ⇒ f16 defaults OFF even where
+/// the correctness probe passes — `RUSTLLAMA_KV_MIRROR_F16=1` is the on-pod A/B path
+/// until a perf stage lands. Mirrors the `step:dev_resident_cuda_graph_faster`
+/// pattern, heeding the split-KV lesson that an eager win ≠ a production-graph win.
+pub const VERDICT_ATTN_KV_MIRROR_F16_FASTER: &str = "attn:kv_mirror_f16_faster";
 /// GPU paged attention (Phase C): the CUDA block-table flash-decode kernel
 /// (`flash_attn_decode_paged_f32`) graded vs the CPU gather + flash-decode
 /// reference over pass / SWA / soft-cap. Read by `accel::dev_attn_paged_enabled`;

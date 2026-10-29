@@ -11172,6 +11172,46 @@ pub fn prefill_flash_tc_enabled() -> bool {
     )
 }
 
+/// Whether the shared attention KV mirror is stored f16 (vs f32) — whole-mirror
+/// f16 KV. Halves the KV bytes read by BOTH the prefill flash-TC and the decode
+/// flash. Gated on BOTH the correctness verdict [`VERDICT_ATTN_KV_MIRROR_F16`]
+/// (f16 KV is lossy → graded within an f16 tolerance by `doctor --cuda-parity
+/// attn:kv_mirror_f16`) AND the perf verdict [`VERDICT_ATTN_KV_MIRROR_F16_FASTER`],
+/// which NO stage banks yet — so it is fail-closed OFF even where the kernel is
+/// correct, until an on-pod A/B proves the production-graph win (the split-KV lesson:
+/// an eager win ≠ a graph win). `RUSTLLAMA_KV_MIRROR_F16=1` force-enables for that
+/// A/B, `=0` disables. The CALLER additionally gates on head_dim % 16 == 0 AND
+/// `prefill_flash_tc_enabled()` (the mirror is shared, so f16 is only safe when the
+/// prefill path that reads it is the TC kernel — the scalar prefill has no f16
+/// reader). On any model that doesn't meet those, the mirror stays f32.
+pub fn kv_mirror_f16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("RUSTLLAMA_KV_MIRROR_F16").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            // Correctness AND perf verdict. The perf one is never banked yet ⇒
+            // default OFF; env-force is the on-pod A/B path until a stage banks it.
+            _ => {
+                kernel_verdict(rustllama_tuner::VERDICT_ATTN_KV_MIRROR_F16)
+                    && kernel_verdict(rustllama_tuner::VERDICT_ATTN_KV_MIRROR_F16_FASTER)
+            }
+        },
+    )
+}
+
+/// The effective per-model decision for storing the shared attention KV mirror as
+/// f16, folding in the two hard preconditions: head_dim must be 16-aligned (the TC
+/// prefill kernel's requirement) AND the TC prefill path must be on (the mirror is
+/// shared prefill↔decode, and only the TC prefill kernel has an f16 reader — the
+/// scalar prefill fallback reads f32). Called at EVERY attention-block cache-lock
+/// site so the shared mirror's dtype is identical for prefill and decode. Stable
+/// per model (both inner gates are process-global / dim-fixed), so no flag flip
+/// mid-request that would realloc the mirror.
+pub fn kv_mirror_f16_active(head_dim: usize) -> bool {
+    kv_mirror_f16_enabled() && head_dim % 16 == 0 && prefill_flash_tc_enabled()
+}
+
 /// Whether the Feature-1b CUDA-graph attention block is enabled. **AUTOMATIC, no
 /// env var** — the graph twin of [`dev_attn_enabled`], perf-gated on verdict
 /// [`VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH`] (persisted by `tune --dev-attn`
@@ -11425,6 +11465,9 @@ pub fn try_decode_attn_block_cuda_f32(
     let Ok(mut g) = cache.lock() else {
         return (false, false);
     };
+    // Whole-mirror f16 KV: set BEFORE the seed (the seed allocs + fills the mirror
+    // at this dtype). Shared with the prefill/graph paths via the same helper.
+    g.set_kv_mirror_f16(kv_mirror_f16_active(head_dim));
     // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
     // dims (caller contract); the cache owns the stream + mirror.
     let ok = unsafe {
@@ -11601,6 +11644,9 @@ pub fn try_prefill_attn_block_cuda_f32(
     );
     // Tensor-core (fp16) vs scalar flash-attn for this block's attention.
     g.set_prefill_flash_tc(prefill_flash_tc_enabled());
+    // Whole-mirror f16 KV: store the shared mirror as f16 (prefill writes it, both
+    // prefill-TC and decode read it). Gated to 16-aligned head_dim + TC prefill.
+    g.set_kv_mirror_f16(kv_mirror_f16_active(head_dim));
     // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
     // dims (caller contract); the cache owns the stream + mirror.
     let ok = unsafe {
@@ -11764,6 +11810,9 @@ pub fn try_decode_attn_block_cuda_graph_f32(
     let Ok(mut g) = cache.lock() else {
         return (false, false);
     };
+    // Whole-mirror f16 KV: set BEFORE the seed (same shared-mirror dtype as the
+    // eager/prefill paths); the captured graph then reads/writes an f16 mirror.
+    g.set_kv_mirror_f16(kv_mirror_f16_active(head_dim));
     // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
     // dims (caller contract); the cache owns the stream + mirror. The graph
     // method seeds the mirror's prefill history then captures + replays the block.
@@ -11920,6 +11969,9 @@ pub fn try_decode_step_cuda_graph_f32(
     let Ok(mut g) = cache.lock() else {
         return false;
     };
+    // Whole-mirror f16 KV: same shared-mirror dtype as the other block paths (the
+    // step graph seeds + writes + reads the mirror through `issue_layer_chain`).
+    g.set_kv_mirror_f16(kv_mirror_f16_active(head_dim));
     let ok = unsafe {
         g.decode_step_graph_f32(
             layers, hidden, k_caches, v_caches, n_heads, n_kv_heads, head_dim, d_model, pos,

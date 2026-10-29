@@ -1116,6 +1116,42 @@ extern "C" {
         n_new: c_int,
         window: c_int,
         softcap: f32,
+        // Whole-mirror f16 KV: 1 ⇒ k/v point into an f16 KV mirror (read as __half
+        // on load); 0 ⇒ the legacy f32 mirror (__float2half on load). Passthrough
+        // at 0 ⇒ byte-identical to before.
+        kv_f16: c_int,
+    ) -> c_int;
+
+    // f16-KV decode flash (whole-mirror f16 KV): q/out stay f32, k/v point into the
+    // f16 KV mirror (passed as *const u16 ≈ __half). Same semantics as
+    // rsl_cuda_flash_attn_decode_f32, half the KV bytes.
+    fn rsl_cuda_flash_attn_decode_f16kv(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k: *const u16,
+        v: *const u16,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len: c_int,
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
+
+    // f16 twin of rsl_cuda_kv_scatter_rows_f32: scatter n_new post-RoPE f32 rows
+    // into the head-major KV mirror at col_base, converting to f16 on store
+    // (mirror as *mut u16 ≈ __half). Serves prefill (n_new) + decode (n_new=1).
+    fn rsl_cuda_kv_scatter_rows_f16(
+        s: *mut RslCudaStreamRaw,
+        mirror: *mut u16,
+        src: *const f32,
+        n_new: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        col_base: c_int,
     ) -> c_int;
 
     // Quantized-KV flash attention (F32 Q/out, packed K/V dequantized
@@ -3218,6 +3254,39 @@ pub unsafe fn kv_scatter_rows_f32(
     }
 }
 
+/// f16 twin of [`kv_scatter_rows_f32`] (whole-mirror f16 KV): scatter `n_new`
+/// post-RoPE f32 rows into the head-major f16 KV mirror at `col_base`, converting
+/// to f16 on store. `mirror` is a `*mut u16` (≈ `__half`) device pointer.
+///
+/// SAFETY: `mirror`/`src` are device pointers on `stream`; `mirror` sized for the
+/// f16 mirror (`n_kv_heads*max_ctx*head_dim` halves), `src` ≥ `n_new*n_kv_heads*head_dim` f32.
+pub unsafe fn kv_scatter_rows_f16(
+    stream: &CudaStream,
+    mirror: *mut u16,
+    src: *const f32,
+    n_new: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    col_base: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_kv_scatter_rows_f16(
+        stream.raw(),
+        mirror,
+        src,
+        n_new as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        col_base as c_int,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
 /// Device-resident RMSNorm: `y[r] = rmsnorm(x[r]) * w`, `n_rows` rows of `d`.
 ///
 /// SAFETY: `x`/`w`/`y` are device pointers on `stream` (`x`,`y` ≥ `n_rows*d`;
@@ -3480,6 +3549,48 @@ pub unsafe fn flash_attn_decode_f32(
     }
 }
 
+/// f16-KV twin of [`flash_attn_decode_f32`] (whole-mirror f16 KV): `q`/`out` stay
+/// f32; `k`/`v` point into the f16 KV mirror (`*const u16` ≈ `__half`). Same
+/// online-softmax/GQA/window/softcap numerics, half the KV bytes, f16-lossy.
+///
+/// SAFETY: same contract as [`flash_attn_decode_f32`], but `k`/`v` are f16 mirror
+/// device pointers (`n_kv_heads*max_ctx*head_dim` halves).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_f16kv(
+    stream: &CudaStream,
+    q: *const f32,
+    k: *const u16,
+    v: *const u16,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    window: i32,
+    softcap: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_f16kv(
+        stream.raw(),
+        q,
+        k,
+        v,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
 /// GPU paged attention (Phase B): block-table FlashAttention decode. Reads K/V
 /// from the whole-pool device mirror `kv_pool` via `block_table` (logical block
 /// -> physical page id) for ONE sequence at `layer_idx`. Matches the contiguous
@@ -3596,6 +3707,10 @@ pub unsafe fn flash_attn_prefill_f16_tc(
     n_new: usize,
     window: i32,
     softcap: f32,
+    // Whole-mirror f16 KV: when true, `k`/`v` point into an f16 KV mirror (read as
+    // __half on load inside the kernel); false ⇒ the legacy f32 mirror. The pointer
+    // TYPE stays `*const f32` (the kernel reinterprets per this flag).
+    kv_f16: bool,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_f16_tc(
         stream.raw(),
@@ -3611,6 +3726,7 @@ pub unsafe fn flash_attn_prefill_f16_tc(
         n_new as c_int,
         window as c_int,
         softcap,
+        kv_f16 as c_int,
     );
     if rc == 0 {
         Ok(())
@@ -5105,8 +5221,8 @@ pub struct CudaMatvecCache {
     attn_k_mirror: Vec<Option<RawDevBuf>>,
     attn_v_mirror: Vec<Option<RawDevBuf>>,
     attn_valid_len: Vec<u32>,
-    attn_mirror_ctx: (u32, u32, u32), // (n_layers, n_kv_heads*head_dim, max_ctx) — rebuild on change
-    attn_act: Option<RawDevBuf>,      // activation slab: hidden|h_norm|q|k|v|attn_out|o|h_norm2
+    attn_mirror_ctx: (u32, u32, u32, u32), // (n_layers, n_kv_heads*head_dim, max_ctx, f16?) — rebuild on change
+    attn_act: Option<RawDevBuf>, // activation slab: hidden|h_norm|q|k|v|attn_out|o|h_norm2
     attn_norms: Option<RawDevBuf>, // norm-weight slab: attn_norm|post_norm|q_norm|k_norm|inv_freq
     // Feature 1b: one cached CUDA-graph executable per layer for the graph-mode
     // attention block (`decode_attn_block_f32_graph`). `None` until the first
@@ -5141,6 +5257,14 @@ pub struct CudaMatvecCache {
     // `attn:prefill_tc` verdict before the block runs; lossy (fp16), fail-closed
     // off. The block checks head_dim % 16 == 0 before using it (scalar otherwise).
     prefill_flash_tc: bool,
+    // Whole-mirror f16 KV: store the shared per-layer attention KV mirror
+    // (`attn_k_mirror`/`attn_v_mirror`, read by BOTH the prefill flash-TC and the
+    // decode flash) as f16 instead of f32 — half the KV bytes in attention. Host
+    // KV stays f32; this is a device-mirror-only dtype. Set by `accel` from the
+    // `attn:kv_mirror_f16` verdict (+ env force), gated to head_dim % 16 == 0 AND
+    // the TC prefill path so the scalar prefill never reads an f16 mirror.
+    // Fail-closed off ⇒ the f32 mirror path is byte-identical to before.
+    kv_mirror_f16: bool,
     // Device-resident PREFILL activation slab (the batched analogue of
     // `attn_act`): hidden|h_norm|q|k|v|attn_out|o|h_norm2[|gate|up|act], each
     // ×n_new rows. Separate from the single-row `attn_act` so prefill and decode
@@ -5261,7 +5385,7 @@ impl CudaMatvecCache {
             attn_k_mirror: Vec::new(),
             attn_v_mirror: Vec::new(),
             attn_valid_len: Vec::new(),
-            attn_mirror_ctx: (0, 0, 0),
+            attn_mirror_ctx: (0, 0, 0, 0),
             attn_act: None,
             attn_norms: None,
             attn_graph_exec: Vec::new(),
@@ -5272,6 +5396,7 @@ impl CudaMatvecCache {
             prefill_q4_k_w8a8_tc: false,
             prefill_q4_k_f32: false,
             prefill_flash_tc: false,
+            kv_mirror_f16: false,
             prefill_act: None,
             stream_window_layers: 0,
             current_layer_tag: 0,
@@ -6333,6 +6458,15 @@ impl CudaMatvecCache {
         self.prefill_flash_tc = enabled;
     }
 
+    /// Store the shared attention KV mirror as f16 (vs f32) — halves the KV bytes
+    /// read by both the prefill flash-TC and the decode flash. Set by `accel` from
+    /// the `attn:kv_mirror_f16` verdict, gated to head_dim % 16 == 0 AND the TC
+    /// prefill path. The mirror shape key includes this flag, so a toggle reallocs
+    /// the mirror; fail-closed off ⇒ the f32 mirror path is byte-identical.
+    pub fn set_kv_mirror_f16(&mut self, enabled: bool) {
+        self.kv_mirror_f16 = enabled;
+    }
+
     /// Batched device-I/O GEMM — the N-row analogue of
     /// [`Self::matvec_packed_dev_io`] for the device-resident PREFILL block.
     /// `x_dev` = `[n, k]`, `out_dev` = `[n, m]` are activation-slab device
@@ -6562,7 +6696,12 @@ impl CudaMatvecCache {
             return false;
         }
         // Per-layer F32 KV mirror on this stream; rebuilt on a shape change.
-        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        let mctx = (
+            n_layers as u32,
+            d_kv as u32,
+            max_ctx as u32,
+            self.kv_mirror_f16 as u32,
+        );
         if self.attn_mirror_ctx != mctx {
             self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
             self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
@@ -6577,7 +6716,7 @@ impl CudaMatvecCache {
         // ffn_out reuses the now-free `o` region). d_ff = 0 ⇒ attention-only size.
         let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * 4;
         let norm_bytes = (2 * d_model + 2 * head_dim + head_dim / 2) * 4;
-        let mir_bytes = d_kv * max_ctx * 4;
+        let mir_bytes = d_kv * max_ctx * if self.kv_mirror_f16 { 2 } else { 4 };
         if !Self::ensure_scratch(&mut self.attn_act, &self.stream, act_bytes)
             || !Self::ensure_scratch(&mut self.attn_norms, &self.stream, norm_bytes)
             || !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
@@ -6795,7 +6934,39 @@ impl CudaMatvecCache {
                 return false;
             }
         }
-        {
+        if self.kv_mirror_f16 {
+            // Whole-mirror f16 KV: convert-scatter this token's K/V (f32 slab) into
+            // the f16 mirror at `pos` (n_new=1). One launch each for K and V.
+            let km_base = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *mut u16;
+            let vm_base = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *mut u16;
+            let ok = unsafe {
+                kv_scatter_rows_f16(
+                    &self.stream,
+                    km_base,
+                    pk,
+                    1,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    pos,
+                )
+                .is_ok()
+                    && kv_scatter_rows_f16(
+                        &self.stream,
+                        vm_base,
+                        pv,
+                        1,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        pos,
+                    )
+                    .is_ok()
+            };
+            if !ok {
+                return false;
+            }
+        } else {
             let km_base = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
             let vm_base = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
             let row_bytes = head_dim * 4;
@@ -6820,28 +6991,49 @@ impl CudaMatvecCache {
             tmark = std::time::Instant::now();
         }
         // 6. Flash decode over [0, pos+1) against the mirror → attn_out (device).
-        let km_ptr = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
-        let vm_ptr = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
-        unsafe {
-            if flash_attn_decode_f32(
-                &self.stream,
-                pq,
-                km_ptr,
-                vm_ptr,
-                pat,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_ctx,
-                pos + 1,
-                // Per-layer SWA window / Gemma2 soft-cap for this decode step.
-                window,
-                softcap,
-            )
-            .is_err()
-            {
-                return false;
+        // Whole-mirror f16 KV: read the f16 mirror via the f16kv kernel; else f32.
+        let mir_ptr = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr;
+        let vmir_ptr = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr;
+        let flash_ok = if self.kv_mirror_f16 {
+            unsafe {
+                flash_attn_decode_f16kv(
+                    &self.stream,
+                    pq,
+                    mir_ptr as *const u16,
+                    vmir_ptr as *const u16,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    pos + 1,
+                    window,
+                    softcap,
+                )
+                .is_ok()
             }
+        } else {
+            unsafe {
+                flash_attn_decode_f32(
+                    &self.stream,
+                    pq,
+                    mir_ptr as *const f32,
+                    vmir_ptr as *const f32,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    pos + 1,
+                    // Per-layer SWA window / Gemma2 soft-cap for this decode step.
+                    window,
+                    softcap,
+                )
+                .is_ok()
+            }
+        };
+        if !flash_ok {
+            return false;
         }
         if prof {
             unsafe { rsl_cuda_stream_sync(self.stream.raw()) };
@@ -7069,7 +7261,12 @@ impl CudaMatvecCache {
         }
         // Per-layer F32 KV mirror on this stream (shared with the decode block);
         // rebuilt on a shape change.
-        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        let mctx = (
+            n_layers as u32,
+            d_kv as u32,
+            max_ctx as u32,
+            self.kv_mirror_f16 as u32,
+        );
         if self.attn_mirror_ctx != mctx {
             self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
             self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
@@ -7101,7 +7298,7 @@ impl CudaMatvecCache {
         // [|gate|up|act]. +3·n·d_ff when a dense FFN follows.
         let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * n_new * 4;
         let norm_bytes = (2 * d_model + 2 * head_dim + head_dim / 2) * 4;
-        let mir_bytes = d_kv * max_ctx * 4;
+        let mir_bytes = d_kv * max_ctx * if self.kv_mirror_f16 { 2 } else { 4 };
         if !Self::ensure_scratch(&mut self.prefill_act, &self.stream, act_bytes)
             || !Self::ensure_scratch(&mut self.attn_norms, &self.stream, norm_bytes)
             || !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
@@ -7276,34 +7473,63 @@ impl CudaMatvecCache {
         //    o-proj/residual/FFN below, so the deferred read is still the post-RoPE
         //    K/V.
         {
-            let km = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
-            let vm = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
-            unsafe {
-                if kv_scatter_rows_f32(
-                    &self.stream,
-                    km,
-                    pk,
-                    n_new,
-                    n_kv_heads,
-                    head_dim,
-                    max_ctx,
-                    kv_len_base,
-                )
-                .is_err()
-                    || kv_scatter_rows_f32(
+            let km = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr;
+            let vm = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr;
+            // Whole-mirror f16 KV: scatter the post-RoPE f32 K/V into the f16 mirror
+            // (convert on store). Else the byte-identical f32 device→device scatter.
+            let scatter_ok = if self.kv_mirror_f16 {
+                unsafe {
+                    kv_scatter_rows_f16(
                         &self.stream,
-                        vm,
-                        pv,
+                        km as *mut u16,
+                        pk,
                         n_new,
                         n_kv_heads,
                         head_dim,
                         max_ctx,
                         kv_len_base,
                     )
-                    .is_err()
-                {
-                    return false;
+                    .is_ok()
+                        && kv_scatter_rows_f16(
+                            &self.stream,
+                            vm as *mut u16,
+                            pv,
+                            n_new,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                        )
+                        .is_ok()
                 }
+            } else {
+                unsafe {
+                    kv_scatter_rows_f32(
+                        &self.stream,
+                        km as *mut f32,
+                        pk,
+                        n_new,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len_base,
+                    )
+                    .is_ok()
+                        && kv_scatter_rows_f32(
+                            &self.stream,
+                            vm as *mut f32,
+                            pv,
+                            n_new,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                        )
+                        .is_ok()
+                }
+            };
+            if !scatter_ok {
+                return false;
             }
         }
         if (self.attn_valid_len[layer_idx] as usize) < kv_len_base + n_new {
@@ -7332,6 +7558,10 @@ impl CudaMatvecCache {
                     n_new,
                     window,
                     softcap,
+                    // Whole-mirror f16 KV: the mirror this reads is f16 iff the cache
+                    // flag is set (accel only sets it when use_flash_tc holds, so the
+                    // scalar else-branch never sees an f16 mirror).
+                    self.kv_mirror_f16,
                 )
             } else {
                 flash_attn_prefill_f32(
@@ -7644,7 +7874,12 @@ impl CudaMatvecCache {
         // shape change ALSO drop every cached graph exec (its nodes reference the
         // old-shape mirror/slab pointers, and a different n_kv_heads changes the
         // mirror-scatter topology → an exec_update would fail anyway).
-        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        let mctx = (
+            n_layers as u32,
+            d_kv as u32,
+            max_ctx as u32,
+            self.kv_mirror_f16 as u32,
+        );
         if self.attn_mirror_ctx != mctx {
             self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
             self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
@@ -7662,7 +7897,7 @@ impl CudaMatvecCache {
         }
         let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * 4;
         let norm_bytes = (2 * d_model + 2 * head_dim + head_dim / 2) * 4;
-        let mir_bytes = d_kv * max_ctx * 4;
+        let mir_bytes = d_kv * max_ctx * if self.kv_mirror_f16 { 2 } else { 4 };
         if !Self::ensure_scratch(&mut self.attn_act, &self.stream, act_bytes)
             || !Self::ensure_scratch(&mut self.attn_norms, &self.stream, norm_bytes)
             || !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
@@ -7993,7 +8228,12 @@ impl CudaMatvecCache {
             }
         }
         // Mirror ctx: rebuild mirrors + BOTH exec caches on a shape change.
-        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        let mctx = (
+            n_layers as u32,
+            d_kv as u32,
+            max_ctx as u32,
+            self.kv_mirror_f16 as u32,
+        );
         if self.attn_mirror_ctx != mctx {
             self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
             self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
@@ -8012,7 +8252,7 @@ impl CudaMatvecCache {
         // re-uploaded here — tiny vs the removed per-layer syncs).
         let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * 4;
         let norm_floats = 2 * d_model + 2 * head_dim + head_dim / 2;
-        let mir_bytes = d_kv * max_ctx * 4;
+        let mir_bytes = d_kv * max_ctx * if self.kv_mirror_f16 { 2 } else { 4 };
         if !Self::ensure_scratch(&mut self.attn_act, &self.stream, act_bytes)
             || !Self::ensure_scratch(
                 &mut self.attn_norms,
@@ -8407,38 +8647,87 @@ impl CudaMatvecCache {
             chain_ok && unsafe { rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_ok() };
         chain_ok = chain_ok
             && unsafe { rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_ok() };
-        // 5. Scatter the post-RoPE K / plain V into the F32 KV mirror at `pos`,
-        //    one kv-head at a time (head-major), via async DEVICE→DEVICE copies
-        //    (NO host round-trip — that is what makes the chain capturable). The
-        //    device→host copy for the host KV cache is deferred past the sync.
-        let row_bytes = head_dim * 4;
-        for h in 0..n_kv_heads {
-            let kd = unsafe { km_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
-            let ks = unsafe { pk.add(h * head_dim) } as *const c_void;
-            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, kd, ks, row_bytes) };
-            let vd = unsafe { vm_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
-            let vs = unsafe { pv.add(h * head_dim) } as *const c_void;
-            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, vd, vs, row_bytes) };
+        // 5. Scatter the post-RoPE K / plain V into the KV mirror at `pos`, via
+        //    async DEVICE→DEVICE launches (NO host round-trip — that is what makes
+        //    the chain capturable). Whole-mirror f16 KV: a single convert-scatter
+        //    per K/V (n_new=1) into the f16 mirror; else the per-head f32 memcpy.
+        if self.kv_mirror_f16 {
+            chain_ok = chain_ok
+                && unsafe {
+                    kv_scatter_rows_f16(
+                        &self.stream,
+                        km_base as *mut u16,
+                        pk,
+                        1,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        pos,
+                    )
+                    .is_ok()
+                };
+            chain_ok = chain_ok
+                && unsafe {
+                    kv_scatter_rows_f16(
+                        &self.stream,
+                        vm_base as *mut u16,
+                        pv,
+                        1,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        pos,
+                    )
+                    .is_ok()
+                };
+        } else {
+            let row_bytes = head_dim * 4;
+            for h in 0..n_kv_heads {
+                let kd = unsafe { km_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+                let ks = unsafe { pk.add(h * head_dim) } as *const c_void;
+                chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, kd, ks, row_bytes) };
+                let vd = unsafe { vm_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+                let vs = unsafe { pv.add(h * head_dim) } as *const c_void;
+                chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, vd, vs, row_bytes) };
+            }
         }
         // 6. Flash decode over [0, pos+1) against the mirror → attn_out (device).
         chain_ok = chain_ok
             && unsafe {
-                flash_attn_decode_f32(
-                    &self.stream,
-                    pq,
-                    km_base as *const f32,
-                    vm_base as *const f32,
-                    pat,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_ctx,
-                    pos + 1,
-                    // Per-layer SWA window / Gemma2 soft-cap for this decode step.
-                    window,
-                    softcap,
-                )
-                .is_ok()
+                if self.kv_mirror_f16 {
+                    flash_attn_decode_f16kv(
+                        &self.stream,
+                        pq,
+                        km_base as *const u16,
+                        vm_base as *const u16,
+                        pat,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        pos + 1,
+                        window,
+                        softcap,
+                    )
+                    .is_ok()
+                } else {
+                    flash_attn_decode_f32(
+                        &self.stream,
+                        pq,
+                        km_base as *const f32,
+                        vm_base as *const f32,
+                        pat,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        pos + 1,
+                        // Per-layer SWA window / Gemma2 soft-cap for this decode step.
+                        window,
+                        softcap,
+                    )
+                    .is_ok()
+                }
             };
         // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
         chain_ok = chain_ok
@@ -8534,14 +8823,19 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        let mctx = (
+            n_layers as u32,
+            d_kv as u32,
+            max_ctx as u32,
+            self.kv_mirror_f16 as u32,
+        );
         if self.attn_mirror_ctx != mctx {
             self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
             self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
             self.attn_valid_len = vec![0; n_layers];
             self.attn_mirror_ctx = mctx;
         }
-        let mir_bytes = d_kv * max_ctx * 4;
+        let mir_bytes = d_kv * max_ctx * if self.kv_mirror_f16 { 2 } else { 4 };
         if !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
             || !Self::ensure_scratch(&mut self.attn_v_mirror[layer_idx], &self.stream, mir_bytes)
         {
@@ -8551,36 +8845,83 @@ impl CudaMatvecCache {
         if valid >= pos {
             return true; // already current
         }
-        let kcb: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                k_cache.as_ptr() as *const u8,
-                std::mem::size_of_val(k_cache),
-            )
-        };
-        let vcb: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                v_cache.as_ptr() as *const u8,
-                std::mem::size_of_val(v_cache),
-            )
-        };
         let n = pos - valid; // rows to upload per head
-        {
-            let km = self.attn_k_mirror[layer_idx].as_mut().unwrap();
-            for h in 0..n_kv_heads {
-                let src = (h * max_ctx + valid) * head_dim * 4;
-                let dst = (h * max_ctx + valid) * head_dim * 4;
-                if !km.upload_at(dst, &kcb[src..src + n * head_dim * 4]) {
-                    return false;
+        if self.kv_mirror_f16 {
+            // Whole-mirror f16 KV: host KV is f32, the mirror is f16 — convert each
+            // per-head row block f32→f16 on the host and upload the halves at the
+            // f16 byte offsets (×2). (The seed runs pre-capture, so a host convert
+            // + H2D is fine; it is amortized across the whole decode that follows.)
+            let elems = n * head_dim;
+            let conv = |cache: &[f32], h: usize| -> Vec<u16> {
+                let base = (h * max_ctx + valid) * head_dim;
+                cache[base..base + elems]
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits())
+                    .collect()
+            };
+            {
+                let km = self.attn_k_mirror[layer_idx].as_mut().unwrap();
+                for h in 0..n_kv_heads {
+                    let half_rows = conv(k_cache, h);
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            half_rows.as_ptr() as *const u8,
+                            half_rows.len() * 2,
+                        )
+                    };
+                    let dst = (h * max_ctx + valid) * head_dim * 2;
+                    if !km.upload_at(dst, bytes) {
+                        return false;
+                    }
                 }
             }
-        }
-        {
-            let vm = self.attn_v_mirror[layer_idx].as_mut().unwrap();
-            for h in 0..n_kv_heads {
-                let src = (h * max_ctx + valid) * head_dim * 4;
-                let dst = (h * max_ctx + valid) * head_dim * 4;
-                if !vm.upload_at(dst, &vcb[src..src + n * head_dim * 4]) {
-                    return false;
+            {
+                let vm = self.attn_v_mirror[layer_idx].as_mut().unwrap();
+                for h in 0..n_kv_heads {
+                    let half_rows = conv(v_cache, h);
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            half_rows.as_ptr() as *const u8,
+                            half_rows.len() * 2,
+                        )
+                    };
+                    let dst = (h * max_ctx + valid) * head_dim * 2;
+                    if !vm.upload_at(dst, bytes) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            let kcb: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    k_cache.as_ptr() as *const u8,
+                    std::mem::size_of_val(k_cache),
+                )
+            };
+            let vcb: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    v_cache.as_ptr() as *const u8,
+                    std::mem::size_of_val(v_cache),
+                )
+            };
+            {
+                let km = self.attn_k_mirror[layer_idx].as_mut().unwrap();
+                for h in 0..n_kv_heads {
+                    let src = (h * max_ctx + valid) * head_dim * 4;
+                    let dst = (h * max_ctx + valid) * head_dim * 4;
+                    if !km.upload_at(dst, &kcb[src..src + n * head_dim * 4]) {
+                        return false;
+                    }
+                }
+            }
+            {
+                let vm = self.attn_v_mirror[layer_idx].as_mut().unwrap();
+                for h in 0..n_kv_heads {
+                    let src = (h * max_ctx + valid) * head_dim * 4;
+                    let dst = (h * max_ctx + valid) * head_dim * 4;
+                    if !vm.upload_at(dst, &vcb[src..src + n * head_dim * 4]) {
+                        return false;
+                    }
                 }
             }
         }
