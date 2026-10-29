@@ -459,6 +459,13 @@ struct rsl_cuda_stream {
     // captured launch). Freed on stream destroy.
     float *fd_partials = nullptr;
     size_t fd_partials_cap = 0; // floats
+    // Fused split-KV (atomic last-block-combines) per-head arrival counter:
+    // [n_heads] ints. memset 0 ONCE at prealloc; the fused kernel's last-arriving
+    // block self-resets its head's slot to 0 after combining, so it stays 0 across
+    // the captured per-layer kernels (serial on the stream) and across graph replays
+    // (decode-step sync). A stable device address is required for the captured launch.
+    int *fd_counter = nullptr;
+    size_t fd_counter_cap = 0; // ints
 };
 
 extern "C" rsl_cuda_stream *rsl_cuda_stream_create(int device_index) {
@@ -488,6 +495,7 @@ extern "C" void rsl_cuda_stream_destroy(rsl_cuda_stream *s) {
         if (e.wd) cudaFree(e.wd);
     }
     if (s->fd_partials) cudaFree(s->fd_partials);
+    if (s->fd_counter) cudaFree(s->fd_counter);
     cudaStreamDestroy(s->stream);
     delete s;
 }
@@ -5105,6 +5113,177 @@ __global__ void flash_attn_decode_combine_f32_kernel(const float *partials,
     }
 }
 
+// Fused split-KV + combine ("last-block-combines", graph-CAPTURABLE — no cooperative
+// launch / grid.sync, which is NOT reliably capturable into a stream-captured CUDA
+// graph). grid (n_heads, n_splits), ONE regular kernel: every block computes its
+// KV-chunk partial exactly like flash_attn_decode_split_f32_kernel and writes it to
+// `partials`; then the block that ARRIVES LAST for its head (an atomic per-head
+// arrival counter) merges all n_splits partials exactly like
+// flash_attn_decode_combine_f32_kernel and writes `out` — so there is NO 2nd kernel /
+// graph node (that 2nd combine node is what made the 2-kernel split a −5.6% net loss
+// inside the per-layer decode graph). The SM fill (n_heads*n_splits blocks vs n_heads)
+// is the fix for the grid-starved 1-block-per-head decode.
+//
+// ORDERING (the documented CUB "last block does the reduction" pattern): each block
+// __threadfence()s its partial write (release) BEFORE bumping counter[hh]; the last
+// arrival (atomicAdd returns n_splits-1) therefore happens-after every other block's
+// fence, so ALL n_splits partials for that head are written + globally visible when it
+// reads them. `counter` is [n_heads] ints, memset 0 ONCE at prealloc; the last block
+// self-resets counter[hh]=0 after combining, which stays 0 for the next layer's kernel
+// (serial on the stream within one captured graph replay) and the next token
+// (decode-step sync) — no per-token memset node needed.
+__global__ void flash_attn_decode_splitfused_f32_kernel(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_heads, int n_gqa, int head_dim, int max_ctx, int kv_len,
+    int n_splits, float scale, int window, float softcap) {
+    extern __shared__ float smem[];
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
+    const int hh = blockIdx.x;
+    const int sp = blockIdx.y;
+    if (hh >= n_heads || sp >= n_splits) return;
+    // ---- PART 1: this (hh,sp) block's chunk partial (identical to the split kernel). ----
+    const int chunk = (kv_len + n_splits - 1) / n_splits;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    const int c0 = sp * chunk;
+    const int c1 = min(kv_len, c0 + chunk);
+    for (int t = c0 + warp; t < c1; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * k[kv_off + d];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * v[kv_off + d];
+        m = m_new;
+    }
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+    float m_g = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int stride = head_dim + 2;
+    float *pout = partials + (size_t)(hh * n_splits + sp) * stride;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+#pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        pout[d] = o; // Σ_t exp(s_t − m_g)·v_t over this chunk
+    }
+    if (tid == 0) {
+        pout[head_dim] = m_g;     // chunk max
+        pout[head_dim + 1] = l_g; // chunk denominator
+    }
+
+    // ---- PART 2: arrival signal — the LAST block for head hh combines (CUB pattern). ----
+    // `pout` is written by MANY threads (the strided loop + tid0's m/l), so bracket the
+    // device-wide release with block barriers: (A) every thread has finished writing its
+    // slice of pout, (B) every thread __threadfence()s it to L2, (C) all of those fences
+    // COMPLETE before tid0 bumps the counter — otherwise a warp still mid-write could be
+    // signalled "done" and the last block would combine a PARTIALLY-written partial.
+    __syncthreads(); // (A) all pout writes issued within this block
+    __threadfence(); // (B) device-wide release of this block's partial
+    __syncthreads(); // (C) every thread's fence done before the arrival is signalled
+    __shared__ int s_last;
+    if (tid == 0) {
+        int prev = atomicAdd(&counter[hh], 1);
+        s_last = (prev == n_splits - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_last) return; // not the last arrival for this head → done
+
+    // LAST block: every other block fenced before its atomicAdd, so all n_splits
+    // partials for head hh are written + visible. Combine exactly as the combine kernel.
+    const float *base = partials + (size_t)hh * n_splits * stride;
+    __shared__ float sM, sInvL;
+    if (tid == 0) {
+        float M = -INFINITY;
+        for (int s2 = 0; s2 < n_splits; ++s2) M = fmaxf(M, base[s2 * stride + head_dim]);
+        float L = 0.f;
+        for (int s2 = 0; s2 < n_splits; ++s2) {
+            float cm = base[s2 * stride + head_dim];
+            L += base[s2 * stride + head_dim + 1] * (isfinite(cm) ? expf(cm - M) : 0.f);
+        }
+        sM = M;
+        sInvL = (L > 0.f) ? 1.f / L : 0.f;
+        counter[hh] = 0; // self-reset for the next layer-kernel / graph replay (stream-ordered)
+    }
+    __syncthreads();
+    const float Mg = sM, inv = sInvL;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        for (int s2 = 0; s2 < n_splits; ++s2) {
+            float cm = base[s2 * stride + head_dim];
+            o += base[s2 * stride + d] * (isfinite(cm) ? expf(cm - Mg) : 0.f);
+        }
+        out[hh * head_dim + d] = o * inv;
+    }
+}
+
+// Standalone entry for the fused split-KV kernel — the `attn:decode_splitfused` parity
+// probe lever. EAGER only (NOT the captured production path): memsets the per-head
+// counter, then launches the fused kernel. The production path is the
+// RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED branch in rsl_cuda_flash_attn_decode_f32, where the
+// counter is prealloc-memset + self-reset (a memset is illegal during graph capture).
+extern "C" int rsl_cuda_flash_attn_decode_splitfused_f32(
+    rsl_cuda_stream *s, const float *q, const float *k, const float *v,
+    float *partials, int *counter, float *out, int n_heads, int n_kv_heads,
+    int head_dim, int max_ctx, int kv_len, int n_splits, int window, float softcap) {
+    if (!s || !q || !k || !v || !partials || !counter || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || n_splits < 1) return -1;
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float), s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_f32");
+    }
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 block(32, RSL_FLASH_DECODE_W);
+    dim3 grid((unsigned)n_heads, (unsigned)n_splits);
+    size_t shmem =
+        (size_t)(RSL_FLASH_DECODE_W * head_dim + 2 * RSL_FLASH_DECODE_W) * sizeof(float);
+    cudaMemsetAsync(counter, 0, (size_t)n_heads * sizeof(int), s->stream);
+    flash_attn_decode_splitfused_f32_kernel<<<grid, block, shmem, s->stream>>>(
+        q, k, v, partials, counter, out, n_heads, n_gqa, head_dim, max_ctx, kv_len,
+        n_splits, scale, window, softcap);
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_f32");
+}
+
 // `window` (0 = full causal) + `softcap` (0 = off): SWA / Gemma2 support,
 // threaded straight into the kernel (byte-identical passthroughs at 0/0).
 extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
@@ -5151,18 +5330,31 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     // it gets in the graph on this slice. Kept in-tree env-gated for a non-MIG ncu box
     // (to profile the real stall) or a single-kernel grid-sync combine (no 2nd node).
     {
-        static int split_env = -1;
+        static int split_env = -1, splitfused_env = -1;
         if (split_env < 0) {
             const char *e = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT");
             split_env = (e && e[0] == '1') ? 1 : 0;
+            const char *ef = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED");
+            splitfused_env = (ef && ef[0] == '1') ? 1 : 0;
         }
-        if (split_env) {
+        if (split_env || splitfused_env) {
             int nsm = 0;
             cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
             int n_splits = rsl_decode_attn_n_splits(nsm, n_heads);
             size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
-            if (n_splits > 1 && s->fd_partials && s->fd_partials_cap >= need) {
-                dim3 sgrid((unsigned)n_heads, (unsigned)n_splits);
+            dim3 sgrid((unsigned)n_heads, (unsigned)n_splits);
+            // FUSED single-kernel split (atomic last-block-combines) takes precedence:
+            // ONE node, no 2nd combine kernel (that extra node is the −5.6% graph cost).
+            // Needs the partials + per-head counter scratch (both prealloc'd pre-capture).
+            if (splitfused_env && n_splits > 1 && s->fd_partials && s->fd_partials_cap >= need &&
+                s->fd_counter && s->fd_counter_cap >= (size_t)n_heads) {
+                flash_attn_decode_splitfused_f32_kernel<<<sgrid, block, shmem, s->stream>>>(
+                    q, k, v, s->fd_partials, s->fd_counter, out, n_heads, n_gqa, head_dim,
+                    max_ctx, kv_len, n_splits, scale, window, softcap);
+                return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
+            }
+            // 2-kernel split (split + separate combine) — the original scaffold.
+            if (split_env && n_splits > 1 && s->fd_partials && s->fd_partials_cap >= need) {
                 flash_attn_decode_split_f32_kernel<<<sgrid, block, shmem, s->stream>>>(
                     q, k, v, s->fd_partials, n_heads, n_gqa, head_dim, max_ctx, kv_len, n_splits,
                     scale, window, softcap);
@@ -5770,8 +5962,11 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
     {
         static int split_env = -1;
         if (split_env < 0) {
+            // Either split path (2-kernel OR fused) needs the partials; the fused one
+            // also needs the per-head arrival counter. Prealloc both when EITHER is on.
             const char *e = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT");
-            split_env = (e && e[0] == '1') ? 1 : 0;
+            const char *ef = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED");
+            split_env = ((e && e[0] == '1') || (ef && ef[0] == '1')) ? 1 : 0;
         }
         if (split_env) {
             int nsm = 0;
@@ -5787,6 +5982,19 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
                 else {
                     s->fd_partials = nullptr;
                     s->fd_partials_cap = 0;
+                }
+            }
+            // Fused-split per-head arrival counter: [n_heads] ints, memset 0 ONCE here
+            // (the sync memset is legal pre-capture); the fused kernel self-resets it.
+            if (n_splits > 1 && cap == cudaStreamCaptureStatusNone &&
+                s->fd_counter_cap < (size_t)n_heads) {
+                if (s->fd_counter) cudaFree(s->fd_counter);
+                if (cudaMalloc(&s->fd_counter, (size_t)n_heads * sizeof(int)) == cudaSuccess) {
+                    s->fd_counter_cap = (size_t)n_heads;
+                    cudaMemset(s->fd_counter, 0, (size_t)n_heads * sizeof(int));
+                } else {
+                    s->fd_counter = nullptr;
+                    s->fd_counter_cap = 0;
                 }
             }
         }

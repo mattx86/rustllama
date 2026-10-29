@@ -1064,6 +1064,26 @@ extern "C" {
         window: c_int,
         softcap: f32,
     ) -> c_int;
+    // Fused split-KV decode (atomic last-block-combines) — standalone EAGER entry for
+    // the attn:decode_splitfused parity probe. `partials` = [n_heads*n_splits*(head_dim+2)]
+    // f32, `counter` = [n_heads] ints (the entry memsets it).
+    fn rsl_cuda_flash_attn_decode_splitfused_f32(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        partials: *mut f32,
+        counter: *mut c_int,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len: c_int,
+        n_splits: c_int,
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
     // Device-pos twins of rope_f32 / kv_scatter_rows_f32 / flash_attn_decode_f32
     // for the PERSISTENT capture-once decode step graph: the position is read from
     // a 1-int device buffer `d_pos`, so the captured graph is static (only d_pos's
@@ -3574,6 +3594,56 @@ pub unsafe fn flash_attn_decode_f32(
         head_dim as c_int,
         max_ctx as c_int,
         kv_len as c_int,
+        window as c_int,
+        softcap,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Fused split-KV decode attention (atomic last-block-combines) — standalone EAGER
+/// entry for the `attn:decode_splitfused` parity probe. `partials` must be
+/// `[n_heads*n_splits*(head_dim+2)]` f32 and `counter` `[n_heads]` ints, both device
+/// pointers on `stream` (the entry memsets the counter before launch).
+///
+/// SAFETY: `q`/`out` = [n_heads,head_dim], `k`/`v` = [n_kv_heads,max_ctx,head_dim],
+/// `partials`/`counter` sized as above; all device pointers; `n_heads % n_kv_heads == 0`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_splitfused_f32(
+    stream: &CudaStream,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    partials: *mut f32,
+    counter: *mut c_int,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    n_splits: usize,
+    window: i32,
+    softcap: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_splitfused_f32(
+        stream.raw(),
+        q,
+        k,
+        v,
+        partials,
+        counter,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        n_splits as c_int,
         window as c_int,
         softcap,
     );
