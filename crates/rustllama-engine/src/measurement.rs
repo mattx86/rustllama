@@ -4556,6 +4556,170 @@ pub fn measure_dev_prefill(
     })
 }
 
+/// Outcome of [`measure_kv_mirror_f16`] — the whole-mirror f16 KV decode A/B.
+///
+/// `capable` is `true` only when the f16 mirror actually engaged on the loaded
+/// model (CUDA + head_dim % 16 == 0 + the TC-prefill gate the shared mirror rides
+/// on); otherwise the CLI persists nothing and the mirror stays f32 (fail-closed).
+/// `off_tps` / `on_tps` are median DECODE tok/s with the mirror forced f32 / f16;
+/// `faster` is `Some(true)` where f16 beat f32 by the clear-win margin.
+#[derive(Debug, Clone, Default)]
+pub struct KvMirrorF16Report {
+    pub capable: bool,
+    pub off_tps: Option<f64>,
+    pub on_tps: Option<f64>,
+    pub faster: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// A/B the whole-mirror f16 KV decode win by measured DECODE tok/s. The shared
+/// device attention KV mirror (read by BOTH prefill and decode) is stored f16
+/// instead of f32, halving the KV byte-stream the grid-starved flash-decode reads
+/// — a win on a memory-latency-bound decode. f16 KV is LOSSY but its CORRECTNESS
+/// is validated separately (`doctor --cuda-parity attn:kv_mirror_f16` + coherence
+/// runs), so this gates on SPEED only. CUDA-only (the f16 mirror lives in the CUDA
+/// device-resident attention path); off CUDA it returns BEFORE loading. Loads the
+/// model ONCE; the mirror dtype is a process-global force toggle
+/// ([`rustllama_models::accel::set_kv_mirror_f16_force`]), so both arms run on the
+/// one loaded engine with NO reload.
+///
+/// METRIC is DECODE tok/s, NOT end-to-end: the win is on decode, and a decode A/B
+/// is HW-adaptive — it banks f16 only where the attention is actually grid-starved
+/// (so f16 speeds decode), and declines on a GPU where f16 would only cost prefill.
+/// The ~prefill regression is the accepted cost of the decode win, not measured here.
+pub fn measure_kv_mirror_f16(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    repeats: usize,
+) -> Result<KvMirrorF16Report, String> {
+    // The f16 KV mirror is part of the CUDA device-resident attention path, so
+    // there is nothing to measure off CUDA — return BEFORE loading the model.
+    if !rustllama_models::accel::cuda_active() {
+        return Ok(KvMirrorF16Report {
+            capable: false,
+            error: Some("no active NVIDIA GPU — f16 KV mirror cannot run".into()),
+            ..Default::default()
+        });
+    }
+    // The decode win is +6-8% on a grid-starved slice; require ON to beat OFF by
+    // >3% to clear same-process back-to-back noise. Fail-closed otherwise.
+    const WIN_MARGIN: f64 = 1.03;
+    // A representative decode: a 512-token prompt (so the flash-decode reads a real
+    // KV range, where halving its bytes matters) + 128 decode tokens to amortize
+    // the one-time prefill→decode mirror seed and stabilize the median.
+    const PROMPT_TOKENS: u32 = 512;
+    const DECODE_TOKENS: u32 = 128;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    // Force f32 KV STORAGE (the host KV cache) regardless of cfg.kv_dtype — the f16
+    // MIRROR is an orthogonal device-side optimization, and its serve gate requires
+    // the f32-KV device-resident path too, so a quant-KV winner leaves it dormant.
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        KvDtype::F32,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // One untimed warmup + `repeats` timed decode runs → median DECODE tok/s (the
+    // same decode-metric pattern `measure_dev_attn` uses).
+    let bench = |cpu: &mut ContiguousEngine| -> (Option<f64>, Option<String>) {
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+            return (None, Some(format!("warmup failed: {e}")));
+        }
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            match cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+                Ok(_) => {
+                    let stats = cpu.last_request_stats();
+                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // OFF arm: the f32 mirror (current production decode). ON arm: force the f16
+    // mirror, snapshotting the engagement counter to confirm it actually ran f16.
+    rustllama_models::accel::set_kv_mirror_f16_force(Some(false));
+    let (off_tps, off_err) = bench(&mut cpu);
+
+    let hits_before = rustllama_models::accel::kv_mirror_f16_hits();
+    rustllama_models::accel::set_kv_mirror_f16_force(Some(true));
+    let (on_tps, on_err) = bench(&mut cpu);
+    let engaged = rustllama_models::accel::kv_mirror_f16_hits() > hits_before;
+
+    // Clear the override → serve-time env/verdicts decide from here.
+    rustllama_models::accel::set_kv_mirror_f16_force(None);
+
+    if !engaged {
+        return Ok(KvMirrorF16Report {
+            capable: false,
+            off_tps,
+            on_tps,
+            faster: None,
+            error: Some(
+                "f16 KV mirror never engaged (head_dim not 16-aligned, or the TC-prefill \
+                 gate the shared mirror rides on is off) — verdict left unset"
+                    .into(),
+            ),
+        });
+    }
+
+    let faster = match (off_tps, on_tps) {
+        (Some(off), Some(on)) if off > 0.0 => Some(on > off * WIN_MARGIN),
+        _ => None,
+    };
+    Ok(KvMirrorF16Report {
+        capable: true,
+        off_tps,
+        on_tps,
+        faster,
+        error: off_err.or(on_err),
+    })
+}
+
 /// Outcome of [`measure_moe_vram_margin_candidates`] — the MoE VRAM-margin A/B.
 ///
 /// `capable` is `true` only when a reload actually engaged the tiered-expert

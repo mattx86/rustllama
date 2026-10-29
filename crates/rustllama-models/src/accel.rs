@@ -11061,6 +11061,35 @@ pub fn dev_prefill_hits() -> u64 {
     DEV_PREFILL_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Transient A/B override for the whole-mirror f16 KV decision (the
+/// `tune --kv-mirror-f16` harness only). `-1` = unset (env/verdict decide),
+/// `0` = force off, `1` = force on. NOT a user knob — serve/bench never set it.
+static KV_MIRROR_F16_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+/// Count of attention blocks that engaged an f16 KV mirror (incremented in
+/// [`kv_mirror_f16_active`] when it returns true — prefill + decode blocks both).
+/// The A/B reads it to confirm the ON arm actually ran with an f16 mirror.
+static KV_MIRROR_F16_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Force the whole-mirror f16 KV path on/off for the current process (the
+/// `tune --kv-mirror-f16` A/B harness only). `None` clears the override → the
+/// `RUSTLLAMA_KV_MIRROR_F16` env / the `attn:kv_mirror_f16{,_faster}` verdicts
+/// decide.
+pub fn set_kv_mirror_f16_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    KV_MIRROR_F16_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many attention blocks have run with an f16 KV mirror so far
+/// (process-global). The A/B harness compares this before/after the ON arm to
+/// confirm the forced-on arm actually engaged f16 (else the A/B is meaningless).
+pub fn kv_mirror_f16_hits() -> u64 {
+    KV_MIRROR_F16_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
 /// reserved below free VRAM when `load_inner` projects the expert-promotion
 /// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
@@ -11177,21 +11206,34 @@ pub fn prefill_flash_tc_enabled() -> bool {
 /// flash. Gated on BOTH the correctness verdict [`VERDICT_ATTN_KV_MIRROR_F16`]
 /// (f16 KV is lossy → graded within an f16 tolerance by `doctor --cuda-parity
 /// attn:kv_mirror_f16`) AND the perf verdict [`VERDICT_ATTN_KV_MIRROR_F16_FASTER`],
-/// which NO stage banks yet — so it is fail-closed OFF even where the kernel is
-/// correct, until an on-pod A/B proves the production-graph win (the split-KV lesson:
-/// an eager win ≠ a graph win). `RUSTLLAMA_KV_MIRROR_F16=1` force-enables for that
-/// A/B, `=0` disables. The CALLER additionally gates on head_dim % 16 == 0 AND
+/// banked by `tune --kv-mirror-f16` (Stage 1e-b) where the f16 mirror measured
+/// FASTER at decode than f32 on this box. HW-ADAPTIVE: f16 wins on grid-starved
+/// attention (halving each starved block's byte-stream) and is declined otherwise,
+/// so the accepted ~prefill cost is only paid where the decode gain justifies it
+/// (the split-KV lesson: a HW-specific win must be measured per box, not assumed).
+/// Fail-closed: unmeasured / not-a-win ⇒ f32. `RUSTLLAMA_KV_MIRROR_F16=1`
+/// force-enables (the on-pod A/B lever), `=0` disables. The CALLER additionally
+/// gates on head_dim % 16 == 0 AND
 /// `prefill_flash_tc_enabled()` (the mirror is shared, so f16 is only safe when the
 /// prefill path that reads it is the TC kernel — the scalar prefill has no f16
 /// reader). On any model that doesn't meet those, the mirror stays f32.
 pub fn kv_mirror_f16_enabled() -> bool {
+    // Transient A/B override (`tune --kv-mirror-f16`) wins and does NOT touch the
+    // OnceLock below, so the env/verdict decision stays intact once the force is
+    // cleared (the override is per-arm; the real decision must survive it).
+    match KV_MIRROR_F16_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(
         || match std::env::var("RUSTLLAMA_KV_MIRROR_F16").ok().as_deref() {
             Some("1") => true,
             Some("0") => false,
-            // Correctness AND perf verdict. The perf one is never banked yet ⇒
-            // default OFF; env-force is the on-pod A/B path until a stage banks it.
+            // Correctness AND perf verdict. The perf one (`attn:kv_mirror_f16_faster`)
+            // is banked by `tune --kv-mirror-f16` (Stage 1e-b) only where the f16
+            // decode A/B wins ⇒ default OFF until that stage measures a win.
             _ => {
                 kernel_verdict(rustllama_tuner::VERDICT_ATTN_KV_MIRROR_F16)
                     && kernel_verdict(rustllama_tuner::VERDICT_ATTN_KV_MIRROR_F16_FASTER)
@@ -11209,7 +11251,14 @@ pub fn kv_mirror_f16_enabled() -> bool {
 /// per model (both inner gates are process-global / dim-fixed), so no flag flip
 /// mid-request that would realloc the mirror.
 pub fn kv_mirror_f16_active(head_dim: usize) -> bool {
-    kv_mirror_f16_enabled() && head_dim % 16 == 0 && prefill_flash_tc_enabled()
+    let on = kv_mirror_f16_enabled() && head_dim % 16 == 0 && prefill_flash_tc_enabled();
+    if on {
+        // Engagement confirmation for the `tune --kv-mirror-f16` A/B — counts every
+        // prefill + decode attention block that runs with an f16 mirror (a "did the
+        // ON arm fire" signal, not a precise per-decode count).
+        KV_MIRROR_F16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    on
 }
 
 /// Whether the Feature-1b CUDA-graph attention block is enabled. **AUTOMATIC, no

@@ -652,6 +652,16 @@ pub enum Command {
         /// correctness.
         #[arg(long)]
         dev_prefill: bool,
+        /// Whole-mirror f16 KV decode A/B (ships the built-but-inert
+        /// `attn:kv_mirror_f16` mirror where it wins): force the shared attention KV
+        /// mirror f32 then f16 on one f32-KV-storage load, measure DECODE tok/s, and
+        /// persist the PERF verdict `attn:kv_mirror_f16_faster` that (with the
+        /// correctness verdict) auto-enables the f16 mirror only where it's measured
+        /// faster — i.e. where the attention is grid-starved and halving the KV
+        /// byte-stream speeds decode. CUDA-only; a `tune --all` sub-stage
+        /// (Stage 1e-b). The accepted prefill cost is not measured here.
+        #[arg(long)]
+        kv_mirror_f16: bool,
         /// Sweep the MoE tiered-expert VRAM margin (the headroom reserved below
         /// free VRAM when projecting the expert-promotion budget) and persist the
         /// per-model margin with the best decode tok/s. A smaller margin promotes
@@ -1448,6 +1458,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             validate_kernels,
             dev_attn,
             dev_prefill,
+            kv_mirror_f16,
             moe_vram_margin,
             cacheblend,
             batching,
@@ -1547,6 +1558,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 validate_kernels,
                 dev_attn,
                 dev_prefill,
+                kv_mirror_f16,
                 moe_vram_margin,
                 cacheblend,
                 batching,
@@ -1772,6 +1784,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if dev_prefill {
                 return cmd_tune_dev_prefill(&config_path, model, repeats);
+            }
+            if kv_mirror_f16 {
+                return cmd_tune_kv_mirror_f16(&config_path, model, repeats);
             }
             if moe_vram_margin {
                 return cmd_tune_moe_vram_margin(
@@ -6973,6 +6988,76 @@ fn cmd_tune_dev_prefill(
     Ok(())
 }
 
+/// `tune --kv-mirror-f16` (Stage 1e-b): A/B the whole-mirror f16 KV decode win and
+/// persist the PERF verdict `attn:kv_mirror_f16_faster`, which — ANDed with the
+/// correctness verdict `attn:kv_mirror_f16` — `accel::kv_mirror_f16_enabled` reads to
+/// auto-enable the f16 attention KV mirror only where it's measured faster on this
+/// device+model (i.e. where the attention is grid-starved, so halving the KV
+/// byte-stream speeds decode). f16 KV is lossy; its CORRECTNESS is validated
+/// separately (`doctor --cuda-parity attn:kv_mirror_f16` + coherence runs), so this
+/// gates on SPEED. CUDA-only; on any other host `measure_kv_mirror_f16` returns
+/// BEFORE loading, so it prints "skipped" and persists nothing — the mirror stays
+/// f32 (fail-closed). Before this stage the perf verdict had NO writer, so the f16
+/// mirror (built at 5cc4402) stayed inert unless `RUSTLLAMA_KV_MIRROR_F16=1` by hand.
+fn cmd_tune_kv_mirror_f16(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_kv_mirror_f16, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+
+    println!("rustllama tune --kv-mirror-f16");
+    println!("  model = {}", model_path.display());
+
+    // f32 KV STORAGE (the f16 MIRROR is orthogonal and its serve gate is f32-KV-only);
+    // pass the config's layout / flash / placement so the A/B runs the decode path
+    // serve would. CUDA-only + the engagement check happen inside the measurement
+    // (it returns BEFORE loading off CUDA).
+    let m_cfg = MeasurementConfig {
+        kv_dtype: rustllama_engine::KvDtype::F32,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+
+    let report = measure_kv_mirror_f16(&model_path, &m_cfg, repeats.max(3) as usize)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    match (report.capable, report.off_tps, report.on_tps, report.faster) {
+        (true, Some(off), Some(on), Some(win)) => {
+            println!("  f32 mirror (OFF) = {off:.1} tok/s");
+            println!(
+                "  f16 mirror (ON)  = {on:.1} tok/s  ({:+.1}%)",
+                (on / off - 1.0) * 100.0
+            );
+            println!(
+                "  → {}",
+                if win {
+                    "ENABLE — f16 KV mirror speeds decode here (accepting the prefill cost)"
+                } else {
+                    "keep f32 mirror — f16 KV is not a decode win here"
+                }
+            );
+            let name = rustllama_tuner::VERDICT_ATTN_KV_MIRROR_F16_FASTER;
+            persist_kernel_verdicts(&[(name.to_string(), win)])?;
+            println!("  → persisted verdict {name} = {win}");
+        }
+        _ => {
+            println!(
+                "  → not measured ({}); verdict left unset — mirror stays f32",
+                report
+                    .error
+                    .unwrap_or_else(|| "f16 KV mirror did not engage".into())
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Persist the per-model MoE VRAM-margin winner (bytes) into the tuner cache,
 /// keyed by model stem under `moe_vram_margin` (mirrors `persist_placement_winner`).
 /// `load_inner` reads it at load so `serve` auto-applies the decode-optimal
@@ -9261,6 +9346,17 @@ fn cmd_tune_all(
                 && t.kernel_build_id == build_id
         })
         .unwrap_or(false);
+    // Whole-mirror f16 KV perf verdict — build-stamped like dev-prefill, its own
+    // (CUDA-only) key. `Some(false)` (measured no-win) still counts as decided, so
+    // use `contains_key` (re-runs on a kernel-source/build change via build_id).
+    let has_kv_mirror_f16 = cached
+        .as_ref()
+        .map(|t| {
+            t.kernel_verdicts
+                .contains_key(rustllama_tuner::VERDICT_ATTN_KV_MIRROR_F16_FASTER)
+                && t.kernel_build_id == build_id
+        })
+        .unwrap_or(false);
     // Tree-width winner. It does NOT persist a sentinel on a non-capable model
     // (there is no "off" width vector) — the sweep SKIPs and writes nothing — so
     // `is_some()` is the "already tuned" probe. A SKIPped (write-blind) model
@@ -9421,6 +9517,28 @@ fn cmd_tune_all(
             &[],
         ) {
             tracing::warn!(error = %e, "stage 1e (dev-prefill perf) failed; continuing");
+        }
+    }
+
+    println!();
+    println!("Stage 1e-b/10: kv-mirror-f16 perf (A/B the f16 KV mirror decode win, f32 KV)");
+    println!("--------");
+    if skip(has_kv_mirror_f16) {
+        println!("(skipped: kv-mirror-f16 verdict already cached for this build)");
+    } else {
+        // Model-dependent f32-KV-storage decode A/B; CUDA-only (the stage self-skips
+        // off CUDA). Runs AFTER Stage 1c — `--validate-kernels` banks `attn:prefill_tc`,
+        // the gate the SHARED mirror rides on, so the ON arm can actually engage f16.
+        // Subprocess like the others for a clean GPU context.
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--kv-mirror-f16",
+            thorough,
+            "1e-b (kv-mirror-f16 perf)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 1e-b (kv-mirror-f16 perf) failed; continuing");
         }
     }
 
