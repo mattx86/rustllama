@@ -4448,6 +4448,43 @@ extern "C" int rsl_cuda_rope_f32(rsl_cuda_stream *s, float *qk, int n_heads,
     return rsl_cuda_check("rsl_cuda_rope_f32");
 }
 
+// Device-pos twin of rope_f32_kernel for the PERSISTENT capture-once decode step
+// graph: reads the absolute position from a 1-int device buffer `d_pos` (so the
+// captured graph node is static — only d_pos's CONTENTS change between token
+// replays, not the node), instead of a host-baked `int pos`. Numerically
+// identical to rope_f32_kernel at pos == d_pos[0].
+__global__ void rope_f32_dpos_kernel(float *qk, int n_heads, int head_dim,
+                                     const int *d_pos, const float *inv_freq) {
+    int pos = d_pos[0];
+    int half = head_dim / 2;
+    int total = n_heads * half;
+    int flat = blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat >= total) return;
+    int head = flat / half;
+    int j = flat % half;
+    float angle = (float)pos * inv_freq[j];
+    float c = cosf(angle), si = sinf(angle);
+    int base = head * head_dim;
+    float x0 = qk[base + j];
+    float x1 = qk[base + j + half];
+    qk[base + j] = x0 * c - x1 * si;
+    qk[base + j + half] = x0 * si + x1 * c;
+}
+
+extern "C" int rsl_cuda_rope_f32_dpos(rsl_cuda_stream *s, float *qk, int n_heads,
+                                      int head_dim, const int *d_pos,
+                                      const float *inv_freq) {
+    if (!s || !qk || !inv_freq || !d_pos || n_heads <= 0 || head_dim <= 0 ||
+        (head_dim % 2) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    int total = n_heads * (head_dim / 2);
+    int t = 128, b = (total + t - 1) / t;
+    rope_f32_dpos_kernel<<<b, t, 0, s->stream>>>(qk, n_heads, head_dim, d_pos,
+                                                 inv_freq);
+    return rsl_cuda_check("rsl_cuda_rope_f32_dpos");
+}
+
 // Batched RoPE for the device-resident PREFILL block: rotate n_rows rows, each
 // token-row `row` at its own absolute position `base_pos + row` (vs the single
 // `pos` of rsl_cuda_rope_f32). `qk` is [n_rows, n_heads, head_dim] (token-major,
@@ -4581,6 +4618,39 @@ extern "C" int rsl_cuda_kv_scatter_rows_f32(rsl_cuda_stream *s, float *mirror,
     kv_scatter_rows_f32_kernel<<<b, t, 0, s->stream>>>(
         mirror, src, n_new, n_kv_heads, head_dim, max_ctx, col_base);
     return rsl_cuda_check("rsl_cuda_kv_scatter_rows_f32");
+}
+
+// Device-pos twin of kv_scatter_rows_f32_kernel for the capture-once decode step
+// graph: the decode scatter writes exactly ONE row (n_new == 1) at column
+// d_pos[0]. Reads the destination column from a 1-int device buffer so the
+// captured node is static across token replays (only d_pos's contents change).
+__global__ void kv_scatter_rows_f32_dpos_kernel(float *mirror, const float *src,
+                                                int n_kv_heads, int head_dim,
+                                                int max_ctx, const int *d_pos) {
+    int col_base = d_pos[0];
+    long total = (long)n_kv_heads * head_dim;  // n_new == 1
+    long flat = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat >= total) return;
+    int e = (int)(flat % head_dim);
+    int h = (int)(flat / head_dim);
+    long dst = ((long)h * max_ctx + col_base) * head_dim + e;
+    mirror[dst] = src[flat];
+}
+
+extern "C" int rsl_cuda_kv_scatter_rows_f32_dpos(rsl_cuda_stream *s, float *mirror,
+                                                 const float *src, int n_kv_heads,
+                                                 int head_dim, int max_ctx,
+                                                 const int *d_pos) {
+    if (!s || !mirror || !src || !d_pos || n_kv_heads <= 0 || head_dim <= 0 ||
+        max_ctx <= 0)
+        return -1;
+    cudaSetDevice(s->device);
+    long total = (long)n_kv_heads * head_dim;
+    int t = 256;
+    int b = (int)((total + t - 1) / t);
+    kv_scatter_rows_f32_dpos_kernel<<<b, t, 0, s->stream>>>(
+        mirror, src, n_kv_heads, head_dim, max_ctx, d_pos);
+    return rsl_cuda_check("rsl_cuda_kv_scatter_rows_f32_dpos");
 }
 
 // f16 twin of kv_scatter_rows_f32_kernel: scatter n_new post-RoPE rows (f32 in the
@@ -5164,6 +5234,123 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale,
         window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
+}
+
+// Device-pos twin of flash_attn_decode_f32_kernel for the PERSISTENT capture-once
+// decode step graph: reads kv_len = d_pos[0]+1 from a 1-int device buffer. The
+// attended length grows each token, but the GRID is one-block-per-head
+// (pos-INDEPENDENT) + shmem is fixed, so ONLY the in-kernel loop bound changes —
+// the captured node stays static across token replays. Body is otherwise
+// byte-identical to flash_attn_decode_f32_kernel.
+__global__ void flash_attn_decode_f32_dpos_kernel(const float *q, const float *k,
+                                                  const float *v, float *out,
+                                                  int n_heads, int n_gqa,
+                                                  int head_dim, int max_ctx,
+                                                  const int *d_pos, float scale,
+                                                  int window, float softcap) {
+    int kv_len = d_pos[0] + 1;
+    extern __shared__ float smem[];
+    float *sh_acc = smem;                                   // [W * head_dim]
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;   // [W]
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;                // [W]
+
+    const int hh = blockIdx.x;            // one block per head
+    if (hh >= n_heads) return;
+    const int lane = threadIdx.x;         // 0..31
+    const int warp = threadIdx.y;         // 0..W-1
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+
+    // This head's query row into per-lane registers (dims lane, lane+32, …).
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+
+    // Sliding-window lower bound: attend only `[t_start, kv_len)`.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;  // SWA: before the window start (warp-uniform)
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * k[kv_off + d];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * v[kv_off + d];
+        m = m_new;
+    }
+
+    // Publish this warp's partial (m, l, acc) to shared.
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+
+    // Merge the W partials: global max, then the flash denominator + output.
+    float m_g = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        #pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] *
+                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
+}
+
+// Simple single-launch entry for the capture-once decode step graph. NO split-KV,
+// NO DECODE_ATTN_DIAG (those read env/occupancy + add nodes — kept out of the
+// captured graph). Fixed grid (one block per head) + fixed shmem; kv_len is read
+// from d_pos inside the kernel.
+extern "C" int rsl_cuda_flash_attn_decode_f32_dpos(rsl_cuda_stream *s,
+                                                   const float *q, const float *k,
+                                                   const float *v, float *out,
+                                                   int n_heads, int n_kv_heads,
+                                                   int head_dim, int max_ctx,
+                                                   const int *d_pos, int window,
+                                                   float softcap) {
+    if (!s || !q || !k || !v || !out || !d_pos) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0)
+        return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return -1;
+    cudaSetDevice(s->device);
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 block(32, RSL_FLASH_DECODE_W);  // W warps per head
+    dim3 grid((unsigned)n_heads);        // one block per head
+    size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
+                            2 * RSL_FLASH_DECODE_W) *
+                   sizeof(float);
+    flash_attn_decode_f32_dpos_kernel<<<grid, block, shmem, s->stream>>>(
+        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, d_pos, scale, window,
+        softcap);
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32_dpos");
 }
 
 // f16-KV twin of flash_attn_decode_f32_kernel (whole-mirror f16 KV): IDENTICAL

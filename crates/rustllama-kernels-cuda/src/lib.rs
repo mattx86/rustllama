@@ -1064,6 +1064,41 @@ extern "C" {
         window: c_int,
         softcap: f32,
     ) -> c_int;
+    // Device-pos twins of rope_f32 / kv_scatter_rows_f32 / flash_attn_decode_f32
+    // for the PERSISTENT capture-once decode step graph: the position is read from
+    // a 1-int device buffer `d_pos`, so the captured graph is static (only d_pos's
+    // CONTENTS change between token replays, never the nodes).
+    fn rsl_cuda_rope_f32_dpos(
+        s: *mut RslCudaStreamRaw,
+        qk: *mut f32,
+        n_heads: c_int,
+        head_dim: c_int,
+        d_pos: *const c_int,
+        inv_freq: *const f32,
+    ) -> c_int;
+    fn rsl_cuda_kv_scatter_rows_f32_dpos(
+        s: *mut RslCudaStreamRaw,
+        mirror: *mut f32,
+        src: *const f32,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        d_pos: *const c_int,
+    ) -> c_int;
+    fn rsl_cuda_flash_attn_decode_f32_dpos(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        d_pos: *const c_int,
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
     // GPU paged attention (Phase B): block-table flash-decode against the
     // whole-pool device mirror. `block_table` = [ceil(kv_len/page_size)] i32.
     fn rsl_cuda_flash_attn_decode_paged_f32(
@@ -3549,6 +3584,102 @@ pub unsafe fn flash_attn_decode_f32(
     }
 }
 
+/// Device-pos twin of [`rope_f32`] for the PERSISTENT capture-once decode step
+/// graph: reads the absolute position from the 1-int device buffer `d_pos`.
+///
+/// SAFETY: `qk`, `inv_freq`, `d_pos` are device pointers on `stream`; `head_dim`
+/// even.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn rope_f32_dpos(
+    stream: &CudaStream,
+    qk: *mut f32,
+    n_heads: usize,
+    head_dim: usize,
+    d_pos: *const c_int,
+    inv_freq: *const f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_rope_f32_dpos(stream.raw(), qk, n_heads as c_int, head_dim as c_int, d_pos, inv_freq);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Device-pos twin of [`kv_scatter_rows_f32`] for the capture-once decode step
+/// graph: scatter exactly ONE row (`n_new == 1`) at device column `d_pos[0]`.
+///
+/// SAFETY: `mirror`, `src`, `d_pos` are device pointers on `stream`;
+/// `d_pos[0] < max_ctx` (caller contract).
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn kv_scatter_rows_f32_dpos(
+    stream: &CudaStream,
+    mirror: *mut f32,
+    src: *const f32,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    d_pos: *const c_int,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_kv_scatter_rows_f32_dpos(
+        stream.raw(),
+        mirror,
+        src,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        d_pos,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Device-pos twin of [`flash_attn_decode_f32`] for the capture-once decode step
+/// graph: reads `kv_len = d_pos[0] + 1` inside the kernel (grid + shmem are
+/// pos-independent, so the captured node is static).
+///
+/// SAFETY: `q`/`k`/`v`/`out`/`d_pos` are device pointers on `stream`;
+/// `n_heads % n_kv_heads == 0`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_f32_dpos(
+    stream: &CudaStream,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    d_pos: *const c_int,
+    window: i32,
+    softcap: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_f32_dpos(
+        stream.raw(),
+        q,
+        k,
+        v,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        d_pos,
+        window as c_int,
+        softcap,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
 /// f16-KV twin of [`flash_attn_decode_f32`] (whole-mirror f16 KV): `q`/`out` stay
 /// f32; `k`/`v` point into the f16 KV mirror (`*const u16` ≈ `__half`). Same
 /// online-softmax/GQA/window/softcap numerics, half the KV bytes, f16-lossy.
@@ -5236,6 +5367,20 @@ pub struct CudaMatvecCache {
     // PER layer). `None` until the first step-graph launch; invalidated alongside
     // `attn_graph_exec` on a mirror-ctx change and on `clear`.
     step_graph_exec: Option<CudaGraphExecHandle>,
+    // PERSISTENT capture-once step graph: the topology key `step_graph_exec` was
+    // captured under. When it matches on the next token, the graph is REPLAYED
+    // without re-capture — only the device `d_pos` changes (vs the old path's
+    // per-token re-capture + `graph_exec_update`, which regressed −34%). Fields =
+    // everything the capture bakes that identifies the layer chain:
+    // (n_layers, d_kv, max_ctx, d_ff, has_q_norm, has_k_norm). Per-layer window /
+    // softcap are MODEL-CONSTANT, so a model reload (`clear`) or a mirror-ctx
+    // realloc — both of which also drop `step_graph_exec` — invalidates the graph.
+    step_graph_key: Option<(usize, usize, usize, usize, bool, bool)>,
+    // 1-int device buffer holding the current decode position, read by the `*_dpos`
+    // kernels inside the captured step graph so the captured nodes are STATIC (only
+    // the buffer's contents change per token). Allocated ONCE with a stable pointer
+    // (in `set_d_pos`); never realloc'd between tokens.
+    d_pos: Option<RawDevBuf>,
     // A1: when set, the EAGER decode block routes its Q4_K matvecs through the
     // lossy, verdict-gated W4A8 int8-activation kernel instead of the bit-exact
     // f32 warp matvec. Set per-call at the top of `decode_attn_block_f32` from
@@ -5390,6 +5535,8 @@ impl CudaMatvecCache {
             attn_norms: None,
             attn_graph_exec: Vec::new(),
             step_graph_exec: None,
+            step_graph_key: None,
+            d_pos: None,
             q4k_w4a8: false,
             prefill_q8_0_w8a8_tc: false,
             prefill_q8_0_f32: false,
@@ -5593,6 +5740,10 @@ impl CudaMatvecCache {
         self.attn_graph_exec = Vec::new();
         // T2: drop the cached whole-step graph exec for the same reason.
         self.step_graph_exec = None;
+        self.step_graph_key = None;
+        // The d_pos buffer is model-independent (a single int), but drop it so a
+        // device reset leaves no dangling buffer; it's re-allocated on next use.
+        self.d_pos = None;
     }
 
     fn ensure_scratch(
@@ -5611,6 +5762,24 @@ impl CudaMatvecCache {
             }
             None => false,
         }
+    }
+
+    /// Ensure the 1-int device `d_pos` buffer exists (allocated ONCE → stable
+    /// pointer) and async-upload the current decode position into it on this
+    /// cache's stream. The capture-once step graph's `*_dpos` kernels read this at
+    /// execution, so the captured nodes stay identical across tokens — only these
+    /// 4 bytes change. Returns false on alloc/upload failure.
+    fn set_d_pos(&mut self, pos: i32) -> bool {
+        if !Self::ensure_scratch(&mut self.d_pos, &self.stream, 4) {
+            return false;
+        }
+        let bytes = pos.to_ne_bytes();
+        self.d_pos.as_mut().unwrap().upload_at_async(0, &bytes)
+    }
+
+    /// Raw `*const c_int` device pointer into `d_pos` (valid after `set_d_pos`).
+    fn d_pos_ptr(&self) -> *const c_int {
+        self.d_pos.as_ref().unwrap().ptr as *const c_int
     }
 
     /// Ensure `weight_key`'s bytes are resident; upload on first use.
@@ -8200,6 +8369,13 @@ impl CudaMatvecCache {
         // W4A8 self-syncs ⇒ uncapturable; force the bit-exact f32 warp matvec for
         // the whole step (same invariant as the per-layer graph).
         self.q4k_w4a8 = false;
+        // PERSISTENT capture-once step graph is F32-KV ONLY: decline an f16 mirror
+        // (the caller falls back to the per-layer graph, the validated f16 path) and
+        // decline AirLLM layer streaming (a bounded window evicts weights between
+        // tokens, which would dangle the captured weight pointers). Both fail-closed.
+        if self.kv_mirror_f16 || self.stream_window_layers > 0 {
+            return false;
+        }
         let n_layers = layers.len();
         let d_q = n_heads * head_dim;
         let d_kv = n_kv_heads * head_dim;
@@ -8241,6 +8417,7 @@ impl CudaMatvecCache {
             self.attn_mirror_ctx = mctx;
             self.attn_graph_exec = (0..n_layers).map(|_| None).collect();
             self.step_graph_exec = None;
+            self.step_graph_key = None;
         }
         if self.attn_valid_len.len() != n_layers {
             self.attn_valid_len = vec![0; n_layers];
@@ -8292,7 +8469,25 @@ impl CudaMatvecCache {
         let fb = |s: &[f32]| -> &[u8] {
             unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
         };
-        // Weight pre-warm (BEFORE capture): all 7 weights for every layer.
+        // Persistence key: the topology the captured graph bakes. When it matches
+        // (and an exec + d_pos already exist), the graph is REPLAYED without
+        // re-capture — only d_pos changes. Per-layer window/softcap are model
+        // constants; a model reload (`clear`) or mirror-ctx realloc — both of which
+        // also drop `step_graph_exec`/`step_graph_key` — invalidates a stale graph.
+        let key = (
+            n_layers,
+            d_kv,
+            max_ctx,
+            d_ff,
+            layers[0].q_norm.is_some(),
+            layers[0].k_norm.is_some(),
+        );
+        let fast = self.step_graph_exec.is_some()
+            && self.step_graph_key == Some(key)
+            && self.d_pos.is_some();
+
+        // Weight pre-warm (BEFORE any capture): all 7 weights for every layer. A
+        // cached weight is a cheap no-op (so ~free on the fast path); never captured.
         for l in layers {
             if !self.ensure_weight(l.wq.1, l.wq.2)
                 || !self.ensure_weight(l.wk.1, l.wk.2)
@@ -8310,8 +8505,7 @@ impl CudaMatvecCache {
                 }
             }
         }
-        // H2D uploads (BEFORE capture): hidden once + every layer's norms into its
-        // own `norm_floats`-sized block of the slab.
+        // Norm-slab offsets (within each layer's `norm_floats` block).
         let (no_attn, no_post, no_qn, no_kn, no_if) = (
             0,
             d_model,
@@ -8319,6 +8513,7 @@ impl CudaMatvecCache {
             2 * d_model + head_dim,
             2 * d_model + 2 * head_dim,
         );
+        // H2D hidden (BOTH paths — it changes every token) into the shared slab.
         if !self
             .attn_act
             .as_mut()
@@ -8327,7 +8522,9 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        {
+        // Layer norms are token-INVARIANT: upload them only on the CAPTURE path
+        // (first token / key change); on the fast path they persist in the slab.
+        if !fast {
             let nrm = self.attn_norms.as_mut().unwrap();
             for (i, l) in layers.iter().enumerate() {
                 let base = i * norm_floats;
@@ -8349,153 +8546,127 @@ impl CudaMatvecCache {
                 }
             }
         }
-        if !stream_sync(&self.stream) {
+        // Upload this token's position into the device `d_pos` buffer (both paths).
+        // The captured `*_dpos` kernels read it at EXECUTION, so the captured nodes
+        // are identical every token — this 4-byte write is the whole per-token delta.
+        if !self.set_d_pos(pos as i32) {
             return false;
         }
 
-        // Shared activation-slab ptrs (same offsets as the per-layer block; reused
-        // by every layer — the chain overwrites them per layer but offset-0 hidden
-        // carries the residual forward).
-        let (o_hidden, o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
-            0,
-            d_model,
-            2 * d_model,
-            2 * d_model + d_q,
-            2 * d_model + d_q + d_kv,
-            2 * d_model + d_q + 2 * d_kv,
-            2 * d_model + 2 * d_q + 2 * d_kv,
-            3 * d_model + 2 * d_q + 2 * d_kv,
-        );
-        let ffn_base = 4 * d_model + 2 * d_q + 2 * d_kv;
-        let (o_gate, o_up, o_act) = (ffn_base, ffn_base + d_ff, ffn_base + 2 * d_ff);
-        let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
-            let a = self.attn_act.as_ref().unwrap();
-            (
-                a.f32_ptr_at(o_hidden),
-                a.f32_ptr_at(o_hnorm),
-                a.f32_ptr_at(o_q),
-                a.f32_ptr_at(o_k),
-                a.f32_ptr_at(o_v),
-                a.f32_ptr_at(o_attn),
-                a.f32_ptr_at(o_o),
-                a.f32_ptr_at(o_hn2),
-                a.f32_ptr_at(o_gate),
-                a.f32_ptr_at(o_up),
-                a.f32_ptr_at(o_act),
-            )
-        };
-        // Per-layer norm + mirror ptrs (copied out as raw ptrs → no borrow held
-        // across the capture loop's `&mut self` calls).
-        type LayerPtrs = (
-            *mut f32,
-            *mut f32,
-            *mut f32,
-            *mut f32,
-            *mut f32,
-            *mut f32,
-            *mut f32,
-        );
-        let layer_ptrs: Vec<LayerPtrs> = (0..n_layers)
-            .map(|i| {
-                let base = i * norm_floats;
-                let n = self.attn_norms.as_ref().unwrap();
-                (
-                    n.f32_ptr_at(base + no_attn),
-                    n.f32_ptr_at(base + no_post),
-                    n.f32_ptr_at(base + no_qn),
-                    n.f32_ptr_at(base + no_kn),
-                    n.f32_ptr_at(base + no_if),
-                    self.attn_k_mirror[i].as_ref().unwrap().ptr as *mut f32,
-                    self.attn_v_mirror[i].as_ref().unwrap().ptr as *mut f32,
-                )
-            })
-            .collect();
-
-        // ================= BEGIN CAPTURE (one for the whole step) =================
-        if !graph_begin_capture(&self.stream) {
-            return false;
-        }
-        let mut chain_ok = true;
-        for (i, l) in layers.iter().enumerate() {
-            let (pan, ppn, pqn, pkn, pif, km_base, vm_base) = layer_ptrs[i];
-            chain_ok = chain_ok
-                && unsafe {
-                    self.issue_layer_chain(
-                        ph,
-                        phn,
-                        pq,
-                        pk,
-                        pv,
-                        pat,
-                        po,
-                        phn2,
-                        p_gate,
-                        p_up,
-                        p_act,
-                        pan,
-                        ppn,
-                        pqn,
-                        pkn,
-                        pif,
-                        km_base,
-                        vm_base,
-                        l.wq,
-                        l.wk,
-                        l.wv,
-                        l.wo,
-                        l.dense_ffn,
-                        l.q_norm.is_some(),
-                        l.k_norm.is_some(),
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        d_model,
-                        d_q,
-                        d_kv,
-                        d_ff,
-                        pos,
-                        max_ctx,
-                        l.window,
-                        l.softcap,
-                        rms_eps,
-                    )
-                };
-        }
-        // ================= END CAPTURE (always) =================
-        let graph = graph_end_capture(&self.stream);
-        let Some(graph) = graph else {
-            return false;
-        };
-        if !chain_ok {
-            unsafe { graph_destroy(graph) };
-            return false;
-        }
-        // Patch the cached step-exec in place (subsequent tokens — cheap) or
-        // instantiate first time / on topology change.
-        let mut launch_ok = true;
-        if self.step_graph_exec.is_some() {
-            let updated = {
-                let e = self.step_graph_exec.as_ref().unwrap();
-                unsafe { graph_exec_update(e, graph) }
-            };
-            if !updated {
-                self.step_graph_exec = None;
-                match unsafe { graph_instantiate(graph) } {
-                    Some(e) => self.step_graph_exec = Some(e),
-                    None => launch_ok = false,
-                }
+        if fast {
+            // FAST PATH: replay the persistent exec. The async uploads above (hidden
+            // + d_pos) are ordered BEFORE the launch on self.stream, so NO pre-launch
+            // sync is needed — and there is NO re-capture and NO exec_update (the two
+            // per-token costs that made the old whole-step graph regress −34%).
+            let e = self.step_graph_exec.as_ref().unwrap();
+            if !unsafe { graph_launch(e, &self.stream) } {
+                return false;
             }
         } else {
+            // CAPTURE PATH (first token / key change): the pre-capture uploads must
+            // complete before capture begins, then capture the whole-step `*_dpos`
+            // chain ONCE, instantiate, and cache it + the key for every later token.
+            if !stream_sync(&self.stream) {
+                return false;
+            }
+            // Shared activation-slab ptrs (offset-0 hidden carries the residual
+            // across layers; the chain overwrites the rest per layer).
+            let (o_hidden, o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
+                0,
+                d_model,
+                2 * d_model,
+                2 * d_model + d_q,
+                2 * d_model + d_q + d_kv,
+                2 * d_model + d_q + 2 * d_kv,
+                2 * d_model + 2 * d_q + 2 * d_kv,
+                3 * d_model + 2 * d_q + 2 * d_kv,
+            );
+            let ffn_base = 4 * d_model + 2 * d_q + 2 * d_kv;
+            let (o_gate, o_up, o_act) = (ffn_base, ffn_base + d_ff, ffn_base + 2 * d_ff);
+            let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
+                let a = self.attn_act.as_ref().unwrap();
+                (
+                    a.f32_ptr_at(o_hidden),
+                    a.f32_ptr_at(o_hnorm),
+                    a.f32_ptr_at(o_q),
+                    a.f32_ptr_at(o_k),
+                    a.f32_ptr_at(o_v),
+                    a.f32_ptr_at(o_attn),
+                    a.f32_ptr_at(o_o),
+                    a.f32_ptr_at(o_hn2),
+                    a.f32_ptr_at(o_gate),
+                    a.f32_ptr_at(o_up),
+                    a.f32_ptr_at(o_act),
+                )
+            };
+            // Per-layer norm + mirror ptrs (copied out as raw ptrs → no borrow held
+            // across the capture loop's `&mut self` calls).
+            type LayerPtrs = (
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+            );
+            let layer_ptrs: Vec<LayerPtrs> = (0..n_layers)
+                .map(|i| {
+                    let base = i * norm_floats;
+                    let n = self.attn_norms.as_ref().unwrap();
+                    (
+                        n.f32_ptr_at(base + no_attn),
+                        n.f32_ptr_at(base + no_post),
+                        n.f32_ptr_at(base + no_qn),
+                        n.f32_ptr_at(base + no_kn),
+                        n.f32_ptr_at(base + no_if),
+                        self.attn_k_mirror[i].as_ref().unwrap().ptr as *mut f32,
+                        self.attn_v_mirror[i].as_ref().unwrap().ptr as *mut f32,
+                    )
+                })
+                .collect();
+            let d_pos_ptr = self.d_pos_ptr();
+
+            // ================= BEGIN CAPTURE (one for the whole step) =============
+            if !graph_begin_capture(&self.stream) {
+                return false;
+            }
+            let mut chain_ok = true;
+            for (i, l) in layers.iter().enumerate() {
+                let (pan, ppn, pqn, pkn, pif, km_base, vm_base) = layer_ptrs[i];
+                chain_ok = chain_ok
+                    && unsafe {
+                        self.issue_layer_chain_dpos(
+                            ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act, pan, ppn,
+                            pqn, pkn, pif, km_base, vm_base, d_pos_ptr, l.wq, l.wk, l.wv, l.wo,
+                            l.dense_ffn, l.q_norm.is_some(), l.k_norm.is_some(), n_heads,
+                            n_kv_heads, head_dim, d_model, d_q, d_kv, d_ff, max_ctx, l.window,
+                            l.softcap, rms_eps,
+                        )
+                    };
+            }
+            // ================= END CAPTURE (always) ==============================
+            let graph = graph_end_capture(&self.stream);
+            let Some(graph) = graph else {
+                return false;
+            };
+            if !chain_ok {
+                unsafe { graph_destroy(graph) };
+                return false;
+            }
+            // Instantiate a FRESH exec (drop any stale one first — NO exec_update,
+            // which is what regressed). Cache it + the key for the fast path.
+            self.step_graph_exec = None;
+            self.step_graph_key = None;
             match unsafe { graph_instantiate(graph) } {
                 Some(e) => self.step_graph_exec = Some(e),
-                None => launch_ok = false,
+                None => {
+                    unsafe { graph_destroy(graph) };
+                    return false;
+                }
             }
-        }
-        unsafe { graph_destroy(graph) };
-        if !launch_ok {
-            return false;
-        }
-        {
+            unsafe { graph_destroy(graph) };
+            self.step_graph_key = Some(key);
             let e = self.step_graph_exec.as_ref().unwrap();
             if !unsafe { graph_launch(e, &self.stream) } {
                 return false;
@@ -8728,6 +8899,168 @@ impl CudaMatvecCache {
                     )
                     .is_ok()
                 }
+            };
+        // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) };
+        chain_ok = chain_ok
+            && unsafe {
+                add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_ok()
+            };
+        // 8b. Optional dense SwiGLU FFN, device-resident (ffn_out reuses `po`).
+        if let Some((wg, wu, wd, _)) = dense_ffn {
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model)
+                };
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model)
+                };
+            chain_ok = chain_ok
+                && unsafe { silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_ok() };
+            chain_ok = chain_ok
+                && unsafe { self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) };
+            chain_ok = chain_ok && unsafe { add_f32(&self.stream, ph, po, d_model).is_ok() };
+        }
+        chain_ok
+    }
+
+    /// Device-pos variant of [`Self::issue_layer_chain`] for the PERSISTENT
+    /// capture-once step graph: identical chain, but RoPE / KV-scatter /
+    /// flash-decode read the absolute position from the device buffer `d_pos`
+    /// instead of a host-baked `pos`, so the captured nodes are STATIC across
+    /// tokens (only `d_pos`'s CONTENTS change). F32-KV ONLY — the caller declines
+    /// the step graph when the mirror is f16. The one structural difference from
+    /// the scalar chain: the decode KV-scatter is ONE `kv_scatter_rows_f32_dpos`
+    /// kernel each (n_new=1) rather than the per-head `memcpy_d2d_async` loop (a
+    /// memcpy node's dst can't be read from a device position — it must be a
+    /// kernel). Numerically identical to `issue_layer_chain` at `d_pos[0] == pos`.
+    ///
+    /// SAFETY: as `issue_layer_chain`, plus `d_pos` is a live 1-int device buffer
+    /// on `self.stream` holding a value `< max_ctx`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn issue_layer_chain_dpos(
+        &mut self,
+        ph: *mut f32,
+        phn: *mut f32,
+        pq: *mut f32,
+        pk: *mut f32,
+        pv: *mut f32,
+        pat: *mut f32,
+        po: *mut f32,
+        phn2: *mut f32,
+        p_gate: *mut f32,
+        p_up: *mut f32,
+        p_act: *mut f32,
+        pan: *mut f32,
+        ppn: *mut f32,
+        pqn: *mut f32,
+        pkn: *mut f32,
+        pif: *mut f32,
+        km_base: *mut f32,
+        vm_base: *mut f32,
+        d_pos: *const c_int,
+        wq: (CudaPackedKind, usize, &[u8]),
+        wk: (CudaPackedKind, usize, &[u8]),
+        wv: (CudaPackedKind, usize, &[u8]),
+        wo: (CudaPackedKind, usize, &[u8]),
+        dense_ffn: Option<(
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            usize,
+        )>,
+        has_q_norm: bool,
+        has_k_norm: bool,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        d_q: usize,
+        d_kv: usize,
+        d_ff: usize,
+        max_ctx: usize,
+        window: i32,
+        softcap: f32,
+        rms_eps: f32,
+    ) -> bool {
+        let mut chain_ok = true;
+        // 1. attn RMSNorm.
+        chain_ok = chain_ok
+            && unsafe { rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_ok() };
+        // 2. q/k/v projections (device-I/O; weights pre-warmed so no upload).
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) };
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) };
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) };
+        // 3. Qwen3 qk-head-norm (in place, device).
+        if has_q_norm {
+            chain_ok = chain_ok
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_ok()
+                };
+        }
+        if has_k_norm {
+            chain_ok = chain_ok
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_ok()
+                };
+        }
+        // 4. RoPE (both device, in place) at the device position d_pos[0].
+        chain_ok = chain_ok
+            && unsafe { rope_f32_dpos(&self.stream, pq, n_heads, head_dim, d_pos, pif).is_ok() };
+        chain_ok = chain_ok
+            && unsafe { rope_f32_dpos(&self.stream, pk, n_kv_heads, head_dim, d_pos, pif).is_ok() };
+        // 5. Scatter the post-RoPE K / plain V into the F32 KV mirror at d_pos[0] —
+        //    ONE device kernel each (n_new=1), reading the column from d_pos so the
+        //    captured node is static (a per-head memcpy's dst can't be device-read).
+        chain_ok = chain_ok
+            && unsafe {
+                kv_scatter_rows_f32_dpos(
+                    &self.stream,
+                    km_base,
+                    pk,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    d_pos,
+                )
+                .is_ok()
+            };
+        chain_ok = chain_ok
+            && unsafe {
+                kv_scatter_rows_f32_dpos(
+                    &self.stream,
+                    vm_base,
+                    pv,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    d_pos,
+                )
+                .is_ok()
+            };
+        // 6. Flash decode over [0, d_pos[0]+1) against the mirror → attn_out.
+        chain_ok = chain_ok
+            && unsafe {
+                flash_attn_decode_f32_dpos(
+                    &self.stream,
+                    pq,
+                    km_base as *const f32,
+                    vm_base as *const f32,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    d_pos,
+                    window,
+                    softcap,
+                )
+                .is_ok()
             };
         // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
         chain_ok = chain_ok
