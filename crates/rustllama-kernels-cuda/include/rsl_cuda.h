@@ -76,6 +76,11 @@ int rsl_cuda_memcpy_d2h_async(rsl_cuda_stream *s, void *dst_host,
                               const void *src_dev, unsigned long long n_bytes);
 int rsl_cuda_memcpy_d2d_async(rsl_cuda_stream *s, void *dst_dev,
                               const void *src_dev, unsigned long long n_bytes);
+int rsl_cuda_memcpy_d2h_2d_async(rsl_cuda_stream *s, void *dst_host,
+                                 unsigned long long dpitch, const void *src_dev,
+                                 unsigned long long spitch,
+                                 unsigned long long width_bytes,
+                                 unsigned long long height);
 int rsl_cuda_stream_sync(rsl_cuda_stream *s);
 int rsl_cuda_graph_begin_capture(rsl_cuda_stream *s);
 int rsl_cuda_graph_end_capture(rsl_cuda_stream *s, void **out_graph);

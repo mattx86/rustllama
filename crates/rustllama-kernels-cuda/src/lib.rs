@@ -187,6 +187,15 @@ extern "C" {
         src_dev: *const c_void,
         n_bytes: u64,
     ) -> c_int;
+    fn rsl_cuda_memcpy_d2h_2d_async(
+        s: *mut RslCudaStreamRaw,
+        dst_host: *mut c_void,
+        dpitch: u64,
+        src_dev: *const c_void,
+        spitch: u64,
+        width_bytes: u64,
+        height: u64,
+    ) -> c_int;
     // PP-0 multi-GPU transport: enable P2P + cross-device peer copy.
     fn rsl_cuda_enable_peer_access(accessing_dev: c_int, peer_dev: c_int) -> c_int;
     fn rsl_cuda_memcpy_peer(
@@ -4870,6 +4879,50 @@ impl RawDevBuf {
         };
         rc == 0
     }
+    /// ASYNC strided (2-D) D2H drain: `height` rows of `width_bytes`, this buffer's
+    /// source rows strided by `src_pitch` bytes from `src_byte_offset`, into host
+    /// `dst` whose rows are strided by `dst_pitch` bytes from `dst_byte_offset`. ONE
+    /// call replaces a per-row `download_at_async` loop — used by the whole-step
+    /// graph to coalesce the head-strided KV-mirror write-back (`n_kv_heads` per-head
+    /// copies → 1) (T2). Bounds-checks the last row's end on both sides. Returns
+    /// false on a bad range / launch failure.
+    #[allow(clippy::too_many_arguments)]
+    fn download_2d_at_async(
+        &self,
+        src_byte_offset: usize,
+        src_pitch: usize,
+        dst: &mut [u8],
+        dst_byte_offset: usize,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+    ) -> bool {
+        if height == 0 || width_bytes == 0 {
+            return true;
+        }
+        // The last row must end within both allocations.
+        let src_end = src_byte_offset + (height - 1) * src_pitch + width_bytes;
+        let dst_end = dst_byte_offset + (height - 1) * dst_pitch + width_bytes;
+        if src_end > self.cap_bytes || dst_end > dst.len() {
+            return false;
+        }
+        // SAFETY: both ranges validated above; raw ptrs avoid holding a slice borrow
+        // across the FFI call.
+        let src = unsafe { (self.ptr as *const u8).add(src_byte_offset) as *const c_void };
+        let dptr = unsafe { dst.as_mut_ptr().add(dst_byte_offset) as *mut c_void };
+        let rc = unsafe {
+            rsl_cuda_memcpy_d2h_2d_async(
+                self.raw_stream,
+                dptr,
+                dst_pitch as u64,
+                src,
+                src_pitch as u64,
+                width_bytes as u64,
+                height as u64,
+            )
+        };
+        rc == 0
+    }
 }
 
 impl Drop for RawDevBuf {
@@ -8755,35 +8808,40 @@ impl CudaMatvecCache {
                 self.attn_valid_len[i] = pos as u32 + 1;
             }
         }
-        // DEFERRED D2H (after the single sync): this token's K/V for each layer
-        // read FROM ITS MIRROR (the shared slab holds only the last layer's) into
-        // the host KV cache at `[pos]`, head-major; plus the final hidden once.
+        // DEFERRED D2H (after the single sync): this token's K/V for each layer,
+        // drained FROM ITS MIRROR (the shared act slab holds only the last layer's)
+        // into the host KV cache at `[pos]`, head-major; plus the final hidden once.
+        // The mirror AND the host cache share the head-major layout
+        // ([h*max_ctx + pos]*head_dim), so ONE strided 2-D copy per layer per K/V
+        // coalesces what was `n_kv_heads` per-head copies — 28*8*2=448 → 28*2=56
+        // copies/token on this model. The per-head loop was the whole-step graph's
+        // dominant per-token cost (nsys: ~55% of API time was cudaMemcpyAsync). The
+        // mirror is F32 here (the f16 branch declines this whole fn above), so a row
+        // is `head_dim*4` bytes with a `max_ctx*head_dim*4`-byte head stride.
+        let row_bytes = head_dim * 4; // one head's [pos] row
+        let head_pitch = max_ctx * head_dim * 4; // byte stride between heads
+        let row0_off = pos * head_dim * 4; // head 0's [pos] row
         for i in 0..n_layers {
-            for h in 0..n_kv_heads {
-                let off = (h * max_ctx + pos) * head_dim;
-                let kb: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        k_caches[i][off..off + head_dim].as_mut_ptr() as *mut u8,
-                        head_dim * 4,
-                    )
-                };
-                let vb: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        v_caches[i][off..off + head_dim].as_mut_ptr() as *mut u8,
-                        head_dim * 4,
-                    )
-                };
-                let km_ok = self.attn_k_mirror[i]
-                    .as_ref()
-                    .unwrap()
-                    .download_at_async(off * 4, kb);
-                let vm_ok = self.attn_v_mirror[i]
-                    .as_ref()
-                    .unwrap()
-                    .download_at_async(off * 4, vb);
-                if !km_ok || !vm_ok {
-                    return false;
-                }
+            let kb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    k_caches[i].as_mut_ptr() as *mut u8,
+                    k_caches[i].len() * 4,
+                )
+            };
+            let vb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    v_caches[i].as_mut_ptr() as *mut u8,
+                    v_caches[i].len() * 4,
+                )
+            };
+            let km_ok = self.attn_k_mirror[i].as_ref().unwrap().download_2d_at_async(
+                row0_off, head_pitch, kb, row0_off, head_pitch, row_bytes, n_kv_heads,
+            );
+            let vm_ok = self.attn_v_mirror[i].as_ref().unwrap().download_2d_at_async(
+                row0_off, head_pitch, vb, row0_off, head_pitch, row_bytes, n_kv_heads,
+            );
+            if !km_ok || !vm_ok {
+                return false;
             }
         }
         {

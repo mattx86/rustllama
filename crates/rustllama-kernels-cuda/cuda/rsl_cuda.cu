@@ -658,6 +658,25 @@ extern "C" int rsl_cuda_memcpy_d2d_async(rsl_cuda_stream *s, void *dst_dev,
                ? 0
                : -1;
 }
+// ASYNC 2-D (strided) D2H copy: `height` rows of `width_bytes` each, source rows
+// strided by `spitch` bytes (dst by `dpitch`). ONE call coalesces a head-strided
+// KV-mirror drain (n_kv_heads rows at `[pos]`, `max_ctx`-strided) that would
+// otherwise be `n_kv_heads` separate per-head `d2h_async` copies — the whole-step
+// graph's per-token write-back (T2). Non-synchronizing; pair with a stream sync.
+extern "C" int rsl_cuda_memcpy_d2h_2d_async(rsl_cuda_stream *s, void *dst_host,
+                                            unsigned long long dpitch,
+                                            const void *src_dev,
+                                            unsigned long long spitch,
+                                            unsigned long long width_bytes,
+                                            unsigned long long height) {
+    if (!s) return -1;
+    cudaSetDevice(s->device);
+    return cudaMemcpy2DAsync(dst_host, (size_t)dpitch, src_dev, (size_t)spitch,
+                             (size_t)width_bytes, (size_t)height,
+                             cudaMemcpyDeviceToHost, s->stream) == cudaSuccess
+               ? 0
+               : -1;
+}
 
 // ============================================================
 // Multi-GPU PP/TP transport (PP-0): cross-GPU peer access + peer copy. The
