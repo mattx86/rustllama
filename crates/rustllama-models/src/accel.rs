@@ -12159,6 +12159,10 @@ pub fn try_prefill_step_cuda_graph_f32(
         q4k_w8a8_tc_enabled(),
         q4k_gemm_f32_enabled(),
     );
+    // And the FP16 tensor-core flash-attn selection — WITHOUT this the captured chain
+    // would fall back to the ~2.7x-slower scalar flash while the eager block uses TC,
+    // which alone made the graph a net prefill REGRESSION in the first on-pod A/B.
+    g.set_prefill_flash_tc(prefill_flash_tc_enabled());
     let ok = unsafe {
         g.prefill_step_graph_f32(
             layers,

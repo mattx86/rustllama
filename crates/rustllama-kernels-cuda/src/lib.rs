@@ -9759,26 +9759,54 @@ impl CudaMatvecCache {
                 .is_ok()
             };
         // 6. Multi-query flash-prefill: n_new causal queries over the mirror
-        //    [0, kv_len_base+n_new) → attn_out (device). Scalar f32 (the prefill graph
-        //    is f32-mirror only; the TC path's f16 mirror is declined by the caller).
+        //    [0, kv_len_base+n_new) → attn_out (device). Use the FP16 tensor-core
+        //    flash where the verdict enabled it (`set_prefill_flash_tc`) AND head_dim
+        //    is 16-aligned — IDENTICAL to the eager prefill block, which is ~2.7x
+        //    faster than scalar on-device (the whole point of the step graph is to NOT
+        //    regress the eager block's compute). The mirror is F32 here (the prefill
+        //    graph declines an f16 mirror), so the TC kernel reads it as f32 via the
+        //    `kv_f16 = self.kv_mirror_f16 (= false)` flag. Both kernels are stream-only
+        //    launches (capture-safe; any first-call lazy alloc is warmed by the
+        //    pre-capture warm-up pass).
+        let use_flash_tc = self.prefill_flash_tc && head_dim % 16 == 0;
         chain_ok = chain_ok
             && unsafe {
-                flash_attn_prefill_f32(
-                    &self.stream,
-                    pq,
-                    km_base as *const f32,
-                    vm_base as *const f32,
-                    pat,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_ctx,
-                    kv_len_base,
-                    n_new,
-                    window,
-                    softcap,
-                )
-                .is_ok()
+                if use_flash_tc {
+                    flash_attn_prefill_f16_tc(
+                        &self.stream,
+                        pq,
+                        km_base as *const f32,
+                        vm_base as *const f32,
+                        pat,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len_base,
+                        n_new,
+                        window,
+                        softcap,
+                        self.kv_mirror_f16,
+                    )
+                    .is_ok()
+                } else {
+                    flash_attn_prefill_f32(
+                        &self.stream,
+                        pq,
+                        km_base as *const f32,
+                        vm_base as *const f32,
+                        pat,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len_base,
+                        n_new,
+                        window,
+                        softcap,
+                    )
+                    .is_ok()
+                }
             };
         // 7. o projection (batched device-I/O); 8. fused residual + post-attn RMSNorm.
         chain_ok = chain_ok
