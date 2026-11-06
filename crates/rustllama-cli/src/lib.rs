@@ -652,6 +652,17 @@ pub enum Command {
         /// correctness.
         #[arg(long)]
         dev_prefill: bool,
+        /// Whole-prefill-step CUDA graph A/B (the orchestration twin of
+        /// `--dev-prefill`): with the device-resident block forced ON, measure
+        /// PREFILL tok/s with the captured whole-step cudaGraph off then on, and
+        /// persist the PERF verdict `prefill:step_cuda_graph_faster` that — ANDed
+        /// with the `prefill:step_cuda_graph` parity verdict from
+        /// `--validate-kernels` — auto-enables the graph only where its one-launch /
+        /// one-sync replay beats the eager per-layer chain on this device+model. The
+        /// graph is bit-exact to that chain, so this gates on speed, not correctness.
+        /// CUDA-only; a `tune --all` sub-stage (Stage 1e-c).
+        #[arg(long)]
+        prefill_step_graph: bool,
         /// Whole-mirror f16 KV decode A/B (ships the built-but-inert
         /// `attn:kv_mirror_f16` mirror where it wins): force the shared attention KV
         /// mirror f32 then f16 on one f32-KV-storage load, measure DECODE tok/s, and
@@ -1458,6 +1469,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             validate_kernels,
             dev_attn,
             dev_prefill,
+            prefill_step_graph,
             kv_mirror_f16,
             moe_vram_margin,
             cacheblend,
@@ -1558,6 +1570,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 validate_kernels,
                 dev_attn,
                 dev_prefill,
+                prefill_step_graph,
                 kv_mirror_f16,
                 moe_vram_margin,
                 cacheblend,
@@ -1578,7 +1591,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --ssm-prefill-chunked / --parallel-matvec-crossover / \
                      --matvec-min-flops / --ssm-chunk / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
-                     --dev-attn / --dev-prefill / --moe-vram-margin / --cacheblend / \
+                     --dev-attn / --dev-prefill / --prefill-step-graph / \
+                     --moe-vram-margin / --cacheblend / \
                      --batching / --all \
                      are exclusive; pick at most one"
                 );
@@ -1784,6 +1798,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if dev_prefill {
                 return cmd_tune_dev_prefill(&config_path, model, repeats);
+            }
+            if prefill_step_graph {
+                return cmd_tune_prefill_step_graph(&config_path, model, repeats);
             }
             if kv_mirror_f16 {
                 return cmd_tune_kv_mirror_f16(&config_path, model, repeats);
@@ -6988,6 +7005,76 @@ fn cmd_tune_dev_prefill(
     Ok(())
 }
 
+/// `tune --prefill-step-graph` (Stage 1e-c): A/B the whole-prefill-step CUDA graph
+/// against the eager device-resident prefill block and persist the PERF verdict
+/// `prefill:step_cuda_graph_faster`, which — ANDed with the `prefill:step_cuda_graph`
+/// parity verdict from `--validate-kernels` — `accel::prefill_step_cuda_graph_enabled`
+/// reads to auto-enable the graph only where its one-launch/one-sync replay beats the
+/// eager per-layer chain on this device+model. The graph is bit-exact to that chain
+/// (coherence + `doctor --cuda-parity` establish correctness), so this gates on
+/// SPEED. CUDA-only; on any other host `measure_prefill_step_graph` returns BEFORE
+/// loading, so it prints "skipped" and persists nothing — the path stays force-gated
+/// only (fail-closed). Before this stage existed the perf verdict had NO writer, so
+/// the step graph was reachable only via `RUSTLLAMA_PREFILL_STEP_GRAPH=1`.
+fn cmd_tune_prefill_step_graph(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_prefill_step_graph, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+
+    println!("rustllama tune --prefill-step-graph");
+    println!("  model = {}", model_path.display());
+
+    // The graph is F32-KV-only; `measure_prefill_step_graph` forces f32 regardless.
+    // Pass the config's layout / flash / placement so the A/B runs on the same prefill
+    // path serve would. CUDA-only + the engagement check happen inside the measurement
+    // (it returns BEFORE loading off CUDA).
+    let m_cfg = MeasurementConfig {
+        kv_dtype: rustllama_engine::KvDtype::F32,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+
+    let report = measure_prefill_step_graph(&model_path, &m_cfg, repeats.max(3) as usize)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    match (report.capable, report.off_tps, report.on_tps, report.faster) {
+        (true, Some(off), Some(on), Some(fast)) => {
+            println!("  eager block (OFF) = {off:.1} tok/s");
+            println!(
+                "  step graph  (ON)  = {on:.1} tok/s  ({:+.1}%)",
+                (on / off - 1.0) * 100.0
+            );
+            println!(
+                "  → {}",
+                if fast {
+                    "ENABLE — the whole-prefill-step graph is faster here"
+                } else {
+                    "keep eager block — the step graph is not a win here"
+                }
+            );
+            let name = rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER;
+            persist_kernel_verdicts(&[(name.to_string(), fast)])?;
+            println!("  → persisted verdict {name} = {fast}");
+        }
+        _ => {
+            println!(
+                "  → not measured ({}); verdict left unset — path stays off",
+                report
+                    .error
+                    .unwrap_or_else(|| "prefill step graph did not engage".into())
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `tune --kv-mirror-f16` (Stage 1e-b): A/B the whole-mirror f16 KV decode win and
 /// persist the PERF verdict `attn:kv_mirror_f16_faster`, which — ANDed with the
 /// correctness verdict `attn:kv_mirror_f16` — `accel::kv_mirror_f16_enabled` reads to
@@ -9346,6 +9433,17 @@ fn cmd_tune_all(
                 && t.kernel_build_id == build_id
         })
         .unwrap_or(false);
+    // Whole-prefill-step CUDA graph PERF verdict — build-stamped like dev-prefill
+    // (a kernel-source edit changes the graph's cost), its own (CUDA-only) key.
+    // `Some(false)` (measured no-win) still counts as decided, so use `contains_key`.
+    let has_prefill_step_graph = cached
+        .as_ref()
+        .map(|t| {
+            t.kernel_verdicts
+                .contains_key(rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER)
+                && t.kernel_build_id == build_id
+        })
+        .unwrap_or(false);
     // Whole-mirror f16 KV perf verdict — build-stamped like dev-prefill, its own
     // (CUDA-only) key. `Some(false)` (measured no-win) still counts as decided, so
     // use `contains_key` (re-runs on a kernel-source/build change via build_id).
@@ -9517,6 +9615,30 @@ fn cmd_tune_all(
             &[],
         ) {
             tracing::warn!(error = %e, "stage 1e (dev-prefill perf) failed; continuing");
+        }
+    }
+
+    println!();
+    println!(
+        "Stage 1e-c/10: prefill-step-graph perf (A/B the whole-step CUDA graph vs the eager block, f32 KV)"
+    );
+    println!("--------");
+    if skip(has_prefill_step_graph) {
+        println!("(skipped: prefill-step-graph verdict already cached for this build)");
+    } else {
+        // Device-vs-device f32-KV prefill A/B; CUDA-only (the stage self-skips off
+        // CUDA). Runs AFTER Stage 1e — the graph only engages with the device-resident
+        // block active, and after Stage 1c banks `prefill:step_cuda_graph` (the parity
+        // half of its serve gate). Subprocess like the others for a clean GPU context.
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--prefill-step-graph",
+            thorough,
+            "1e-c (prefill-step-graph perf)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 1e-c (prefill-step-graph perf) failed; continuing");
         }
     }
 

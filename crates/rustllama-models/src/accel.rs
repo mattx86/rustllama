@@ -11395,7 +11395,7 @@ pub(crate) fn note_prefill_step_hit() {
 /// [`rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH`] (correctness, banked by
 /// `doctor --cuda-parity`/`--validate-kernels`) AND
 /// [`rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER`] (perf, banked by the
-/// `tune --dev-prefill` step arm). Fail-closed: OFF unless BOTH passed — so until
+/// `tune --prefill-step-graph` arm, Stage 1e-c). Fail-closed: OFF unless BOTH passed — so until
 /// the perf arm banks `_FASTER` this is OFF and prefill is byte-identical to today.
 /// `RUSTLLAMA_PREFILL_STEP_GRAPH=1` force-enables it (for the on-pod A/B before the
 /// verdict is banked); `=0` force-disables. The caller
@@ -11422,8 +11422,8 @@ pub fn prefill_step_cuda_graph_enabled() -> bool {
             // instantiate overhead can exceed the per-launch/sync saving unless the
             // exec is REUSED across same-shape chunks/requests. Require BOTH the
             // correctness AND the measured-faster verdicts; unmeasured ⇒ OFF (the
-            // eager prefill block runs). `tune --dev-prefill` banks `_FASTER` per
-            // (system,model) where it actually wins.
+            // eager prefill block runs). `tune --prefill-step-graph` (Stage 1e-c)
+            // banks `_FASTER` per (system,model) where it actually wins.
             _ => {
                 kernel_verdict(rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH)
                     && kernel_verdict(rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER)

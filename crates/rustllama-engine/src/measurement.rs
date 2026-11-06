@@ -4556,6 +4556,185 @@ pub fn measure_dev_prefill(
     })
 }
 
+/// Outcome of [`measure_prefill_step_graph`] — the whole-prefill-step CUDA graph A/B.
+///
+/// The BASELINE (`off_tps`) is the eager device-resident prefill block — already the
+/// production prefill path where `prefill:dev_resident_block` won — and `on_tps`
+/// wraps that SAME per-layer attention+FFN chain in ONE captured-and-replayed
+/// cudaGraph (one launch + one sync for the whole chunk vs a synchronous per-layer
+/// K/V download each of 28 layers). So unlike `measure_dev_prefill` (host vs device),
+/// this A/Bs device vs device: it isolates the orchestration collapse alone.
+/// `faster` is `Some(true)` where the graph beat the eager block by the clear-win
+/// margin. `capable` is true only when the graph actually ENGAGED on the loaded model
+/// (CUDA + dense + f32 KV + supported shape + a first-chunk prefill); off CUDA or if
+/// the graph never fires, nothing is persisted and the path stays force-gated only
+/// (fail-closed). The graph is bit-exact to the eager chain (coherence +
+/// `doctor --cuda-parity prefill:step_cuda_graph` cos=1.0 establish correctness), so
+/// this gates on SPEED, feeding the SECOND half of the step-graph serve gate — the
+/// first half (`prefill:step_cuda_graph`) is the parity verdict.
+#[derive(Debug, Clone, Default)]
+pub struct PrefillStepGraphReport {
+    pub capable: bool,
+    pub off_tps: Option<f64>,
+    pub on_tps: Option<f64>,
+    pub faster: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// A/B the whole-prefill-step CUDA graph against the eager device-resident prefill
+/// block by measured PREFILL tok/s, forcing f32 KV (the graph is F32-KV-only). Loads
+/// the model ONCE; both the dev-prefill block and the step graph are process-global
+/// force toggles, so both arms run on the single loaded engine with NO reload. The
+/// step graph only wraps the device-resident block (its serve gate is ANDed with
+/// `dev_prefill_enabled`), so BOTH arms force the dev-prefill block ON and the A/B
+/// toggles only the graph: OFF = eager chain, ON = the captured graph over the same
+/// chain. CUDA-only — off CUDA the graph never runs, so we skip before loading
+/// (`capable=false`, no verdict). Uses the same representative 512-token prompt as
+/// `measure_dev_prefill` and times ONLY prefill; the untimed warmup absorbs the
+/// graph's one-time capture + warm-up pass so the timed runs measure steady-state
+/// replay (the exec is cached across prefix-cache clears, reset only on model load).
+pub fn measure_prefill_step_graph(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    repeats: usize,
+) -> Result<PrefillStepGraphReport, String> {
+    // The step graph dispatches only on an active NVIDIA GPU (its gate is ANDed with
+    // `cuda_active()` and `dev_prefill_enabled()`), so there is nothing to measure on
+    // any other host — return BEFORE loading the model.
+    if !rustllama_models::accel::cuda_active() {
+        return Ok(PrefillStepGraphReport {
+            capable: false,
+            error: Some("no active NVIDIA GPU — prefill step graph cannot run".into()),
+            ..Default::default()
+        });
+    }
+    // The graph's win is the orchestration collapse (one launch + one sync vs a
+    // per-layer synchronous K/V download) layered ON TOP of the already-fast eager
+    // block, so it is a smaller delta than host-vs-device. Require ON to beat OFF by
+    // >2% to clear same-process back-to-back noise. Fail-closed otherwise.
+    const WIN_MARGIN: f64 = 1.02;
+    const PROMPT_TOKENS: u32 = 512;
+    const DECODE_TOKENS: u32 = 1;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        KvDtype::F32,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // One untimed warmup + `repeats` timed runs → median PREFILL tok/s. The prefix
+    // cache is cleared each run so every run re-prefills the whole prompt at
+    // kv_len_base==0 (where the step graph engages); the captured exec survives the
+    // clear, so the warmup pays capture and the timed runs replay.
+    let bench = |cpu: &mut ContiguousEngine| -> (Option<f64>, Option<String>) {
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+            return (None, Some(format!("warmup failed: {e}")));
+        }
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            match cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+                Ok(_) => {
+                    let stats = cpu.last_request_stats();
+                    if stats.prefill_ms > 0.0 && stats.tokens_prefilled > 0 {
+                        runs.push((stats.tokens_prefilled as f64) / (stats.prefill_ms / 1000.0));
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // The step graph lives on the batched prefill path, same as the eager block, so
+    // force batched prefill on for the A/B (restore after). Both arms force the
+    // device-resident block ON — the graph only wraps it; the A/B toggles the graph.
+    let prev_batched = rustllama_models::accel::prefill_batched();
+    rustllama_models::accel::set_prefill_batched(true);
+    rustllama_models::accel::set_dev_prefill_force(Some(true));
+
+    // OFF arm: eager device-resident block, step graph forced off.
+    rustllama_models::accel::set_prefill_step_force(Some(false));
+    let (off_tps, off_err) = bench(&mut cpu);
+
+    // ON arm: the captured step graph, with the hit counter snapshotted to confirm
+    // it fired.
+    let hits_before = rustllama_models::accel::prefill_step_hits();
+    rustllama_models::accel::set_prefill_step_force(Some(true));
+    let (on_tps, on_err) = bench(&mut cpu);
+    let engaged = rustllama_models::accel::prefill_step_hits() > hits_before;
+
+    // Clear the overrides → serve-time config/verdicts decide from here.
+    rustllama_models::accel::set_prefill_step_force(None);
+    rustllama_models::accel::set_dev_prefill_force(None);
+    rustllama_models::accel::set_prefill_batched(prev_batched);
+
+    if !engaged {
+        return Ok(PrefillStepGraphReport {
+            capable: false,
+            off_tps,
+            on_tps,
+            faster: None,
+            error: Some(
+                "prefill step graph never engaged (non-dense, quant KV, unsupported \
+                 shape, or not a first-chunk prefill) — verdict left unset"
+                    .into(),
+            ),
+        });
+    }
+
+    let faster = match (off_tps, on_tps) {
+        (Some(off), Some(on)) if off > 0.0 => Some(on > off * WIN_MARGIN),
+        _ => None,
+    };
+    Ok(PrefillStepGraphReport {
+        capable: true,
+        off_tps,
+        on_tps,
+        faster,
+        error: off_err.or(on_err),
+    })
+}
+
 /// Outcome of [`measure_kv_mirror_f16`] — the whole-mirror f16 KV decode A/B.
 ///
 /// `capable` is `true` only when the f16 mirror actually engaged on the loaded
