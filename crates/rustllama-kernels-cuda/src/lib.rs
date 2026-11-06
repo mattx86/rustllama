@@ -3677,7 +3677,14 @@ pub unsafe fn rope_f32_dpos(
     d_pos: *const c_int,
     inv_freq: *const f32,
 ) -> Result<(), CudaError> {
-    let rc = rsl_cuda_rope_f32_dpos(stream.raw(), qk, n_heads as c_int, head_dim as c_int, d_pos, inv_freq);
+    let rc = rsl_cuda_rope_f32_dpos(
+        stream.raw(),
+        qk,
+        n_heads as c_int,
+        head_dim as c_int,
+        d_pos,
+        inv_freq,
+    );
     if rc == 0 {
         Ok(())
     } else {
@@ -5499,6 +5506,22 @@ pub struct CudaMatvecCache {
     // softcap are MODEL-CONSTANT, so a model reload (`clear`) or a mirror-ctx
     // realloc — both of which also drop `step_graph_exec` — invalidates the graph.
     step_graph_key: Option<(usize, usize, usize, usize, bool, bool)>,
+    // T-prefill-graph: the ONE cached executable graph for the WHOLE-PREFILL-STEP
+    // graph — every dense layer's BATCHED (n_new>1) attention+FFN chain captured
+    // into a single graph and replayed with one launch + one `stream_sync` for the
+    // whole chunk (vs the eager prefill block's synchronous per-layer K/V D2H). The
+    // prefill graph bakes `kv_len_base` into its scatter/flash launch args, so it is
+    // captured ONLY at `kv_len_base==0` (the first chunk) and keyed on the chunk
+    // shape so repeated same-size first-chunk prefills (the bench + short-prompt
+    // serving) REPLAY it. `None` until the first prefill-step-graph launch;
+    // invalidated alongside `step_graph_exec` on a mirror-ctx change and on `clear`.
+    prefill_step_graph_exec: Option<CudaGraphExecHandle>,
+    // Topology key the `prefill_step_graph_exec` was captured under; a mismatch
+    // re-captures. Fields = everything the capture bakes that is NOT the shared
+    // resident mirror: (n_layers, n_new, d_ff, has_q_norm, has_k_norm). `kv_len_base`
+    // is always 0 for a captured prefill graph (the engage precondition), so it is
+    // not in the key.
+    prefill_step_graph_key: Option<(usize, usize, usize, bool, bool)>,
     // 1-int device buffer holding the current decode position, read by the `*_dpos`
     // kernels inside the captured step graph so the captured nodes are STATIC (only
     // the buffer's contents change per token). Allocated ONCE with a stable pointer
@@ -5659,6 +5682,8 @@ impl CudaMatvecCache {
             attn_graph_exec: Vec::new(),
             step_graph_exec: None,
             step_graph_key: None,
+            prefill_step_graph_exec: None,
+            prefill_step_graph_key: None,
             d_pos: None,
             q4k_w4a8: false,
             prefill_q8_0_w8a8_tc: false,
@@ -5864,6 +5889,9 @@ impl CudaMatvecCache {
         // T2: drop the cached whole-step graph exec for the same reason.
         self.step_graph_exec = None;
         self.step_graph_key = None;
+        // T-prefill-graph: drop the cached whole-prefill-step graph exec likewise.
+        self.prefill_step_graph_exec = None;
+        self.prefill_step_graph_key = None;
         // The d_pos buffer is model-independent (a single int), but drop it so a
         // device reset leaves no dangling buffer; it's re-allocated on next use.
         self.d_pos = None;
@@ -7991,6 +8019,496 @@ impl CudaMatvecCache {
         consume_error_count() == 0
     }
 
+    /// T-prefill-graph: WHOLE-PREFILL-STEP CUDA graph — the batched (n_new>1) twin
+    /// of [`Self::decode_step_graph_f32`]. Captures EVERY dense layer's batched
+    /// attention+FFN prefill chain into ONE `cudaGraph` and replays it with ONE
+    /// launch + ONE `stream_sync` for the whole chunk, vs the eager prefill block's
+    /// one launch + a SYNCHRONOUS per-layer K/V D2H drain PER layer + a per-layer
+    /// norm re-upload. The captured kernels are IDENTICAL to the eager
+    /// [`Self::prefill_attn_block_f32`] (via [`Self::issue_prefill_layer_chain`]), so
+    /// correctness tracks that block (graded by `doctor --cuda-parity
+    /// prefill:step_cuda_graph`); this only changes HOW the ops are submitted.
+    ///
+    /// `hidden` is `[n_new * d_model]` (in: the chunk's embeds; out: the post-stack
+    /// residual stream, drained to host after the launch). `k_caches`/`v_caches` are
+    /// the per-layer host head-major KV slabs; this fn drains all n_new new columns
+    /// of each layer FROM ITS DEVICE MIRROR (one strided 2-D async copy per layer per
+    /// K/V after the single sync), so the caller's per-layer host scatter is skipped.
+    ///
+    /// ENGAGE RULES (fail-closed `false` → caller runs the eager prefill block): f32
+    /// mirror only (no f16 / streaming); `kv_len_base == 0` ONLY (the scatter/flash
+    /// launch args bake it, so a captured graph is valid for the first chunk — later
+    /// chunks keep the eager path); every layer dense with uniform d_ff + matching
+    /// norm shapes. The exec is cached + keyed on `(n_layers, n_new, d_ff, q_norm,
+    /// k_norm)`; a same-key call REPLAYS it (only the per-call hidden H2D differs), a
+    /// mismatch RE-captures. FAIL-SOFT: any capture/launch/sync error destroys the
+    /// partial graph, drains the latch, and returns `false` with host buffers
+    /// untouched and the mirror `valid_len` un-advanced, so the caller re-runs the
+    /// proven eager block with no corruption.
+    ///
+    /// # Safety
+    /// Weight/norm slices in `layers` outlive the call; `hidden` and the KV caches
+    /// are sized to the dims; the cache owns the stream + mirrors.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prefill_step_graph_f32(
+        &mut self,
+        layers: &[StepLayer],
+        hidden: &mut [f32],
+        k_caches: &mut [&mut [f32]],
+        v_caches: &mut [&mut [f32]],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        kv_len_base: usize,
+        n_new: usize,
+        max_ctx: usize,
+        rms_eps: f32,
+    ) -> bool {
+        // W4A8 self-syncs ⇒ uncapturable; force the bit-exact f32 batched matvec for
+        // the whole step (same invariant as the decode step graph).
+        self.q4k_w4a8 = false;
+        // F32-mirror ONLY + no AirLLM streaming (a bounded window evicts weights
+        // between calls, dangling the captured weight pointers). Both fail-closed.
+        if self.kv_mirror_f16 || self.stream_window_layers > 0 {
+            return false;
+        }
+        // Engage ONLY at the first chunk: the scatter/flash launch args bake
+        // kv_len_base, so a captured graph is valid for base 0 (empty-mirror start,
+        // no history seed). Later chunks keep the eager prefill block.
+        if kv_len_base != 0 {
+            return false;
+        }
+        let n_layers = layers.len();
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        if n_layers == 0
+            || n_new == 0
+            || hidden.len() != n_new * d_model
+            || head_dim % 2 != 0
+            || n_kv_heads == 0
+            || n_heads % n_kv_heads != 0
+            || kv_len_base + n_new > max_ctx
+            || k_caches.len() != n_layers
+            || v_caches.len() != n_layers
+        {
+            return false;
+        }
+        // Every layer must be dense with a uniform d_ff + matching norm shapes.
+        let Some((_, _, _, d_ff)) = layers[0].dense_ffn else {
+            return false;
+        };
+        for l in layers {
+            if l.dense_ffn.map(|f| f.3) != Some(d_ff)
+                || l.attn_norm.len() != d_model
+                || l.post_norm.len() != d_model
+                || l.inv_freq.len() != head_dim / 2
+            {
+                return false;
+            }
+        }
+        // Mirror ctx: rebuild mirrors + BOTH exec caches on a shape change.
+        let mctx = (
+            n_layers as u32,
+            d_kv as u32,
+            max_ctx as u32,
+            self.kv_mirror_f16 as u32,
+        );
+        if self.attn_mirror_ctx != mctx {
+            self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_valid_len = vec![0; n_layers];
+            self.attn_mirror_ctx = mctx;
+            self.attn_graph_exec = (0..n_layers).map(|_| None).collect();
+            self.step_graph_exec = None;
+            self.step_graph_key = None;
+            self.prefill_step_graph_exec = None;
+            self.prefill_step_graph_key = None;
+        }
+        if self.attn_valid_len.len() != n_layers {
+            self.attn_valid_len = vec![0; n_layers];
+        }
+
+        // Slab sizing: ONE activation slab (×n_new, shared across layers — offset-0
+        // hidden carries the residual stream) + an N-LAYER norm slab (each layer's
+        // norms resident before capture) + a per-layer F32 KV mirror.
+        let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * n_new * 4;
+        let norm_floats = 2 * d_model + 2 * head_dim + head_dim / 2;
+        let mir_bytes = d_kv * max_ctx * 4;
+        if !Self::ensure_scratch(&mut self.prefill_act, &self.stream, act_bytes)
+            || !Self::ensure_scratch(
+                &mut self.attn_norms,
+                &self.stream,
+                norm_floats * n_layers * 4,
+            )
+        {
+            return false;
+        }
+        for i in 0..n_layers {
+            if !Self::ensure_scratch(&mut self.attn_k_mirror[i], &self.stream, mir_bytes)
+                || !Self::ensure_scratch(&mut self.attn_v_mirror[i], &self.stream, mir_bytes)
+            {
+                return false;
+            }
+        }
+
+        let fb = |s: &[f32]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+        };
+        // Persistence key: the topology the captured graph bakes. kv_len_base is
+        // always 0 here (engage precondition), so it is not keyed.
+        let key = (
+            n_layers,
+            n_new,
+            d_ff,
+            layers[0].q_norm.is_some(),
+            layers[0].k_norm.is_some(),
+        );
+        let fast =
+            self.prefill_step_graph_exec.is_some() && self.prefill_step_graph_key == Some(key);
+
+        // Weight pre-warm (BEFORE any capture): all 7 weights for every layer. A
+        // cached weight is a cheap no-op (so ~free on the fast path); never captured.
+        for l in layers {
+            if !self.ensure_weight(l.wq.1, l.wq.2)
+                || !self.ensure_weight(l.wk.1, l.wk.2)
+                || !self.ensure_weight(l.wv.1, l.wv.2)
+                || !self.ensure_weight(l.wo.1, l.wo.2)
+            {
+                return false;
+            }
+            if let Some((wg, wu, wd, _)) = l.dense_ffn {
+                if !self.ensure_weight(wg.1, wg.2)
+                    || !self.ensure_weight(wu.1, wu.2)
+                    || !self.ensure_weight(wd.1, wd.2)
+                {
+                    return false;
+                }
+            }
+        }
+        // Norm-slab offsets (within each layer's `norm_floats` block).
+        let (no_attn, no_post, no_qn, no_kn, no_if) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + head_dim,
+            2 * d_model + 2 * head_dim,
+        );
+        // Activation-slab offsets (each region is n_new rows wide).
+        let o_hidden = 0;
+        // H2D hidden (BOTH paths — it changes every call) into the shared slab.
+        if !self
+            .prefill_act
+            .as_mut()
+            .unwrap()
+            .upload_at_async(o_hidden * 4, fb(hidden))
+        {
+            return false;
+        }
+        // Layer norms are CALL-INVARIANT: upload them only on the CAPTURE path (first
+        // call / key change); on the fast path they persist in the slab.
+        if !fast {
+            let nrm = self.attn_norms.as_mut().unwrap();
+            for (i, l) in layers.iter().enumerate() {
+                let base = i * norm_floats;
+                if !nrm.upload_at_async((base + no_attn) * 4, fb(l.attn_norm))
+                    || !nrm.upload_at_async((base + no_post) * 4, fb(l.post_norm))
+                    || !nrm.upload_at_async((base + no_if) * 4, fb(l.inv_freq))
+                {
+                    return false;
+                }
+                if let Some(w) = l.q_norm {
+                    if !nrm.upload_at_async((base + no_qn) * 4, fb(w)) {
+                        return false;
+                    }
+                }
+                if let Some(w) = l.k_norm {
+                    if !nrm.upload_at_async((base + no_kn) * 4, fb(w)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if fast {
+            // FAST PATH: replay the persistent exec. The async hidden upload above is
+            // ordered BEFORE the launch on self.stream, so NO pre-launch sync is
+            // needed, and there is NO re-capture / exec_update.
+            let e = self.prefill_step_graph_exec.as_ref().unwrap();
+            if !unsafe { graph_launch(e, &self.stream) } {
+                return false;
+            }
+        } else {
+            // CAPTURE PATH: the pre-capture uploads must complete before capture, then
+            // capture the whole-prefill-step chain ONCE, instantiate, cache it + key.
+            if !stream_sync(&self.stream) {
+                return false;
+            }
+            // Shared activation-slab offsets (×n_new).
+            let (o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
+                n_new * d_model,
+                2 * n_new * d_model,
+                n_new * (2 * d_model + d_q),
+                n_new * (2 * d_model + d_q + d_kv),
+                n_new * (2 * d_model + d_q + 2 * d_kv),
+                n_new * (2 * d_model + 2 * d_q + 2 * d_kv),
+                n_new * (3 * d_model + 2 * d_q + 2 * d_kv),
+            );
+            let ffn_base = n_new * (4 * d_model + 2 * d_q + 2 * d_kv);
+            let (o_gate, o_up, o_act) = (
+                ffn_base,
+                ffn_base + n_new * d_ff,
+                ffn_base + 2 * n_new * d_ff,
+            );
+            let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
+                let a = self.prefill_act.as_ref().unwrap();
+                (
+                    a.f32_ptr_at(o_hidden),
+                    a.f32_ptr_at(o_hnorm),
+                    a.f32_ptr_at(o_q),
+                    a.f32_ptr_at(o_k),
+                    a.f32_ptr_at(o_v),
+                    a.f32_ptr_at(o_attn),
+                    a.f32_ptr_at(o_o),
+                    a.f32_ptr_at(o_hn2),
+                    a.f32_ptr_at(o_gate),
+                    a.f32_ptr_at(o_up),
+                    a.f32_ptr_at(o_act),
+                )
+            };
+            type LayerPtrs = (
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+                *mut f32,
+            );
+            let layer_ptrs: Vec<LayerPtrs> = (0..n_layers)
+                .map(|i| {
+                    let base = i * norm_floats;
+                    let n = self.attn_norms.as_ref().unwrap();
+                    (
+                        n.f32_ptr_at(base + no_attn),
+                        n.f32_ptr_at(base + no_post),
+                        n.f32_ptr_at(base + no_qn),
+                        n.f32_ptr_at(base + no_kn),
+                        n.f32_ptr_at(base + no_if),
+                        self.attn_k_mirror[i].as_ref().unwrap().ptr as *mut f32,
+                        self.attn_v_mirror[i].as_ref().unwrap().ptr as *mut f32,
+                    )
+                })
+                .collect();
+
+            // WARM-UP PASS (eager, NOT captured): issue the whole-step chain once so
+            // every LAZY device allocation the active GEMM / flash path makes on a
+            // cold cache — the int8-activation scratch (`rsl_q4k_ensure_scratch`
+            // cudaMalloc, grown to this n_new's size) and the per-weight int4 repack
+            // (`q8_0_repack_kernel`'s cudaMalloc, cached by weight ptr) — happens
+            // HERE, outside capture. A `cudaMalloc` inside a capture region is illegal
+            // and would invalidate the graph; after this pass + sync those caches are
+            // warm, so the captured pass issues only pure kernels (the quant kernel +
+            // the TC/f32 GEMM find the scratch big enough and the repack cached). The
+            // warm-up overwrites slab offset-0 `hidden` with the residual, so re-upload
+            // the embeds before capture. Paid once per key (rare — only on a change).
+            {
+                let mut warm_ok = true;
+                for (i, l) in layers.iter().enumerate() {
+                    let (pan, ppn, pqn, pkn, pif, km_base, vm_base) = layer_ptrs[i];
+                    warm_ok = warm_ok
+                        && unsafe {
+                            self.issue_prefill_layer_chain(
+                                ph,
+                                phn,
+                                pq,
+                                pk,
+                                pv,
+                                pat,
+                                po,
+                                phn2,
+                                p_gate,
+                                p_up,
+                                p_act,
+                                pan,
+                                ppn,
+                                pqn,
+                                pkn,
+                                pif,
+                                km_base,
+                                vm_base,
+                                l.wq,
+                                l.wk,
+                                l.wv,
+                                l.wo,
+                                l.dense_ffn,
+                                l.q_norm.is_some(),
+                                l.k_norm.is_some(),
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                d_model,
+                                d_q,
+                                d_kv,
+                                d_ff,
+                                kv_len_base,
+                                n_new,
+                                max_ctx,
+                                l.window,
+                                l.softcap,
+                                rms_eps,
+                            )
+                        };
+                }
+                if !warm_ok || !stream_sync(&self.stream) || consume_error_count() != 0 {
+                    return false;
+                }
+                // Re-upload the embeds the warm-up clobbered (norms persist in-slab).
+                if !self
+                    .prefill_act
+                    .as_mut()
+                    .unwrap()
+                    .upload_at_async(o_hidden * 4, fb(hidden))
+                    || !stream_sync(&self.stream)
+                {
+                    return false;
+                }
+            }
+
+            // ================= BEGIN CAPTURE (one for the whole prefill step) =======
+            if !graph_begin_capture(&self.stream) {
+                return false;
+            }
+            let mut chain_ok = true;
+            for (i, l) in layers.iter().enumerate() {
+                let (pan, ppn, pqn, pkn, pif, km_base, vm_base) = layer_ptrs[i];
+                chain_ok = chain_ok
+                    && unsafe {
+                        self.issue_prefill_layer_chain(
+                            ph,
+                            phn,
+                            pq,
+                            pk,
+                            pv,
+                            pat,
+                            po,
+                            phn2,
+                            p_gate,
+                            p_up,
+                            p_act,
+                            pan,
+                            ppn,
+                            pqn,
+                            pkn,
+                            pif,
+                            km_base,
+                            vm_base,
+                            l.wq,
+                            l.wk,
+                            l.wv,
+                            l.wo,
+                            l.dense_ffn,
+                            l.q_norm.is_some(),
+                            l.k_norm.is_some(),
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            d_model,
+                            d_q,
+                            d_kv,
+                            d_ff,
+                            kv_len_base,
+                            n_new,
+                            max_ctx,
+                            l.window,
+                            l.softcap,
+                            rms_eps,
+                        )
+                    };
+            }
+            // ================= END CAPTURE (always) =================================
+            let graph = graph_end_capture(&self.stream);
+            let Some(graph) = graph else {
+                return false;
+            };
+            if !chain_ok {
+                unsafe { graph_destroy(graph) };
+                return false;
+            }
+            self.prefill_step_graph_exec = None;
+            self.prefill_step_graph_key = None;
+            match unsafe { graph_instantiate(graph) } {
+                Some(e) => self.prefill_step_graph_exec = Some(e),
+                None => {
+                    unsafe { graph_destroy(graph) };
+                    return false;
+                }
+            }
+            unsafe { graph_destroy(graph) };
+            self.prefill_step_graph_key = Some(key);
+            let e = self.prefill_step_graph_exec.as_ref().unwrap();
+            if !unsafe { graph_launch(e, &self.stream) } {
+                return false;
+            }
+        }
+        if !stream_sync(&self.stream) {
+            return false;
+        }
+        if consume_error_count() != 0 {
+            return false;
+        }
+
+        // Each layer's mirror now holds this chunk's K/V in [0, n_new).
+        for i in 0..n_layers {
+            self.attn_valid_len[i] = (kv_len_base + n_new) as u32;
+        }
+        // DEFERRED D2H (after the single sync): each layer's n_new new K/V columns,
+        // drained FROM ITS MIRROR into the host head-major KV cache. The mirror and
+        // the host cache share the layout ([h*max_ctx + col]*head_dim), and columns
+        // [0,n_new) for a head are CONTIGUOUS, so ONE strided 2-D copy per layer per
+        // K/V (n_kv_heads rows of n_new*head_dim*4 bytes, head-strided) coalesces what
+        // the eager block did as n_new synchronous per-layer downloads.
+        let row_bytes = n_new * head_dim * 4; // columns [0,n_new) for one head
+        let head_pitch = max_ctx * head_dim * 4; // byte stride between heads
+        for i in 0..n_layers {
+            let kb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    k_caches[i].as_mut_ptr() as *mut u8,
+                    k_caches[i].len() * 4,
+                )
+            };
+            let vb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    v_caches[i].as_mut_ptr() as *mut u8,
+                    v_caches[i].len() * 4,
+                )
+            };
+            let km_ok = self.attn_k_mirror[i]
+                .as_ref()
+                .unwrap()
+                .download_2d_at_async(0, head_pitch, kb, 0, head_pitch, row_bytes, n_kv_heads);
+            let vm_ok = self.attn_v_mirror[i]
+                .as_ref()
+                .unwrap()
+                .download_2d_at_async(0, head_pitch, vb, 0, head_pitch, row_bytes, n_kv_heads);
+            if !km_ok || !vm_ok {
+                return false;
+            }
+        }
+        // The post-stack hidden (all n_new rows) back to host for the final norm / LM head.
+        {
+            let a = self.prefill_act.as_ref().unwrap();
+            let hb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, n_new * d_model * 4)
+            };
+            if !a.download_at_async(0, hb) {
+                return false;
+            }
+        }
+        // The deferred async drains complete before the host reads them.
+        stream_sync(&self.stream) && consume_error_count() == 0
+    }
+
     /// CUDA-graph-captured twin of [`Self::decode_attn_block_f32`] (Feature 1b).
     /// Runs the IDENTICAL device chain + math, but captures the whole chain into
     /// a `cudaGraph` and replays it as ONE launch, collapsing the per-op CPU
@@ -8760,11 +9278,43 @@ impl CudaMatvecCache {
                 chain_ok = chain_ok
                     && unsafe {
                         self.issue_layer_chain_dpos(
-                            ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act, pan, ppn,
-                            pqn, pkn, pif, km_base, vm_base, d_pos_ptr, l.wq, l.wk, l.wv, l.wo,
-                            l.dense_ffn, l.q_norm.is_some(), l.k_norm.is_some(), n_heads,
-                            n_kv_heads, head_dim, d_model, d_q, d_kv, d_ff, max_ctx, l.window,
-                            l.softcap, rms_eps,
+                            ph,
+                            phn,
+                            pq,
+                            pk,
+                            pv,
+                            pat,
+                            po,
+                            phn2,
+                            p_gate,
+                            p_up,
+                            p_act,
+                            pan,
+                            ppn,
+                            pqn,
+                            pkn,
+                            pif,
+                            km_base,
+                            vm_base,
+                            d_pos_ptr,
+                            l.wq,
+                            l.wk,
+                            l.wv,
+                            l.wo,
+                            l.dense_ffn,
+                            l.q_norm.is_some(),
+                            l.k_norm.is_some(),
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            d_model,
+                            d_q,
+                            d_kv,
+                            d_ff,
+                            max_ctx,
+                            l.window,
+                            l.softcap,
+                            rms_eps,
                         )
                     };
             }
@@ -8834,12 +9384,18 @@ impl CudaMatvecCache {
                     v_caches[i].len() * 4,
                 )
             };
-            let km_ok = self.attn_k_mirror[i].as_ref().unwrap().download_2d_at_async(
-                row0_off, head_pitch, kb, row0_off, head_pitch, row_bytes, n_kv_heads,
-            );
-            let vm_ok = self.attn_v_mirror[i].as_ref().unwrap().download_2d_at_async(
-                row0_off, head_pitch, vb, row0_off, head_pitch, row_bytes, n_kv_heads,
-            );
+            let km_ok = self.attn_k_mirror[i]
+                .as_ref()
+                .unwrap()
+                .download_2d_at_async(
+                    row0_off, head_pitch, kb, row0_off, head_pitch, row_bytes, n_kv_heads,
+                );
+            let vm_ok = self.attn_v_mirror[i]
+                .as_ref()
+                .unwrap()
+                .download_2d_at_async(
+                    row0_off, head_pitch, vb, row0_off, head_pitch, row_bytes, n_kv_heads,
+                );
             if !km_ok || !vm_ok {
                 return false;
             }
@@ -9050,6 +9606,213 @@ impl CudaMatvecCache {
             chain_ok = chain_ok
                 && unsafe { self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) };
             chain_ok = chain_ok && unsafe { add_f32(&self.stream, ph, po, d_model).is_ok() };
+        }
+        chain_ok
+    }
+
+    /// T-prefill-graph: issue ONE dense layer's BATCHED (n_new>1) prefill chain
+    /// (attn RMSNorm → q/k/v batched GEMMs → optional Qwen3 qk-head-norm → batched
+    /// RoPE → KV-mirror scatter of all n_new rows → multi-query flash-prefill →
+    /// o-proj GEMM → fused residual+post-norm → optional dense SwiGLU FFN) onto
+    /// `self.stream`, using device pointers the caller already copied out of the
+    /// slabs/mirror (so no slab borrow is held across the `&mut self` matvec calls).
+    /// The batched twin of [`Self::issue_layer_chain`]: IDENTICAL kernels to the
+    /// eager prefill block [`Self::prefill_attn_block_f32`], issued with NO sync and
+    /// NO host round-trip (the per-layer K/V D2H the eager block does is DEFERRED by
+    /// the caller to one batched drain after the single post-launch sync), so the
+    /// whole prefill step is capturable into ONE graph. F32-mirror ONLY (the caller
+    /// declines an f16 mirror for the prefill graph, matching the decode step graph).
+    /// Accumulates success with `&&` so a failed op skips the rest without
+    /// early-returning (the caller must still reach `end_capture`).
+    ///
+    /// SAFETY: every pointer must be a live device buffer on `self.stream` sized for
+    /// the (n_heads,n_kv_heads,head_dim,d_model,d_ff)×n_new dims, and
+    /// `kv_len_base + n_new <= max_ctx`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn issue_prefill_layer_chain(
+        &mut self,
+        ph: *mut f32,
+        phn: *mut f32,
+        pq: *mut f32,
+        pk: *mut f32,
+        pv: *mut f32,
+        pat: *mut f32,
+        po: *mut f32,
+        phn2: *mut f32,
+        p_gate: *mut f32,
+        p_up: *mut f32,
+        p_act: *mut f32,
+        pan: *mut f32,
+        ppn: *mut f32,
+        pqn: *mut f32,
+        pkn: *mut f32,
+        pif: *mut f32,
+        km_base: *mut f32,
+        vm_base: *mut f32,
+        wq: (CudaPackedKind, usize, &[u8]),
+        wk: (CudaPackedKind, usize, &[u8]),
+        wv: (CudaPackedKind, usize, &[u8]),
+        wo: (CudaPackedKind, usize, &[u8]),
+        dense_ffn: Option<(
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            usize,
+        )>,
+        has_q_norm: bool,
+        has_k_norm: bool,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        d_q: usize,
+        d_kv: usize,
+        d_ff: usize,
+        kv_len_base: usize,
+        n_new: usize,
+        max_ctx: usize,
+        window: i32,
+        softcap: f32,
+        rms_eps: f32,
+    ) -> bool {
+        let mut chain_ok = true;
+        // 1. attn RMSNorm over all n_new rows.
+        chain_ok = chain_ok
+            && unsafe {
+                rmsnorm_dev_f32(&self.stream, ph, pan, phn, n_new, d_model, rms_eps).is_ok()
+            };
+        // 2. q/k/v batched projections (device-I/O; weights pre-warmed so no upload).
+        chain_ok = chain_ok
+            && unsafe {
+                self.matvec_packed_batched_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model, n_new)
+            };
+        chain_ok = chain_ok
+            && unsafe {
+                self.matvec_packed_batched_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model, n_new)
+            };
+        chain_ok = chain_ok
+            && unsafe {
+                self.matvec_packed_batched_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model, n_new)
+            };
+        // 3. Qwen3 qk-head-norm over all n_new*heads rows (shared weight), in place.
+        if has_q_norm {
+            chain_ok = chain_ok
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pq, pqn, n_new * n_heads, head_dim, rms_eps)
+                        .is_ok()
+                };
+        }
+        if has_k_norm {
+            chain_ok = chain_ok
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pk, pkn, n_new * n_kv_heads, head_dim, rms_eps)
+                        .is_ok()
+                };
+        }
+        // 4. batched RoPE (each of the n_new rows at absolute kv_len_base+row).
+        chain_ok = chain_ok
+            && unsafe {
+                rope_rows_f32(&self.stream, pq, n_new, n_heads, head_dim, kv_len_base, pif).is_ok()
+            };
+        chain_ok = chain_ok
+            && unsafe {
+                rope_rows_f32(
+                    &self.stream,
+                    pk,
+                    n_new,
+                    n_kv_heads,
+                    head_dim,
+                    kv_len_base,
+                    pif,
+                )
+                .is_ok()
+            };
+        // 5. Scatter the post-RoPE K / plain V for all n_new rows into the F32 KV
+        //    mirror at [kv_len_base, kv_len_base+n_new), via async DEVICE→DEVICE
+        //    kernels (NO host round-trip — that is what makes the chain capturable).
+        chain_ok = chain_ok
+            && unsafe {
+                kv_scatter_rows_f32(
+                    &self.stream,
+                    km_base,
+                    pk,
+                    n_new,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                )
+                .is_ok()
+            };
+        chain_ok = chain_ok
+            && unsafe {
+                kv_scatter_rows_f32(
+                    &self.stream,
+                    vm_base,
+                    pv,
+                    n_new,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                )
+                .is_ok()
+            };
+        // 6. Multi-query flash-prefill: n_new causal queries over the mirror
+        //    [0, kv_len_base+n_new) → attn_out (device). Scalar f32 (the prefill graph
+        //    is f32-mirror only; the TC path's f16 mirror is declined by the caller).
+        chain_ok = chain_ok
+            && unsafe {
+                flash_attn_prefill_f32(
+                    &self.stream,
+                    pq,
+                    km_base as *const f32,
+                    vm_base as *const f32,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window,
+                    softcap,
+                )
+                .is_ok()
+            };
+        // 7. o projection (batched device-I/O); 8. fused residual + post-attn RMSNorm.
+        chain_ok = chain_ok
+            && unsafe {
+                self.matvec_packed_batched_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q, n_new)
+            };
+        chain_ok = chain_ok
+            && unsafe {
+                add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, n_new, d_model, rms_eps).is_ok()
+            };
+        // 8b. Optional dense SwiGLU FFN, device-resident (ffn_out reuses `po`).
+        if let Some((wg, wu, wd, _)) = dense_ffn {
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_batched_dev_io(
+                        wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model, n_new,
+                    )
+                };
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_batched_dev_io(
+                        wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model, n_new,
+                    )
+                };
+            chain_ok = chain_ok
+                && unsafe { silu_mul_f32(&self.stream, p_gate, p_up, p_act, n_new * d_ff).is_ok() };
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_batched_dev_io(
+                        wd.0, wd.1, wd.2, p_act, po, d_model, d_ff, n_new,
+                    )
+                };
+            chain_ok =
+                chain_ok && unsafe { add_f32(&self.stream, ph, po, n_new * d_model).is_ok() };
         }
         chain_ok
     }

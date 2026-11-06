@@ -11362,6 +11362,77 @@ pub fn dev_step_hits() -> u64 {
     DEV_STEP_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// T-prefill-graph: WHOLE-PREFILL-STEP graph perf A/B force (the `tune
+/// --dev-prefill` step arm drives it): -1 = unset (env/verdict decide), 0 = force
+/// OFF, 1 = force ON. NOT a user knob.
+static PREFILL_STEP_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+/// Count of prefill CHUNKS the whole-prefill-step graph actually ran (engagement
+/// check for the A/B — a forced-ON arm that never engaged is meaningless).
+static DEV_PREFILL_STEP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Force the whole-prefill-step graph on/off for the current process (the `tune
+/// --dev-prefill` step A/B only). `None` clears → env/verdict decide.
+pub fn set_prefill_step_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    PREFILL_STEP_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many prefill chunks ran through the whole-prefill-step graph (process-global).
+pub fn prefill_step_hits() -> u64 {
+    DEV_PREFILL_STEP_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one whole-prefill-step-graph chunk (called by `try_prefill_step_cuda_graph_f32`).
+pub(crate) fn note_prefill_step_hit() {
+    DEV_PREFILL_STEP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// T-prefill-graph WHOLE-PREFILL-STEP graph gate — perf-gated on BOTH
+/// [`rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH`] (correctness, banked by
+/// `doctor --cuda-parity`/`--validate-kernels`) AND
+/// [`rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER`] (perf, banked by the
+/// `tune --dev-prefill` step arm). Fail-closed: OFF unless BOTH passed — so until
+/// the perf arm banks `_FASTER` this is OFF and prefill is byte-identical to today.
+/// `RUSTLLAMA_PREFILL_STEP_GRAPH=1` force-enables it (for the on-pod A/B before the
+/// verdict is banked); `=0` force-disables. The caller
+/// ([`try_prefill_step_cuda_graph_f32`]) AND's this with `cuda_active()` +
+/// `stream_window()==0`; any unmet precondition declines to the eager prefill block
+/// without corruption. OFF while speculating / under a multi-device pipeline split
+/// (same hazards as the decode step graph).
+pub fn prefill_step_cuda_graph_enabled() -> bool {
+    match PREFILL_STEP_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return !spec_active() && !pipeline_active(),
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let base = *ON.get_or_init(|| {
+        match std::env::var("RUSTLLAMA_PREFILL_STEP_GRAPH")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => true,
+            Some("0") => false,
+            // PERF-GATED: the prefill graph is replayed once per chunk (vs the decode
+            // step graph's hundreds of replays per token stream), so capture+
+            // instantiate overhead can exceed the per-launch/sync saving unless the
+            // exec is REUSED across same-shape chunks/requests. Require BOTH the
+            // correctness AND the measured-faster verdicts; unmeasured ⇒ OFF (the
+            // eager prefill block runs). `tune --dev-prefill` banks `_FASTER` per
+            // (system,model) where it actually wins.
+            _ => {
+                kernel_verdict(rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH)
+                    && kernel_verdict(rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER)
+            }
+        }
+    });
+    base && !spec_active() && !pipeline_active()
+}
+
 /// Count one whole-step-graph decode (called by `try_decode_step_cuda_graph_f32`).
 pub(crate) fn note_dev_step_hit() {
     DEV_STEP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12035,6 +12106,84 @@ pub fn try_decode_step_cuda_graph_f32(
                 "T2 whole-decode-step CUDA graph ENGAGED — all dense layers captured \
                  into ONE cudaGraph + replayed as ONE launch + ONE sync per token \
                  (verdict step:dev_resident_cuda_graph) (logged once)"
+            );
+        }
+    }
+    ok
+}
+
+/// T-prefill-graph: run the WHOLE PREFILL STEP (all dense layers of one chunk) via
+/// the captured prefill CUDA graph — `CudaMatvecCache::prefill_step_graph_f32`
+/// behind the gate. On success `hidden` holds the post-stack residual (all n_new
+/// rows, drained to host) and every layer's host head-major KV cache is populated
+/// (drained from the device mirror after the single launch), so the caller SKIPS
+/// its per-layer prefill loop entirely. Returns `false` (caller runs the eager
+/// per-layer prefill block / host path, buffers untouched) unless: the correctness
+/// + perf verdicts (or the force/env) are on, CUDA is active, not streaming,
+/// `kv_len_base == 0`, and every layer is dense + f32-KV-dispatchable. Fail-soft:
+/// any capture/launch error inside the method returns false with no corruption.
+#[allow(clippy::too_many_arguments)]
+pub fn try_prefill_step_cuda_graph_f32(
+    layers: &[ck::StepLayer],
+    hidden: &mut [f32],
+    k_caches: &mut [&mut [f32]],
+    v_caches: &mut [&mut [f32]],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    max_ctx: usize,
+    rms_eps: f32,
+) -> bool {
+    if !prefill_step_cuda_graph_enabled() || !cuda_active() || stream_window() != 0 {
+        return false;
+    }
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut g) = cache.lock() else {
+        return false;
+    };
+    // Respect the active shared-mirror dtype: if an f16 KV mirror is active (the
+    // decode path reads it as f16), the prefill graph DECLINES internally (it is
+    // f32-mirror only) and the eager prefill block — which handles f16 — runs, so
+    // the mirror dtype never mismatches what decode expects.
+    g.set_kv_mirror_f16(kv_mirror_f16_active(head_dim));
+    // Same batched device-I/O GEMM selection the eager prefill block makes, so the
+    // captured GEMMs take the per-model-verdict-selected path (W8A8-TC / f32).
+    g.set_prefill_gemm(
+        q8_0_w8a8_tc_enabled(),
+        q8_0_gemm_f32_enabled(),
+        q4k_w8a8_tc_enabled(),
+        q4k_gemm_f32_enabled(),
+    );
+    let ok = unsafe {
+        g.prefill_step_graph_f32(
+            layers,
+            hidden,
+            k_caches,
+            v_caches,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_model,
+            kv_len_base,
+            n_new,
+            max_ctx,
+            rms_eps,
+        )
+    };
+    if ok {
+        note_prefill_step_hit();
+        static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                "T-prefill-graph whole-PREFILL-step CUDA graph ENGAGED — all dense \
+                 layers' batched attention+FFN chain captured into ONE cudaGraph + \
+                 replayed as ONE launch + ONE sync for the chunk (verdict \
+                 prefill:step_cuda_graph) (logged once)"
             );
         }
     }

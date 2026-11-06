@@ -359,6 +359,32 @@ pub const VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH: &str = "step:dev_resident_cuda_g
 /// the correctness verdict, so an unmeasured / slower step graph is OFF (the
 /// per-layer path runs), and it re-enables only per (system,model) where it wins.
 pub const VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH_FASTER: &str = "step:dev_resident_cuda_graph_faster";
+/// T-prefill-graph: WHOLE-PREFILL-STEP CUDA graph — EVERY dense layer's batched
+/// attention+FFN prefill chain (n_new>1 tokens) captured into ONE `cudaGraph` and
+/// replayed with ONE launch + ONE `stream_sync` for the whole chunk, vs the eager
+/// device-resident prefill block's one launch + a SYNCHRONOUS per-layer K/V D2H
+/// drain PER layer. Removes `(n_layers-1)` syncs + the per-layer host round-trips +
+/// the per-layer norm re-uploads (uploaded once into an N-layer slab before
+/// capture). The captured kernels are the IDENTICAL batched ops the eager prefill
+/// block (`prefill_attn_block_f32`) issues, so it is correctness-anchored by
+/// [`VERDICT_PREFILL_DEV_RESIDENT_BLOCK`]; this is a PERF-only verdict graded by
+/// `doctor --cuda-parity prefill:step_cuda_graph` (stacks the SAME batched chain
+/// over N synthetic dense layers vs a CPU reference). Read by
+/// `accel::prefill_step_cuda_graph_enabled`; engages ONLY at `kv_len_base==0` (the
+/// first chunk; later chunks keep the eager path) so a varying-n_new workload never
+/// thrashes capture. Fail-closed OFF.
+pub const VERDICT_PREFILL_STEP_CUDA_GRAPH: &str = "prefill:step_cuda_graph";
+/// PERF gate for the whole-prefill-step graph — it must be measured FASTER than the
+/// eager device-resident prefill block before it engages. Mirrors
+/// [`VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH_FASTER`]: unlike decode (step replayed
+/// hundreds of times per token stream), a prefill graph is replayed once per chunk,
+/// so capture+instantiate overhead can exceed the per-launch/per-sync saving unless
+/// the exec is REUSED across same-shape chunks/requests (the single cached exec +
+/// `model bench`'s repeated fixed-size prefill both reuse it). Banked by the
+/// `tune --dev-prefill` step arm; `accel::prefill_step_cuda_graph_enabled` AND's it
+/// with the correctness verdict, so an unmeasured / slower graph is OFF (the eager
+/// prefill block runs), re-enabling only per (system,model) where it wins.
+pub const VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER: &str = "prefill:step_cuda_graph_faster";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror

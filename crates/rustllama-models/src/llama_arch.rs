@@ -17108,7 +17108,98 @@ impl LlamaModel {
         // before a host layer, on a block failure, or after the loop), mirroring
         // the decode `hidden_dev_resident` plumbing.
         let mut hidden_dev_resident = false;
-        for (layer_idx, block) in attn_views.iter().take(n_layers_used).enumerate() {
+
+        // T-prefill-graph — WHOLE-PREFILL-STEP CUDA graph: for a PURE-DENSE model on
+        // the FIRST chunk (kv_len_base==0) with all preconditions met and the
+        // prefill-step verdict (or `RUSTLLAMA_PREFILL_STEP_GRAPH`) on, capture EVERY
+        // layer's batched attention+FFN prefill chain into ONE cudaGraph and replay
+        // it with ONE launch + ONE sync for the whole chunk — vs the eager per-layer
+        // loop below (one launch + a SYNCHRONOUS per-layer K/V D2H PER layer). The
+        // captured kernels are the SAME batched ops the eager device-resident prefill
+        // block issues, so it's fail-soft + parity-probed on-device
+        // (`prefill:step_cuda_graph`). On success `hidden` (post-stack, all n_new
+        // rows) + every layer's F32 host KV cache are synced, and the per-layer loop
+        // is skipped (bound → 0); the final norm / LM head below runs unchanged.
+        let dev_softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+        let step_graph_ran = moe_cfg.is_none()
+            && self.weights.moe_blocks.is_none()
+            && !self.weights.is_hybrid()
+            && !self.weights.is_mla()
+            && self.yarn_mscale == 1.0
+            && !rope_interleaved_enabled()
+            && tree.is_none()
+            && kv_len_base == 0
+            && n_layers_used == attn_views.len()
+            && crate::accel::dev_prefill_enabled()
+            && crate::accel::cuda_active()
+            && crate::accel::stream_window() == 0
+            && crate::accel::prefill_step_cuda_graph_enabled()
+            && (0..n_layers_used)
+                .all(|i| kv.layer_cap(i) == max_ctx && matches!(kv.layers[i], KvLayer::F32 { .. }))
+            && {
+                let mut sls: Vec<rustllama_kernels_cuda::StepLayer> =
+                    Vec::with_capacity(n_layers_used);
+                let mut gathered = true;
+                for i in 0..n_layers_used {
+                    let b = &self.weights.blocks[i];
+                    if b.b_q().is_some() || b.b_k().is_some() || b.b_v().is_some() {
+                        gathered = false;
+                        break;
+                    }
+                    match crate::accel::make_step_layer(
+                        b.w_q(),
+                        b.w_k(),
+                        b.w_v(),
+                        b.w_o(),
+                        Some((&b.w_gate, &b.w_up, &b.w_down, d_ff)),
+                        b.attn_norm(),
+                        b.ffn_norm(),
+                        b.q_norm(),
+                        b.k_norm(),
+                        &self.rope_inv_freq,
+                        cfg.swa_window(i) as u32,
+                        dev_softcap,
+                    ) {
+                        Some(sl) => sls.push(sl),
+                        None => {
+                            gathered = false;
+                            break;
+                        }
+                    }
+                }
+                if !gathered {
+                    false
+                } else {
+                    let mut kc: Vec<&mut [f32]> = Vec::with_capacity(n_layers_used);
+                    let mut vc: Vec<&mut [f32]> = Vec::with_capacity(n_layers_used);
+                    for l in kv.layers.iter_mut().take(n_layers_used) {
+                        if let KvLayer::F32 { k, v } = l {
+                            kc.push(&mut k[..]);
+                            vc.push(&mut v[..]);
+                        }
+                    }
+                    crate::accel::try_prefill_step_cuda_graph_f32(
+                        &sls,
+                        &mut hidden,
+                        &mut kc,
+                        &mut vc,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        d,
+                        kv_len_base,
+                        n_new,
+                        max_ctx,
+                        cfg.rms_eps,
+                    )
+                }
+            };
+
+        for (layer_idx, block) in attn_views
+            .iter()
+            .take(if step_graph_ran { 0 } else { n_layers_used })
+            .enumerate()
+        {
             // Hybrid placement: tell the `try_*_usm_f32` dispatch
             // ladder which layer we're on. Helpers consult
             // `accel::gpu_active_for_current_layer()` (= layer_idx

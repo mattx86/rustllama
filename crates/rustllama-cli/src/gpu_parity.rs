@@ -8282,8 +8282,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 for (window, softcap) in dec_cases {
                     let mut cpu = vec![0f32; n_heads * head_dim];
                     k::gqa_attention_flash_decode_capped_windowed(
-                        &q, &kc, &vc, &mut cpu, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as usize, softcap,
+                        &q,
+                        &kc,
+                        &vc,
+                        &mut cpu,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: q/out f32 [n_heads*head_dim], k/v f32 [n_kv_heads*max_ctx*head_dim],
                     // partials [n_heads*n_splits*(head_dim+2)] f32, counter [n_heads] i32.
@@ -10309,6 +10318,291 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         &format!(
                             "cos={cos:.6} worst_abs={worst_abs:.5} tol_used={tol_frac:.3} \
                              ({N_LAYERS}L attn+ffn) fail@[{wi}] ref={:.4} gpu={:.4} abs={w_abs:.4} allowed={w_allowed:.4}",
+                            cpu[wi], gpu[wi]
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- T-prefill-graph: WHOLE-PREFILL-STEP CUDA-graph capture (ALL layers) ----
+    // Drives `prefill_step_graph_f32`, which captures EVERY dense layer's BATCHED
+    // (n_new>1) attention+FFN prefill chain into ONE cudaGraph replayed with ONE
+    // launch + ONE sync for the whole chunk (vs the eager prefill block's one launch
+    // + a SYNCHRONOUS per-layer K/V D2H PER layer). Grades correctness against a CPU
+    // reference that stacks the SAME batched chain over N synthetic dense layers with
+    // CAUSAL multi-query attention (query i attends [0,i]) — a layer-indexing /
+    // residual-threading / per-query-position bug surfaces as a MISCOMPUTE. Verdict
+    // `prefill:step_cuda_graph` (read by `accel::prefill_step_cuda_graph_enabled`).
+    // The fresh cache leaves the prefill-GEMM flags OFF, so the captured matvecs are
+    // the BIT-EXACT batched warp path (the lossy TC GEMM has its own verdict); this
+    // probe validates the graph ORCHESTRATION + chain math. WRITE-BLIND (no NVIDIA
+    // here) — validated on-device via `--cuda-parity`.
+    {
+        let name = rustllama_tuner::VERDICT_PREFILL_STEP_CUDA_GRAPH;
+        const HEAD_DIM: usize = 128;
+        const N_HEADS: usize = 8;
+        const N_KV: usize = 2;
+        const D_MODEL: usize = 1024;
+        const D_FF: usize = 256; // Q4_K `down` has k=D_FF → multiple of 256
+        const MAX_CTX: usize = 64;
+        const N_NEW: usize = 4; // >1 so batching + causal masking are exercised
+        const EPS: f32 = 1e-5;
+        const THETA: f32 = 10000.0;
+        const N_LAYERS: usize = 6; // >1 so cross-layer residual threading is exercised
+        let d_q = N_HEADS * HEAD_DIM;
+        let d_kv = N_KV * HEAD_DIM;
+        let half = HEAD_DIM / 2;
+
+        let layout = LAYOUTS
+            .iter()
+            .find(|l| l.name == "q4_k")
+            .expect("q4_k layout");
+        let cpu_mv = cpu_matvec_for("q4_k");
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|j| 1.0f32 / THETA.powf(2.0 * j as f32 / HEAD_DIM as f32))
+            .collect();
+
+        // Per-layer DISTINCT weights + norms (so a layer-index mixup surfaces).
+        struct Lw {
+            wq: Vec<u8>,
+            wk: Vec<u8>,
+            wv: Vec<u8>,
+            wo: Vec<u8>,
+            wg: Vec<u8>,
+            wu: Vec<u8>,
+            wd: Vec<u8>,
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+        }
+        let mut rng = XorShift(0x9A3B_17C5);
+        let mut lws: Vec<Lw> = Vec::with_capacity(N_LAYERS);
+        for l in 0..N_LAYERS {
+            let s = (l as u32).wrapping_mul(0x9E37_79B1).wrapping_add(1);
+            lws.push(Lw {
+                wq: gen_quant_bytes(layout, d_q, D_MODEL, 0x1A1A ^ s),
+                wk: gen_quant_bytes(layout, d_kv, D_MODEL, 0x2B2B ^ s),
+                wv: gen_quant_bytes(layout, d_kv, D_MODEL, 0x3C3C ^ s),
+                wo: gen_quant_bytes(layout, D_MODEL, d_q, 0x4D4D ^ s),
+                wg: gen_quant_bytes(layout, D_FF, D_MODEL, 0x5E5E ^ s),
+                wu: gen_quant_bytes(layout, D_FF, D_MODEL, 0x6F6F ^ s),
+                wd: gen_quant_bytes(layout, D_MODEL, D_FF, 0x7070 ^ s),
+                attn_norm: (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect(),
+                ffn_norm: (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect(),
+            });
+        }
+
+        // Per-token position-i RoPE (absolute pos == row index, kv_len_base==0).
+        let rope_at = |qk: &mut [f32], nh: usize, pos: usize| {
+            for hh in 0..nh {
+                let base = hh * HEAD_DIM;
+                for j in 0..half {
+                    let angle = pos as f32 * inv_freq[j];
+                    let (sn, cs) = angle.sin_cos();
+                    let x0 = qk[base + j];
+                    let x1 = qk[base + j + half];
+                    qk[base + j] = x0 * cs - x1 * sn;
+                    qk[base + j + half] = x0 * sn + x1 * cs;
+                }
+            }
+        };
+
+        // The chunk's embeds: N_NEW rows of D_MODEL (row-major [n_new, d_model]).
+        let hidden0: Vec<f32> = (0..N_NEW * D_MODEL).map(|_| rng.f32_pm(0.6)).collect();
+
+        // ---- CPU reference: stack N dense layers; hidden[n_new,d] threads forward,
+        //      each query attends causally over [0, i] within the chunk. ----
+        let mut hidden_cpu = hidden0.clone();
+        for lw in lws.iter() {
+            // Per-layer KV cache (head-major [N_KV, MAX_CTX, HEAD_DIM]); fill [0,N_NEW).
+            let mut rk = vec![0f32; N_KV * MAX_CTX * HEAD_DIM];
+            let mut rv = vec![0f32; N_KV * MAX_CTX * HEAD_DIM];
+            let mut q_rows = vec![0f32; N_NEW * d_q];
+            for i in 0..N_NEW {
+                let mut hnorm = vec![0f32; D_MODEL];
+                k::rmsnorm_f32_row(
+                    &hidden_cpu[i * D_MODEL..(i + 1) * D_MODEL],
+                    &lw.attn_norm,
+                    &mut hnorm,
+                    EPS,
+                );
+                let mut q_i = vec![0f32; d_q];
+                let mut k_i = vec![0f32; d_kv];
+                let mut v_i = vec![0f32; d_kv];
+                cpu_mv(&lw.wq, &hnorm, &mut q_i, d_q, D_MODEL);
+                cpu_mv(&lw.wk, &hnorm, &mut k_i, d_kv, D_MODEL);
+                cpu_mv(&lw.wv, &hnorm, &mut v_i, d_kv, D_MODEL);
+                rope_at(&mut q_i, N_HEADS, i);
+                rope_at(&mut k_i, N_KV, i);
+                for h in 0..N_KV {
+                    for dd in 0..HEAD_DIM {
+                        let idx = (h * MAX_CTX + i) * HEAD_DIM + dd;
+                        rk[idx] = k_i[h * HEAD_DIM + dd];
+                        rv[idx] = v_i[h * HEAD_DIM + dd];
+                    }
+                }
+                q_rows[i * d_q..(i + 1) * d_q].copy_from_slice(&q_i);
+            }
+            // Causal attention per query i over keys [0, i]; o-proj + residual.
+            for i in 0..N_NEW {
+                let mut attn = vec![0f32; d_q];
+                k::gqa_attention_one_step_capped_windowed(
+                    &q_rows[i * d_q..(i + 1) * d_q],
+                    &rk,
+                    &rv,
+                    &mut attn,
+                    N_HEADS,
+                    N_KV,
+                    HEAD_DIM,
+                    MAX_CTX,
+                    i + 1,
+                    0,
+                    0.0,
+                );
+                let mut o = vec![0f32; D_MODEL];
+                cpu_mv(&lw.wo, &attn, &mut o, D_MODEL, d_q);
+                for dd in 0..D_MODEL {
+                    hidden_cpu[i * D_MODEL + dd] += o[dd];
+                }
+            }
+            // FFN per row.
+            for i in 0..N_NEW {
+                let mut hn2 = vec![0f32; D_MODEL];
+                k::rmsnorm_f32_row(
+                    &hidden_cpu[i * D_MODEL..(i + 1) * D_MODEL],
+                    &lw.ffn_norm,
+                    &mut hn2,
+                    EPS,
+                );
+                let mut g = vec![0f32; D_FF];
+                let mut u = vec![0f32; D_FF];
+                cpu_mv(&lw.wg, &hn2, &mut g, D_FF, D_MODEL);
+                cpu_mv(&lw.wu, &hn2, &mut u, D_FF, D_MODEL);
+                let mut act = vec![0f32; D_FF];
+                k::silu_mul_f32(&g, &u, &mut act);
+                let mut fo = vec![0f32; D_MODEL];
+                cpu_mv(&lw.wd, &act, &mut fo, D_MODEL, D_FF);
+                for dd in 0..D_MODEL {
+                    hidden_cpu[i * D_MODEL + dd] += fo[dd];
+                }
+            }
+        }
+
+        match ck::CudaMatvecCache::new(0, 64 << 20) {
+            None => {
+                cu_emit(name, "KERNEL_ERR", "cache-create-failed");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            Some(mut cache) => {
+                let step_layers: Vec<ck::StepLayer> = lws
+                    .iter()
+                    .map(|lw| ck::StepLayer {
+                        wq: (ck::CudaPackedKind::Q4_K, lw.wq.as_ptr() as usize, &lw.wq),
+                        wk: (ck::CudaPackedKind::Q4_K, lw.wk.as_ptr() as usize, &lw.wk),
+                        wv: (ck::CudaPackedKind::Q4_K, lw.wv.as_ptr() as usize, &lw.wv),
+                        wo: (ck::CudaPackedKind::Q4_K, lw.wo.as_ptr() as usize, &lw.wo),
+                        dense_ffn: Some((
+                            (
+                                ck::CudaPackedKind::Q4_K,
+                                lw.wg.as_ptr() as usize,
+                                lw.wg.as_slice(),
+                            ),
+                            (
+                                ck::CudaPackedKind::Q4_K,
+                                lw.wu.as_ptr() as usize,
+                                lw.wu.as_slice(),
+                            ),
+                            (
+                                ck::CudaPackedKind::Q4_K,
+                                lw.wd.as_ptr() as usize,
+                                lw.wd.as_slice(),
+                            ),
+                            D_FF,
+                        )),
+                        attn_norm: &lw.attn_norm,
+                        post_norm: &lw.ffn_norm,
+                        q_norm: None,
+                        k_norm: None,
+                        inv_freq: &inv_freq,
+                        window: 0,
+                        softcap: 0.0,
+                    })
+                    .collect();
+                let mut hidden_dev = hidden0.clone();
+                // Fresh per-layer host KV caches (head-major); base 0 so no history.
+                let mut kcaches: Vec<Vec<f32>> = (0..N_LAYERS)
+                    .map(|_| vec![0f32; N_KV * MAX_CTX * HEAD_DIM])
+                    .collect();
+                let mut vcaches: Vec<Vec<f32>> = (0..N_LAYERS)
+                    .map(|_| vec![0f32; N_KV * MAX_CTX * HEAD_DIM])
+                    .collect();
+                let mut kc_refs: Vec<&mut [f32]> =
+                    kcaches.iter_mut().map(|c| c.as_mut_slice()).collect();
+                let mut vc_refs: Vec<&mut [f32]> =
+                    vcaches.iter_mut().map(|c| c.as_mut_slice()).collect();
+                // SAFETY: weight + norm slices in `lws` outlive the call; host KV
+                // caches sized N_KV*MAX_CTX*HEAD_DIM; kv_len_base 0 + N_NEW <= MAX_CTX.
+                let ok = unsafe {
+                    cache.prefill_step_graph_f32(
+                        &step_layers,
+                        &mut hidden_dev,
+                        &mut kc_refs,
+                        &mut vc_refs,
+                        N_HEADS,
+                        N_KV,
+                        HEAD_DIM,
+                        D_MODEL,
+                        0,
+                        N_NEW,
+                        MAX_CTX,
+                        EPS,
+                    )
+                };
+                if !ok {
+                    cu_emit(name, "SKIP", "prefill-step-graph-declined");
+                    *counts.entry("SKIP").or_default() += 1;
+                } else {
+                    // Grade the residual hidden DELTA after the full N-layer stack over
+                    // ALL n_new rows (same cos>0.99 / rel<0.15 bar as the decode step).
+                    let gpu: Vec<f32> = hidden_dev
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
+                    let cpu: Vec<f32> = hidden_cpu
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
+                    const GRAPH_REL_TOL: f64 = 0.15;
+                    let (cos, within, worst_abs, tol_frac) =
+                        allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, GRAPH_REL_TOL);
+                    let key: &'static str = if cos > 0.99 && within {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
+                    *counts.entry(key).or_default() += 1;
+                    let mut wi = 0usize;
+                    let mut wfrac = 0f64;
+                    for i in 0..gpu.len() {
+                        let allowed =
+                            GRAPH_ALLCLOSE_ABS_TOL + GRAPH_REL_TOL * (cpu[i] as f64).abs();
+                        let frac = (gpu[i] as f64 - cpu[i] as f64).abs() / allowed;
+                        if frac > wfrac {
+                            wfrac = frac;
+                            wi = i;
+                        }
+                    }
+                    let w_allowed = GRAPH_ALLCLOSE_ABS_TOL + GRAPH_REL_TOL * (cpu[wi] as f64).abs();
+                    let w_abs = (gpu[wi] as f64 - cpu[wi] as f64).abs();
+                    cu_emit(
+                        name,
+                        key,
+                        &format!(
+                            "cos={cos:.6} worst_abs={worst_abs:.5} tol_used={tol_frac:.3} \
+                             ({N_LAYERS}L×{N_NEW}tok attn+ffn) fail@[{wi}] ref={:.4} gpu={:.4} abs={w_abs:.4} allowed={w_allowed:.4}",
                             cpu[wi], gpu[wi]
                         ),
                     );
