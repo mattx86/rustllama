@@ -385,6 +385,32 @@ pub const VERDICT_PREFILL_STEP_CUDA_GRAPH: &str = "prefill:step_cuda_graph";
 /// with the correctness verdict, so an unmeasured / slower graph is OFF (the eager
 /// prefill block runs), re-enabling only per (system,model) where it wins.
 pub const VERDICT_PREFILL_STEP_CUDA_GRAPH_FASTER: &str = "prefill:step_cuda_graph_faster";
+/// PERF+correctness gate for the software-pipelined decode flash: prefetch the next
+/// position's K/V to overlap the load latency the clock64 profiler found dominant
+/// (K 46% + V 41% of the per-position loop). BIT-EXACT to the base decode kernel, so
+/// the `attn:decode_pipeline` probe grades it vs the CPU flash-decode reference (must
+/// stay cos≈1) AND times it against the base kernel, banking ON only where it is
+/// correct AND measured FASTER on this box. Read by
+/// `accel::decode_attn_pipeline_enabled`, which pushes the decision into the CUDA
+/// decode entries (`rsl_cuda_set_decode_attn_pipeline`) so BOTH the eager path and the
+/// shipped device-pos step graph capture the pipe kernel. Fail-closed OFF (unmeasured
+/// / not-a-win ⇒ the base decode kernel). The +4.7% decode win lands in the CAPTURED
+/// graph (launch overhead collapsed), unlike split-KV which won eager but lost
+/// in-graph — so the gate measures the kernel in isolation, where a faster kernel can
+/// never hurt the graph.
+pub const VERDICT_DECODE_ATTN_PIPELINE: &str = "attn:decode_pipeline";
+/// PERF gate for the software-pipelined decode flash — it must be measured FASTER
+/// end-to-end at DECODE than the base kernel before it engages. Banked by
+/// `tune --decode-pipeline` (Stage 1e-d), a WHOLE-DECODE reload A/B (force base, load,
+/// measure decode tok/s; force pipe, reload, measure). This replaces the isolated
+/// kernel A/B, which measures the WRONG signal: firing the flash kernel back-to-back
+/// keeps K/V warm in L2 (no load latency to hide → the prefetch only costs registers,
+/// looks slower), whereas the real decode step's FFN matvecs EVICT K/V between
+/// attention calls, so each pays cold-DRAM latency the prefetch overlaps (+~6.6% decode
+/// on sm_120 MIG, bit-exact). `accel::decode_attn_pipeline_enabled` AND's it with the
+/// correctness verdict [`VERDICT_DECODE_ATTN_PIPELINE`]; unmeasured / not-a-win ⇒ OFF
+/// (the base decode kernel runs), re-enabling only per (system,model) where it wins.
+pub const VERDICT_DECODE_ATTN_PIPELINE_FASTER: &str = "attn:decode_pipeline_faster";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror

@@ -663,6 +663,16 @@ pub enum Command {
         /// CUDA-only; a `tune --all` sub-stage (Stage 1e-c).
         #[arg(long)]
         prefill_step_graph: bool,
+        /// Software-pipelined decode-flash A/B: with the whole-decode step graph forced
+        /// ON, measure DECODE tok/s with the base kernel then the pipe kernel (prefetch
+        /// the next K/V to overlap load latency), reloading per arm, and persist the
+        /// PERF verdict `attn:decode_pipeline_faster` that — ANDed with the
+        /// `attn:decode_pipeline` parity verdict from `--validate-kernels` — auto-enables
+        /// the pipe kernel only where it beats the base at decode on this device+model.
+        /// The pipe kernel is bit-exact, so this gates on speed. CUDA-only; a `tune
+        /// --all` sub-stage (Stage 1e-d).
+        #[arg(long)]
+        decode_pipeline: bool,
         /// Whole-mirror f16 KV decode A/B (ships the built-but-inert
         /// `attn:kv_mirror_f16` mirror where it wins): force the shared attention KV
         /// mirror f32 then f16 on one f32-KV-storage load, measure DECODE tok/s, and
@@ -1470,6 +1480,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dev_attn,
             dev_prefill,
             prefill_step_graph,
+            decode_pipeline,
             kv_mirror_f16,
             moe_vram_margin,
             cacheblend,
@@ -1571,6 +1582,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 dev_attn,
                 dev_prefill,
                 prefill_step_graph,
+                decode_pipeline,
                 kv_mirror_f16,
                 moe_vram_margin,
                 cacheblend,
@@ -1592,6 +1604,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --matvec-min-flops / --ssm-chunk / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
                      --dev-attn / --dev-prefill / --prefill-step-graph / \
+                     --decode-pipeline / \
                      --moe-vram-margin / --cacheblend / \
                      --batching / --all \
                      are exclusive; pick at most one"
@@ -1801,6 +1814,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if prefill_step_graph {
                 return cmd_tune_prefill_step_graph(&config_path, model, repeats);
+            }
+            if decode_pipeline {
+                return cmd_tune_decode_pipeline(&config_path, model, repeats);
             }
             if kv_mirror_f16 {
                 return cmd_tune_kv_mirror_f16(&config_path, model, repeats);
@@ -7075,6 +7091,79 @@ fn cmd_tune_prefill_step_graph(
     Ok(())
 }
 
+/// `tune --decode-pipeline` (Stage 1e-d): A/B the software-pipelined decode flash
+/// (prefetch the next position's K/V to overlap load latency) against the base decode
+/// kernel and persist the PERF verdict `attn:decode_pipeline_faster`, which — ANDed
+/// with the `attn:decode_pipeline` parity verdict from `--validate-kernels` —
+/// `accel::decode_attn_pipeline_enabled` reads to auto-enable the pipe kernel only where
+/// it beats the base at DECODE on this device+model. The pipe kernel is BIT-EXACT (the
+/// parity probe establishes correctness), so this gates on SPEED. The A/B is
+/// WHOLE-DECODE (step graph forced on, model reloaded per arm): an isolated-kernel A/B
+/// measures the WRONG signal because it keeps K/V warm in L2, where the prefetch can't
+/// help. CUDA-only; on any other host `measure_decode_pipeline` returns BEFORE loading,
+/// so it prints "skipped" and persists nothing — the path stays force-gated only
+/// (fail-closed). Before this stage existed the perf verdict had NO writer, so the pipe
+/// kernel was reachable only via `RUSTLLAMA_DECODE_ATTN_PIPELINE=1`.
+fn cmd_tune_decode_pipeline(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_decode_pipeline, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+
+    println!("rustllama tune --decode-pipeline");
+    println!("  model = {}", model_path.display());
+
+    // The pipe kernel is an F32-KV decode-flash; `measure_decode_pipeline` forces f32 +
+    // forces the whole-decode step graph on (the win is in-graph only). Pass the
+    // config's layout / flash / placement so the A/B runs on the same decode path serve
+    // would. CUDA-only + the engagement check happen inside the measurement (it returns
+    // BEFORE loading off CUDA).
+    let m_cfg = MeasurementConfig {
+        kv_dtype: rustllama_engine::KvDtype::F32,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+
+    let report = measure_decode_pipeline(&model_path, &m_cfg, repeats.max(3) as usize)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    match (report.capable, report.off_tps, report.on_tps, report.faster) {
+        (true, Some(off), Some(on), Some(fast)) => {
+            println!("  base kernel (OFF) = {off:.1} tok/s");
+            println!(
+                "  pipe kernel (ON)  = {on:.1} tok/s  ({:+.1}%)",
+                (on / off - 1.0) * 100.0
+            );
+            println!(
+                "  → {}",
+                if fast {
+                    "ENABLE — the pipelined decode flash is faster here"
+                } else {
+                    "keep base kernel — the pipe kernel is not a win here"
+                }
+            );
+            let name = rustllama_tuner::VERDICT_DECODE_ATTN_PIPELINE_FASTER;
+            persist_kernel_verdicts(&[(name.to_string(), fast)])?;
+            println!("  → persisted verdict {name} = {fast}");
+        }
+        _ => {
+            println!(
+                "  → not measured ({}); verdict left unset — path stays off",
+                report
+                    .error
+                    .unwrap_or_else(|| "decode pipeline A/B did not engage".into())
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `tune --kv-mirror-f16` (Stage 1e-b): A/B the whole-mirror f16 KV decode win and
 /// persist the PERF verdict `attn:kv_mirror_f16_faster`, which — ANDed with the
 /// correctness verdict `attn:kv_mirror_f16` — `accel::kv_mirror_f16_enabled` reads to
@@ -9444,6 +9533,17 @@ fn cmd_tune_all(
                 && t.kernel_build_id == build_id
         })
         .unwrap_or(false);
+    // Software-pipelined decode-flash PERF verdict — build-stamped (a kernel-source
+    // edit changes the pipe kernel's cost), its own (CUDA-only) key. `Some(false)`
+    // (measured no-win) still counts as decided, so use `contains_key`.
+    let has_decode_pipeline = cached
+        .as_ref()
+        .map(|t| {
+            t.kernel_verdicts
+                .contains_key(rustllama_tuner::VERDICT_DECODE_ATTN_PIPELINE_FASTER)
+                && t.kernel_build_id == build_id
+        })
+        .unwrap_or(false);
     // Whole-mirror f16 KV perf verdict — build-stamped like dev-prefill, its own
     // (CUDA-only) key. `Some(false)` (measured no-win) still counts as decided, so
     // use `contains_key` (re-runs on a kernel-source/build change via build_id).
@@ -9661,6 +9761,31 @@ fn cmd_tune_all(
             &[],
         ) {
             tracing::warn!(error = %e, "stage 1e-b (kv-mirror-f16 perf) failed; continuing");
+        }
+    }
+
+    println!();
+    println!(
+        "Stage 1e-d/10: decode-pipeline perf (A/B the pipelined decode flash vs the base kernel, f32 KV)"
+    );
+    println!("--------");
+    if skip(has_decode_pipeline) {
+        println!("(skipped: decode-pipeline verdict already cached for this build)");
+    } else {
+        // Whole-decode f32-KV A/B; CUDA-only (the stage self-skips off CUDA). Forces the
+        // step graph ON for both arms (the pipelining win is in-graph only) and reloads
+        // per arm (the kernel is baked at graph capture). Runs AFTER Stage 1c banks
+        // `attn:decode_pipeline` (the parity half of its serve gate). Subprocess like the
+        // others for a clean GPU context.
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--decode-pipeline",
+            thorough,
+            "1e-d (decode-pipeline perf)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 1e-d (decode-pipeline perf) failed; continuing");
         }
     }
 

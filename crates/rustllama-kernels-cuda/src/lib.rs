@@ -1128,6 +1128,10 @@ extern "C" {
         window: c_int,
         softcap: f32,
     ) -> c_int;
+    // Process-wide override for the software-pipelined decode flash (driven by the
+    // `attn:decode_pipeline` verdict from accel.rs). v: 0=base kernel, 1=pipe kernel,
+    // anything else = clear the override (fall back to RUSTLLAMA_DECODE_ATTN_PIPELINE).
+    fn rsl_cuda_set_decode_attn_pipeline(v: c_int);
     // GPU paged attention (Phase B): block-table flash-decode against the
     // whole-pool device mirror. `block_table` = [ceil(kv_len/page_size)] i32.
     fn rsl_cuda_flash_attn_decode_paged_f32(
@@ -3611,6 +3615,25 @@ pub unsafe fn flash_attn_decode_f32(
     } else {
         Err(CudaError::Kernel(rc))
     }
+}
+
+/// Select the software-pipelined decode-flash kernel process-wide. BOTH decode C
+/// entries consult this: the base param-`kv_len` entry ([`flash_attn_decode_f32`])
+/// and the capture-once device-pos step-graph entry ([`flash_attn_decode_f32_dpos`]).
+/// `Some(true)` = pipe (prefetch the next position's K/V to overlap load latency),
+/// `Some(false)` = base kernel, `None` = clear the override (fall back to the
+/// `RUSTLLAMA_DECODE_ATTN_PIPELINE` env). Set ONCE before the first decode so the
+/// device-pos graph captures the chosen kernel; driven by
+/// `accel::decode_attn_pipeline_enabled()` from the on-device `attn:decode_pipeline`
+/// verdict (BIT-EXACT + measured-faster). Inert off-NVIDIA.
+pub fn set_decode_attn_pipeline(sel: Option<bool>) {
+    let v: c_int = match sel {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    };
+    // SAFETY: a trivial C setter storing one int to a process global; no pointers.
+    unsafe { rsl_cuda_set_decode_attn_pipeline(v) }
 }
 
 /// Fused split-KV decode attention (atomic last-block-combines) — standalone EAGER

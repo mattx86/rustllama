@@ -11090,6 +11090,27 @@ pub fn kv_mirror_f16_hits() -> u64 {
     KV_MIRROR_F16_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Transient A/B override for the software-pipelined decode-flash decision (the
+/// `tune --decode-pipeline` harness only). `-1` = unset (env/verdicts decide),
+/// `0` = force base kernel, `1` = force the pipe kernel. NOT a user knob — serve/
+/// bench never set it. Checked FIRST by [`decode_attn_pipeline_enabled`], so the
+/// A/B drives both arms without disturbing the real env/verdict decision.
+static DECODE_PIPE_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Force the software-pipelined decode-flash path on/off for the current process
+/// (the `tune --decode-pipeline` A/B harness only). `None` clears the override → the
+/// `RUSTLLAMA_DECODE_ATTN_PIPELINE` env / the `attn:decode_pipeline{,_faster}`
+/// verdicts decide. Because the decode step graph re-captures on a model reload (it
+/// drops `step_graph_exec`), the A/B sets this, reloads, and measures per arm.
+pub fn set_decode_pipe_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DECODE_PIPE_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
 /// reserved below free VRAM when `load_inner` projects the expert-promotion
 /// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
@@ -11199,6 +11220,52 @@ pub fn prefill_flash_tc_enabled() -> bool {
             _ => kernel_verdict(rustllama_tuner::VERDICT_ATTN_PREFILL_TC),
         },
     )
+}
+
+/// Whether the software-pipelined decode-flash kernel runs (vs the base decode
+/// kernel): it prefetches the NEXT position's K/V to overlap the load latency the
+/// clock64 profiler found dominant (K 46% + V 41%). Gated on BOTH a correctness
+/// verdict [`VERDICT_DECODE_ATTN_PIPELINE`] (bit-exact vs the CPU reference, banked by
+/// `tune --validate-kernels`) AND a perf verdict [`VERDICT_DECODE_ATTN_PIPELINE_FASTER`]
+/// (measured FASTER end-to-end at decode, banked by `tune --decode-pipeline`'s reload
+/// A/B). The perf gate is a WHOLE-DECODE A/B, NOT an isolated-kernel one: the isolated
+/// kernel A/B measures the WRONG signal — firing the flash kernel back-to-back keeps
+/// K/V warm in L2, so there is no load latency to hide and the prefetch only costs
+/// registers (looks ~11% slower); in the real step the FFN matvecs between attention
+/// calls EVICT K/V, so each call pays cold-DRAM latency and the prefetch wins (+~6.6%
+/// decode, bit-exact, measured on sm_120 MIG — alternating 3-round A/B). HW-adaptive:
+/// re-measured per box, declined where it doesn't win. `RUSTLLAMA_DECODE_ATTN_PIPELINE=1`
+/// force-enables (the on-pod A/B lever), `=0` disables. Fail-closed: unmeasured /
+/// not-a-win ⇒ the base kernel. The decision is PUSHED into the CUDA decode entries
+/// (`ck::set_decode_attn_pipeline`) so the base entry AND the capture-once device-pos
+/// step graph both select the chosen kernel.
+pub fn decode_attn_pipeline_enabled() -> bool {
+    // Transient A/B override (`tune --decode-pipeline`) wins and does NOT touch the
+    // OnceLock, so the env/verdict decision survives the force being cleared.
+    match DECODE_PIPE_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("RUSTLLAMA_DECODE_ATTN_PIPELINE")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                kernel_verdict(rustllama_tuner::VERDICT_DECODE_ATTN_PIPELINE)
+                    && kernel_verdict(rustllama_tuner::VERDICT_DECODE_ATTN_PIPELINE_FASTER)
+            }
+        };
+        // Push the decision to the CUDA decode entries ONCE, before the first decode
+        // captures the device-pos step graph (idempotent cheap int store). Covers both
+        // the eager and the graph path (the global is process-wide).
+        ck::set_decode_attn_pipeline(Some(on));
+        on
+    })
 }
 
 /// Whether the shared attention KV mirror is stored f16 (vs f32) — whole-mirror
@@ -12092,6 +12159,11 @@ pub fn try_decode_step_cuda_graph_f32(
     // Whole-mirror f16 KV: same shared-mirror dtype as the other block paths (the
     // step graph seeds + writes + reads the mirror through `issue_layer_chain`).
     g.set_kv_mirror_f16(kv_mirror_f16_active(head_dim));
+    // Select the software-pipelined decode-flash kernel per the on-device verdict,
+    // BEFORE the first capture so the graph records the chosen kernel (the pipe win
+    // lands here, in the captured graph). Idempotent re-push each token; robust across
+    // model reloads that re-capture the graph.
+    ck::set_decode_attn_pipeline(Some(decode_attn_pipeline_enabled()));
     let ok = unsafe {
         g.decode_step_graph_f32(
             layers, hidden, k_caches, v_caches, n_heads, n_kv_heads, head_dim, d_model, pos,

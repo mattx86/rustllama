@@ -4899,6 +4899,162 @@ pub fn measure_kv_mirror_f16(
     })
 }
 
+/// Outcome of [`measure_decode_pipeline`] — the software-pipelined decode-flash A/B.
+/// `capable` is `true` only when the whole-decode step graph actually engaged (the
+/// pipelining win is in-graph only); `off_tps`/`on_tps` are the median decode tok/s of
+/// the base vs pipe kernel, `faster = Some(on > off*margin)`.
+#[derive(Debug, Clone, Default)]
+pub struct DecodePipelineReport {
+    pub capable: bool,
+    pub off_tps: Option<f64>,
+    pub on_tps: Option<f64>,
+    pub faster: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// A/B the software-pipelined decode flash by measured DECODE tok/s. The pipe kernel
+/// prefetches the next position's K/V to overlap the load latency the clock64 profiler
+/// found dominant; it is BIT-EXACT (graded separately by `doctor --cuda-parity
+/// attn:decode_pipeline`), so this gates on SPEED only.
+///
+/// CRITICAL: the win only appears with the whole-decode STEP GRAPH engaged. In the
+/// eager path per-op launch overhead dilutes the per-call kernel saving to noise, and
+/// an isolated back-to-back kernel A/B keeps K/V warm in L2 (no latency to hide, so the
+/// prefetch only costs registers and looks slower). In the real step the FFN matvecs
+/// between attention calls evict K/V, so each call pays cold-DRAM latency the prefetch
+/// overlaps. So this forces the step graph ON for both arms and measures end-to-end
+/// decode. The kernel is baked at graph CAPTURE, so each arm RELOADS the model (a
+/// reload drops `step_graph_exec` via `reset_device_caches_for_new_model` → re-capture
+/// with the arm's forced kernel). CUDA-only; off CUDA it returns before loading.
+pub fn measure_decode_pipeline(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    repeats: usize,
+) -> Result<DecodePipelineReport, String> {
+    if !rustllama_models::accel::cuda_active() {
+        return Ok(DecodePipelineReport {
+            capable: false,
+            error: Some("no active NVIDIA GPU — pipelined decode flash cannot run".into()),
+            ..Default::default()
+        });
+    }
+    // Require ON to beat OFF by >3% to clear same-process back-to-back noise (the
+    // measured win is ~5-9% on a grid-starved slice). Fail-closed otherwise.
+    const WIN_MARGIN: f64 = 1.03;
+    const PROMPT_TOKENS: u32 = 512;
+    const DECODE_TOKENS: u32 = 128;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // Fresh load per arm (the step graph bakes the kernel at capture; a reload drops
+    // step_graph_exec → re-capture with the arm's forced kernel). Returns (median
+    // decode tok/s, error). The engine is dropped at the end of each call.
+    let load_and_bench = |pipe: bool| -> (Option<f64>, Option<String>) {
+        rustllama_models::accel::set_decode_pipe_force(Some(pipe));
+        let mut cpu = match ContiguousEngine::load_with_options_and_layout(
+            model_path,
+            ctx_size,
+            true,
+            KvDtype::F32,
+            &cfg.kv_cache_layout,
+        ) {
+            Ok(e) => e,
+            Err(e) => return (None, Some(format!("load failed: {e}"))),
+        };
+        cpu.set_prefix_cache(false);
+        cpu.set_flash_attention(cfg.flash_attention);
+        apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
+
+        let vocab = cpu.vocab_size() as i32;
+        let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+            .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+            .collect();
+
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+            return (None, Some(format!("warmup failed: {e}")));
+        }
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            match cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+                Ok(_) => {
+                    let stats = cpu.last_request_stats();
+                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // Force the whole-decode step graph ON for both arms (the pipelining win is
+    // in-graph only) and confirm it actually engaged — else the A/B is meaningless.
+    rustllama_models::accel::set_dev_step_force(Some(true));
+    let hits0 = rustllama_models::accel::dev_step_hits();
+    let (off_tps, off_err) = load_and_bench(false);
+    let (on_tps, on_err) = load_and_bench(true);
+    let engaged = rustllama_models::accel::dev_step_hits() > hits0;
+
+    // Clear the overrides → serve-time env/verdicts decide from here.
+    rustllama_models::accel::set_decode_pipe_force(None);
+    rustllama_models::accel::set_dev_step_force(None);
+
+    if !engaged {
+        return Ok(DecodePipelineReport {
+            capable: false,
+            off_tps,
+            on_tps,
+            faster: None,
+            error: Some(
+                "whole-decode step graph never engaged (the pipelining win is in-graph \
+                 only) — verdict left unset"
+                    .into(),
+            ),
+        });
+    }
+
+    let faster = match (off_tps, on_tps) {
+        (Some(off), Some(on)) if off > 0.0 => Some(on > off * WIN_MARGIN),
+        _ => None,
+    };
+    Ok(DecodePipelineReport {
+        capable: true,
+        off_tps,
+        on_tps,
+        faster,
+        error: off_err.or(on_err),
+    })
+}
+
 /// Outcome of [`measure_moe_vram_margin_candidates`] — the MoE VRAM-margin A/B.
 ///
 /// `capable` is `true` only when a reload actually engaged the tiered-expert

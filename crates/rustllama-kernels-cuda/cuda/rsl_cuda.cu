@@ -5008,6 +5008,255 @@ __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
     }
 }
 
+// clock64 PHASE profiler for the decode flash (env RUSTLLAMA_DECODE_ATTN_CYCLES=1). A
+// faithful COPY of flash_attn_decode_f32_kernel with per-phase cycle accounting on the
+// representative thread (head 0, tid 0) — launched ONCE off the hot path, so the
+// production kernel is byte-untouched. The decode-attn diag already found this kernel
+// LATENCY-bound (22% peak BW, grid-underutilized); this splits the per-position loop
+// into K-load+dot / shfl-reduce+softmax / V-load+accumulate so build-B fixes the RIGHT
+// sink (loads → float4 + software-pipeline, which is in-graph-safe unlike split-KV;
+// reduce/softmax → restructure). Ratios are the signal (clock64 adds uniform per-read
+// overhead that inflates absolutes). The ncu-free method that drove the prefill GEMM
+// 1.167→0.495 (2.36x), now on the #1 decode bucket.
+__global__ void flash_attn_decode_f32_profcycles_kernel(
+    const float *q, const float *k, const float *v, float *out, int n_heads,
+    int n_gqa, int head_dim, int max_ctx, int kv_len, float scale, int window,
+    float softcap, unsigned long long *gcyc) {
+    extern __shared__ float smem[];
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
+    const int hh = blockIdx.x;
+    if (hh >= n_heads) return;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    unsigned long long cKdot = 0, cRedSm = 0, cVacc = 0;
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;
+        long long p0 = clock64();
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * k[kv_off + d];
+        long long p1 = clock64();
+        cKdot += (unsigned long long)(p1 - p0);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        long long p2 = clock64();
+        cRedSm += (unsigned long long)(p2 - p1);
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * v[kv_off + d];
+        m = m_new;
+        long long p3 = clock64();
+        cVacc += (unsigned long long)(p3 - p2);
+    }
+    long long pc0 = clock64();
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+    float m_g = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+#pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
+    long long pc1 = clock64();
+    if (hh == 0 && tid == 0) {
+        gcyc[0] = cKdot;
+        gcyc[1] = cRedSm;
+        gcyc[2] = cVacc;
+        gcyc[3] = (unsigned long long)(pc1 - pc0);
+    }
+}
+
+// Rust-settable override for the software-pipelined decode flash, driven by the
+// `attn:decode_pipeline` on-device verdict through accel.rs
+// (rsl_cuda_set_decode_attn_pipeline). -1 = unset (fall back to the
+// RUSTLLAMA_DECODE_ATTN_PIPELINE env, default off); 0 = base kernel; 1 = pipe. Set
+// ONCE before the first decode (so the capture-once device-pos step graph records
+// the chosen kernel) and then stable, so a plain non-atomic int is enough
+// (set-before-use; read on the decode thread). Resolves the pipe-vs-base selection
+// for BOTH the base param-kv_len entry and the shipped device-pos graph entry.
+static int g_decode_pipe_override = -1;
+extern "C" void rsl_cuda_set_decode_attn_pipeline(int v) {
+    g_decode_pipe_override = (v == 0 || v == 1) ? v : -1;
+}
+static inline int rsl_decode_pipe_on() {
+    if (g_decode_pipe_override >= 0) return g_decode_pipe_override;
+    static int pipe_env = -1;
+    if (pipe_env < 0) {
+        const char *e = std::getenv("RUSTLLAMA_DECODE_ATTN_PIPELINE");
+        pipe_env = (e && e[0] == '1') ? 1 : 0;
+    }
+    return pipe_env;
+}
+
+// Software-PIPELINED decode-flash body (RUSTLLAMA_DECODE_ATTN_PIPELINE). The clock64
+// profiler found flash_attn_decode LOAD-bound (K 46% + V 41% of the per-position loop;
+// latency-stalled at 22% peak BW). This prefetches the NEXT position's K+V rows into
+// registers right after the current dot, so their load latency overlaps the current
+// position's shfl-reduce + softmax + V-accumulate (the loads are independent of this
+// position's online-softmax). BIT-EXACT to flash_attn_decode_f32_kernel (identical
+// values + arithmetic order; loads merely issued earlier; the per-warp `t<t_start` SWA
+// skip stays warp-uniform so __shfl is safe). In-graph-safe: ONE kernel node, no
+// combine (unlike split-KV, which added a node and lost in-graph). The grid is
+// 1-block-per-head (underutilized on the slice → 1 block/SM), so the extra prefetch
+// registers cost NO occupancy. Shared by the param-kv_len + device-pos wrappers.
+__device__ __forceinline__ void flash_decode_pipe_body(
+    const float *q, const float *k, const float *v, float *out, int n_heads,
+    int n_gqa, int head_dim, int max_ctx, int kv_len, float scale, int window,
+    float softcap) {
+    extern __shared__ float smem[];
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
+    const int hh = blockIdx.x;
+    if (hh >= n_heads) return;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+    const int NSEG = (head_dim + 31) / 32;
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float kreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float vreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    // Prologue: prefetch the first position's K+V this warp owns.
+    int t = warp;
+    bool have = (t < kv_len);
+    if (have) {
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+            kreg[seg] = k[kv_off + d];
+            vreg[seg] = v[kv_off + d];
+        }
+    }
+    while (have) {
+        const int cur = t;
+        const int nt = t + RSL_FLASH_DECODE_W;
+        const bool nhave = (nt < kv_len);
+        // Dot with the already-prefetched K row.
+        float partial = 0.f;
+        for (int seg = 0; seg < NSEG; ++seg) partial += qreg[seg] * kreg[seg];
+        // Issue the NEXT position's loads NOW (independent of this softmax) → in flight
+        // while the reduce/softmax/accumulate below run.
+        float kreg_n[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+        float vreg_n[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+        if (nhave) {
+            const int kv_off_n = (kv_h * max_ctx + nt) * head_dim;
+            for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+                kreg_n[seg] = k[kv_off_n + d];
+                vreg_n[seg] = v[kv_off_n + d];
+            }
+        }
+        if (cur >= t_start) {
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_down_sync(0xffffffffu, partial, off);
+            float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+            if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+            float m_new = fmaxf(m, s_dot);
+            float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+            float p = expf(s_dot - m_new);
+            l = l * rescale + p;
+            for (int seg = 0; seg < NSEG; ++seg)
+                acc[seg] = acc[seg] * rescale + p * vreg[seg];
+            m = m_new;
+        }
+        if (nhave) {
+            for (int seg = 0; seg < NSEG; ++seg) {
+                kreg[seg] = kreg_n[seg];
+                vreg[seg] = vreg_n[seg];
+            }
+        }
+        t = nt;
+        have = nhave;
+    }
+    // Publish this warp's partial + combine — identical to flash_attn_decode_f32_kernel.
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+    float m_g = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+#pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+#pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
+}
+
+__global__ void flash_attn_decode_f32_pipe_kernel(const float *q, const float *k,
+                                                  const float *v, float *out,
+                                                  int n_heads, int n_gqa,
+                                                  int head_dim, int max_ctx,
+                                                  int kv_len, float scale,
+                                                  int window, float softcap) {
+    flash_decode_pipe_body(q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len,
+                           scale, window, softcap);
+}
+
+__global__ void flash_attn_decode_f32_dpos_pipe_kernel(
+    const float *q, const float *k, const float *v, float *out, int n_heads,
+    int n_gqa, int head_dim, int max_ctx, const int *d_pos, float scale, int window,
+    float softcap) {
+    flash_decode_pipe_body(q, k, v, out, n_heads, n_gqa, head_dim, max_ctx,
+                           d_pos[0] + 1, scale, window, softcap);
+}
+
 // Split-KV (FlashDecoding) PARTIAL kernel: grid (n_heads, n_splits). Block (hh, sp)
 // runs the SAME online-softmax flash as flash_attn_decode_f32_kernel but over ONLY
 // its KV chunk [sp*chunk, min(kv_len, (sp+1)*chunk)); it writes that chunk's partial
@@ -5441,6 +5690,56 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
             }
         }
     }
+    // clock64 PHASE profiler (RUSTLLAMA_DECODE_ATTN_CYCLES=1), fired ONCE on a WARM
+    // call (skip 64; capture-guarded). Splits the per-position loop into
+    // K-load+dot / shfl-reduce+softmax / V-load+accumulate so build-B targets the real
+    // latency sink. Off the hot path (its own scratch out + gcyc); production launch
+    // below is unchanged.
+    {
+        static int dac_calls = 0, dac_done = 0;
+        cudaStreamCaptureStatus capst = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s->stream, &capst);
+        if (!dac_done && capst == cudaStreamCaptureStatusNone &&
+            std::getenv("RUSTLLAMA_DECODE_ATTN_CYCLES") != nullptr && dac_calls++ >= 64) {
+            dac_done = 1;
+            unsigned long long *gcyc = nullptr, hcyc[4] = {0, 0, 0, 0};
+            float *tmp_out = nullptr;
+            if (cudaMalloc(&gcyc, 4 * sizeof(unsigned long long)) == cudaSuccess &&
+                cudaMalloc(&tmp_out, (size_t)n_heads * head_dim * sizeof(float)) == cudaSuccess) {
+                cudaMemsetAsync(gcyc, 0, 4 * sizeof(unsigned long long), s->stream);
+                flash_attn_decode_f32_profcycles_kernel<<<grid, block, shmem, s->stream>>>(
+                    q, k, v, tmp_out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window,
+                    softcap, gcyc);
+                cudaStreamSynchronize(s->stream);
+                cudaMemcpy(hcyc, gcyc, 4 * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+                unsigned long long tot = hcyc[0] + hcyc[1] + hcyc[2];
+                std::fprintf(
+                    stderr,
+                    "[decode-attn-cycles] flash_decode kv_len=%d head_dim=%d (warp0/tid0, RATIOS are the "
+                    "signal): Kload+dot=%llu (%.0f%%) reduce+softmax=%llu (%.0f%%) Vload+acc=%llu (%.0f%%) "
+                    "| combine=%llu cyc -> %s\n",
+                    kv_len, head_dim, hcyc[0], tot ? 100.0 * hcyc[0] / tot : 0.0, hcyc[1],
+                    tot ? 100.0 * hcyc[1] / tot : 0.0, hcyc[2], tot ? 100.0 * hcyc[2] / tot : 0.0,
+                    hcyc[3],
+                    (hcyc[0] + hcyc[2] > hcyc[1])
+                        ? "LOAD-bound -> vectorize+software-pipeline K&V (float4+prefetch; in-graph-safe)"
+                        : "REDUCE/SOFTMAX-bound -> restructure the shfl reduction / fewer exp");
+            }
+            if (gcyc) cudaFree(gcyc);
+            if (tmp_out) cudaFree(tmp_out);
+        }
+    }
+    // Software-pipelined decode flash: prefetch next-position K+V to overlap the load
+    // latency the clock64 profiler found dominant (K 46% + V 41%). BIT-EXACT → the
+    // attn:decode_pipeline probe grades it vs the CPU reference AND times it vs the base
+    // kernel, banking the verdict accel.rs pushes here via rsl_cuda_set_decode_attn_pipeline
+    // (RUSTLLAMA_DECODE_ATTN_PIPELINE=1/0 still force-overrides the unset default).
+    if (rsl_decode_pipe_on()) {
+        flash_attn_decode_f32_pipe_kernel<<<grid, block, shmem, s->stream>>>(
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window,
+            softcap);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
+    }
     flash_attn_decode_f32_kernel<<<grid, block, shmem, s->stream>>>(
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale,
         window, softcap);
@@ -5558,6 +5857,19 @@ extern "C" int rsl_cuda_flash_attn_decode_f32_dpos(rsl_cuda_stream *s,
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) *
                    sizeof(float);
+    // Software-pipelined device-pos decode flash — the SHIPPED whole-step graph path.
+    // Pure kernel launch (no malloc/sync/memset), so it is capture-safe: the branch
+    // resolves from the stable Rust-set override (accel.rs pushes the verdict BEFORE the
+    // first capture), and the pipe kernel is recorded into the graph like the base one.
+    // BIT-EXACT to flash_attn_decode_f32_dpos_kernel. Verdict-gated (attn:decode_pipeline,
+    // perf+parity banked by tune --validate-kernels); the +4.7% decode win lands HERE in
+    // the captured graph — where split-KV's eager win evaporated (the launch-overhead trap).
+    if (rsl_decode_pipe_on()) {
+        flash_attn_decode_f32_dpos_pipe_kernel<<<grid, block, shmem, s->stream>>>(
+            q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, d_pos, scale, window,
+            softcap);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32_dpos");
+    }
     flash_attn_decode_f32_dpos_kernel<<<grid, block, shmem, s->stream>>>(
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, d_pos, scale, window,
         softcap);
