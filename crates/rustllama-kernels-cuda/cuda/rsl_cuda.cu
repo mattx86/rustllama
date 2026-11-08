@@ -5124,6 +5124,73 @@ static inline int rsl_decode_pipe_on() {
     return pipe_env;
 }
 
+// Split-KV (FlashDecoding) FUSED single-kernel selector for the WHOLE-decode-step
+// graph. Same set-before-capture discipline as the pipe override: accel.rs resolves
+// it ONCE before the first decode so the capture-once step graph records the chosen
+// attention kernel, then it is stable (plain non-atomic int is enough). Env A/B
+// (RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED) is the pre-verdict lever — the SAME env the
+// prefill prealloc keys on, so setting it both allocates the scratch and engages here.
+static int g_decode_splitfused_override = -1;
+extern "C" void rsl_cuda_set_decode_attn_split_fused(int v) {
+    g_decode_splitfused_override = (v == 0 || v == 1) ? v : -1;
+}
+static inline int rsl_splitfused_on() {
+    if (g_decode_splitfused_override >= 0) return g_decode_splitfused_override;
+    static int sf_env = -1;
+    if (sf_env < 0) {
+        const char *e = std::getenv("RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED");
+        sf_env = (e && e[0] == '1') ? 1 : 0;
+    }
+    return sf_env;
+}
+
+// Eagerly allocate the split-KV fused decode scratch (partials + per-head arrival
+// counter) BEFORE the whole-decode-step graph captures. Why a dedicated entry: the
+// dpos decode kernel entry is ONLY ever called DURING capture (where cudaMalloc is
+// illegal), and prefill now runs through its own captured step graph / TC-flash path,
+// so the prefill-time prealloc in rsl_cuda_flash_attn_prefill_f32 no longer reliably
+// fires. lib.rs calls this from the decode step graph's one guaranteed pre-capture
+// (non-capturing) point, with the dims known. No-op unless the fused-split gate is on;
+// idempotent; sized EXACTLY like the launch (same rsl_decode_attn_n_splits, so the
+// dpos branch's `fd_*_cap >= need` check matches). Best-effort: on any failure the
+// dpos split branch simply falls through to the pipe/base kernel (fail-closed).
+extern "C" int rsl_cuda_ensure_fd_scratch(rsl_cuda_stream *s, int n_heads,
+                                          int head_dim) {
+    if (!s || n_heads <= 0 || head_dim <= 0) return -1;
+    if (!rsl_splitfused_on()) return 0;  // gate off → nothing to allocate
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(s->stream, &cap);
+    if (cap != cudaStreamCaptureStatusNone) return 0;  // never malloc mid-capture
+    cudaSetDevice(s->device);
+    int nsm = 0;
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
+    int n_splits = rsl_decode_attn_n_splits(nsm, n_heads);
+    if (n_splits <= 1) return 0;  // grid not starved / nothing to split
+    size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
+    if (s->fd_partials_cap < need) {
+        if (s->fd_partials) cudaFree(s->fd_partials);
+        if (cudaMalloc(&s->fd_partials, need * sizeof(float)) == cudaSuccess) {
+            s->fd_partials_cap = need;
+        } else {
+            s->fd_partials = nullptr;
+            s->fd_partials_cap = 0;
+            return -1;
+        }
+    }
+    if (s->fd_counter_cap < (size_t)n_heads) {
+        if (s->fd_counter) cudaFree(s->fd_counter);
+        if (cudaMalloc(&s->fd_counter, (size_t)n_heads * sizeof(int)) == cudaSuccess) {
+            s->fd_counter_cap = (size_t)n_heads;
+            cudaMemset(s->fd_counter, 0, (size_t)n_heads * sizeof(int));
+        } else {
+            s->fd_counter = nullptr;
+            s->fd_counter_cap = 0;
+            return -1;
+        }
+    }
+    return 0;
+}
+
 // Software-PIPELINED decode-flash body (RUSTLLAMA_DECODE_ATTN_PIPELINE). The clock64
 // profiler found flash_attn_decode LOAD-bound (K 46% + V 41% of the per-position loop;
 // latency-stalled at 22% peak BW). This prefetches the NEXT position's K+V rows into
@@ -5400,7 +5467,9 @@ __global__ void flash_attn_decode_combine_f32_kernel(const float *partials,
 // self-resets counter[hh]=0 after combining, which stays 0 for the next layer's kernel
 // (serial on the stream within one captured graph replay) and the next token
 // (decode-step sync) — no per-token memset node needed.
-__global__ void flash_attn_decode_splitfused_f32_kernel(
+// Shared body for the param-kv_len wrapper (eager/per-layer-graph) + the device-pos
+// wrapper (whole-step graph). kv_len is a plain param here; each wrapper supplies it.
+__device__ __forceinline__ void flash_decode_splitfused_body(
     const float *q, const float *k, const float *v, float *partials, int *counter,
     float *out, int n_heads, int n_gqa, int head_dim, int max_ctx, int kv_len,
     int n_splits, float scale, int window, float softcap) {
@@ -5519,6 +5588,32 @@ __global__ void flash_attn_decode_splitfused_f32_kernel(
         }
         out[hh * head_dim + d] = o * inv;
     }
+}
+
+// Param-kv_len wrapper: eager + the per-layer-graph split path + the parity probe.
+__global__ void flash_attn_decode_splitfused_f32_kernel(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_heads, int n_gqa, int head_dim, int max_ctx, int kv_len,
+    int n_splits, float scale, int window, float softcap) {
+    flash_decode_splitfused_body(q, k, v, partials, counter, out, n_heads, n_gqa,
+                                 head_dim, max_ctx, kv_len, n_splits, scale, window,
+                                 softcap);
+}
+
+// Device-pos twin for the capture-once WHOLE-decode-step graph (T2): kv_len is read
+// from d_pos[0] INSIDE the kernel, so the (n_heads, n_splits) grid + fixed shmem stay
+// static across token replays (capture-stable). This is the production-graph split
+// path the per-layer 2-kernel split never reached — ONE node (fused last-block
+// combine, no 2nd combine node that cost the per-layer graph −5.6%), and the whole-
+// step graph has already collapsed every per-layer launch, so this isolates the
+// split kernel's SM-fill gain (the eager +6% that per-layer launch overhead masked).
+__global__ void flash_attn_decode_splitfused_f32_dpos_kernel(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_heads, int n_gqa, int head_dim, int max_ctx, const int *d_pos,
+    int n_splits, float scale, int window, float softcap) {
+    flash_decode_splitfused_body(q, k, v, partials, counter, out, n_heads, n_gqa,
+                                 head_dim, max_ctx, d_pos[0] + 1, n_splits, scale,
+                                 window, softcap);
 }
 
 // Standalone entry for the fused split-KV kernel — the `attn:decode_splitfused` parity
@@ -5857,6 +5952,45 @@ extern "C" int rsl_cuda_flash_attn_decode_f32_dpos(rsl_cuda_stream *s,
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) *
                    sizeof(float);
+    // Split-KV (FlashDecoding), FUSED single kernel, in the WHOLE-decode-step graph —
+    // the production-graph split path the per-layer 2-kernel split never reached. Takes
+    // precedence over the pipe kernel when gated on. n_heads×n_splits blocks fill the
+    // grid-starved slice; the fused last-block-combine is ONE node (no 2nd combine node
+    // that cost the per-layer graph −5.6%), and the whole-step graph already collapsed
+    // all per-layer launch overhead, so this isolates the SM-fill gain (eager +6%).
+    // kv_len is read from d_pos inside → the (n_heads, n_splits) grid + shmem stay FIXED
+    // = capture-stable. Pure launch (no malloc/sync/memset) ⇒ capture-safe like the pipe
+    // branch. Engages only when the gate (override/env) is on AND the partials+counter
+    // scratch is already allocated (prealloc'd pre-capture in rsl_cuda_flash_attn_prefill_f32;
+    // cudaMalloc is illegal during capture) — else falls through to pipe/base (safe).
+    // nsm is cached on the first (pre-capture) call so no cudaDeviceGetAttribute recurs.
+    if (rsl_splitfused_on()) {
+        static int s_nsm = -1;
+        if (s_nsm < 0)
+            cudaDeviceGetAttribute(&s_nsm, cudaDevAttrMultiProcessorCount, s->device);
+        int n_splits = rsl_decode_attn_n_splits(s_nsm, n_heads);
+        size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
+        if (n_splits > 1 && s->fd_partials && s->fd_partials_cap >= need &&
+            s->fd_counter && s->fd_counter_cap >= (size_t)n_heads) {
+            // One-time engagement confirmation (host-side, harmless during capture) so
+            // the A/B can tell a real split run from a silent fall-through to pipe/base.
+            static int sf_logged = 0;
+            if (!sf_logged) {
+                sf_logged = 1;
+                fprintf(stderr,
+                        "[rustllama] T2 split-KV FUSED decode attention ENGAGED "
+                        "(n_heads=%d n_splits=%d -> %d blocks; one-node "
+                        "last-block-combine) (logged once)\n",
+                        n_heads, n_splits, n_heads * n_splits);
+            }
+            dim3 sgrid((unsigned)n_heads, (unsigned)n_splits);
+            flash_attn_decode_splitfused_f32_dpos_kernel<<<sgrid, block, shmem,
+                                                           s->stream>>>(
+                q, k, v, s->fd_partials, s->fd_counter, out, n_heads, n_gqa, head_dim,
+                max_ctx, d_pos, n_splits, scale, window, softcap);
+            return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32_dpos");
+        }
+    }
     // Software-pipelined device-pos decode flash — the SHIPPED whole-step graph path.
     // Pure kernel launch (no malloc/sync/memset), so it is capture-safe: the branch
     // resolves from the stable Rust-set override (accel.rs pushes the verdict BEFORE the

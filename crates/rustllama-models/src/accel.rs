@@ -11111,6 +11111,22 @@ pub fn set_decode_pipe_force(v: Option<bool>) {
     DECODE_PIPE_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
+static DECODE_SPLIT_FUSED_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Force the split-KV FUSED decode-flash path on/off for the current process (the
+/// `tune --decode-split-fused` A/B harness only). `None` clears the override → the
+/// `RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED` env / the `attn:decode_splitfused{,_faster}`
+/// verdicts decide. Like the pipe force: the decode step graph re-captures on a model
+/// reload (it drops `step_graph_exec`), so the A/B sets this, reloads, measures per arm.
+pub fn set_decode_split_fused_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DECODE_SPLIT_FUSED_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
 /// reserved below free VRAM when `load_inner` projects the expert-promotion
 /// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
@@ -11265,6 +11281,49 @@ pub fn decode_attn_pipeline_enabled() -> bool {
         // the eager and the graph path (the global is process-wide).
         ck::set_decode_attn_pipeline(Some(on));
         on
+    })
+}
+
+/// Whether the split-KV FUSED decode-flash kernel runs inside the whole-decode-step
+/// graph (vs the pipe/base kernel): it launches n_heads×n_splits blocks (each a KV-
+/// chunk partial; the last block for a head atomically combines — ONE graph node) to
+/// FILL a grid-starved slice. This is the fix the GQA-group regression pointed at —
+/// 16 heads = 16 blocks badly underfills a ~48-SM slice, and going the OTHER way
+/// (fewer, heavier blocks) lost −32%, so more/lighter blocks is the lever. Gated on
+/// BOTH a correctness verdict [`VERDICT_DECODE_SPLIT_FUSED`] (the fused kernel matched
+/// the CPU reference, banked by `tune --validate-kernels` via the `attn:decode_splitfused`
+/// probe) AND a perf verdict [`VERDICT_DECODE_SPLIT_FUSED_FASTER`] (measured FASTER
+/// end-to-end at decode than the current best — the pipe kernel — banked by
+/// `tune --decode-split-fused`'s reload A/B). Like the pipe gate, the perf gate is a
+/// WHOLE-DECODE A/B: an isolated-kernel A/B hides the starvation (K/V stays warm in
+/// L2), while the real step's FFN matvecs evict K/V so the SM-fill win shows (+29%
+/// decode, coherent, sm_120 MIG, n_splits=3 → 48 blocks). TAKES PRECEDENCE over the
+/// pipe kernel when on (the `.cu` dpos entry orders the split branch first).
+/// `RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED=1` force-enables (the on-pod A/B lever), `=0`
+/// disables. Fail-closed: unmeasured / not-a-win ⇒ the pipe/base kernel. The decision
+/// is PUSHED into the CUDA decode entry (`ck::set_decode_attn_split_fused`) before the
+/// first capture.
+pub fn decode_attn_split_fused_enabled() -> bool {
+    // Transient A/B override (`tune --decode-split-fused`) wins and does NOT touch the
+    // OnceLock, so the env/verdict decision survives the force being cleared.
+    match DECODE_SPLIT_FUSED_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        match std::env::var("RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                kernel_verdict(rustllama_tuner::VERDICT_DECODE_SPLIT_FUSED)
+                    && kernel_verdict(rustllama_tuner::VERDICT_DECODE_SPLIT_FUSED_FASTER)
+            }
+        }
     })
 }
 
@@ -12164,6 +12223,11 @@ pub fn try_decode_step_cuda_graph_f32(
     // lands here, in the captured graph). Idempotent re-push each token; robust across
     // model reloads that re-capture the graph.
     ck::set_decode_attn_pipeline(Some(decode_attn_pipeline_enabled()));
+    // Split-KV FUSED decode takes precedence over the pipe kernel when its verdicts
+    // pass (the .cu dpos entry orders the split branch first); push it the same way,
+    // BEFORE capture, so the graph records it (and `ensure_fd_scratch` — run inside
+    // `decode_step_graph_f32` pre-capture — sees the override and allocates the scratch).
+    ck::set_decode_attn_split_fused(Some(decode_attn_split_fused_enabled()));
     let ok = unsafe {
         g.decode_step_graph_f32(
             layers, hidden, k_caches, v_caches, n_heads, n_kv_heads, head_dim, d_model, pos,

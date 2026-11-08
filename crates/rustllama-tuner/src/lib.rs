@@ -411,6 +411,26 @@ pub const VERDICT_DECODE_ATTN_PIPELINE: &str = "attn:decode_pipeline";
 /// correctness verdict [`VERDICT_DECODE_ATTN_PIPELINE`]; unmeasured / not-a-win ⇒ OFF
 /// (the base decode kernel runs), re-enabling only per (system,model) where it wins.
 pub const VERDICT_DECODE_ATTN_PIPELINE_FASTER: &str = "attn:decode_pipeline_faster";
+/// CORRECTNESS gate for the split-KV FUSED decode flash — the `attn:decode_splitfused`
+/// probe grades the fused single-kernel split (n_heads×n_splits KV-chunk partials, the
+/// last block per head atomically combines) vs the CPU flash-decode reference. The
+/// split rescale is the exact cross-chunk flash merge, so it stays cos≈1 (same answer
+/// as the whole-KV softmax within fp reassociation). Read by
+/// `accel::decode_attn_split_fused_enabled` together with the perf verdict below.
+/// Fail-closed OFF (unmeasured / miscompute ⇒ the pipe/base decode kernel).
+pub const VERDICT_DECODE_SPLIT_FUSED: &str = "attn:decode_splitfused";
+/// PERF gate for the split-KV FUSED decode flash — it must be measured FASTER
+/// end-to-end at DECODE than the current best (the pipe kernel) before it engages.
+/// Banked by `tune --decode-split-fused` (Stage 1e-e), a WHOLE-DECODE reload A/B (force
+/// split off → pipe/base per its verdict, load, measure decode tok/s; force split on,
+/// reload, measure). A WHOLE-DECODE A/B, not isolated: the lone kernel keeps K/V warm
+/// in L2 and hides the grid starvation; only the real step (FFN matvecs evict K/V, and
+/// n_heads blocks underfill the slice) shows the SM-fill win (+29% decode on sm_120
+/// MIG, n_splits=3 → 48 blocks, coherent). `accel::decode_attn_split_fused_enabled`
+/// AND's it with the correctness verdict [`VERDICT_DECODE_SPLIT_FUSED`]; unmeasured /
+/// not-a-win ⇒ OFF, re-enabling only per (system,model) where it wins. Split TAKES
+/// PRECEDENCE over pipe when both pass (it is the faster of the two).
+pub const VERDICT_DECODE_SPLIT_FUSED_FASTER: &str = "attn:decode_split_fused_faster";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror

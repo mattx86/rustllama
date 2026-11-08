@@ -1132,6 +1132,18 @@ extern "C" {
     // `attn:decode_pipeline` verdict from accel.rs). v: 0=base kernel, 1=pipe kernel,
     // anything else = clear the override (fall back to RUSTLLAMA_DECODE_ATTN_PIPELINE).
     fn rsl_cuda_set_decode_attn_pipeline(v: c_int);
+    // Process-wide override for the split-KV FUSED decode flash (driven by the
+    // `attn:decode_split_fused` verdict). v: 0=off, 1=on, else = clear the override
+    // (fall back to RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED).
+    fn rsl_cuda_set_decode_attn_split_fused(v: c_int);
+    // Eager pre-capture allocation of the split-KV fused decode scratch (partials +
+    // per-head arrival counter). No-op unless the fused-split gate is on; MUST be
+    // called OUTSIDE graph capture (cudaMalloc is illegal mid-capture). Best-effort.
+    fn rsl_cuda_ensure_fd_scratch(
+        s: *mut RslCudaStreamRaw,
+        n_heads: c_int,
+        head_dim: c_int,
+    ) -> c_int;
     // GPU paged attention (Phase B): block-table flash-decode against the
     // whole-pool device mirror. `block_table` = [ceil(kv_len/page_size)] i32.
     fn rsl_cuda_flash_attn_decode_paged_f32(
@@ -3634,6 +3646,25 @@ pub fn set_decode_attn_pipeline(sel: Option<bool>) {
     };
     // SAFETY: a trivial C setter storing one int to a process global; no pointers.
     unsafe { rsl_cuda_set_decode_attn_pipeline(v) }
+}
+
+/// Select the split-KV FUSED decode-flash kernel process-wide for the device-pos
+/// whole-decode-step graph entry ([`flash_attn_decode_f32_dpos`]). `Some(true)` =
+/// split-fused (n_heads×n_splits blocks, atomic last-block-combine — fills a grid-
+/// starved slice), `Some(false)` = off (fall to pipe/base), `None` = clear the
+/// override (fall back to the `RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED` env). Set ONCE
+/// before the first decode so the captured graph records the chosen kernel; driven by
+/// `accel::decode_attn_split_fused_enabled()` from the on-device
+/// `attn:decode_splitfused` (correct) + `attn:decode_split_fused_faster` (measured)
+/// verdicts. Takes precedence over the pipe kernel when on. Inert off-NVIDIA.
+pub fn set_decode_attn_split_fused(sel: Option<bool>) {
+    let v: c_int = match sel {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    };
+    // SAFETY: a trivial C setter storing one int to a process global; no pointers.
+    unsafe { rsl_cuda_set_decode_attn_split_fused(v) }
 }
 
 /// Fused split-KV decode attention (atomic last-block-combines) — standalone EAGER
@@ -9233,6 +9264,12 @@ impl CudaMatvecCache {
             if !stream_sync(&self.stream) {
                 return false;
             }
+            // Eagerly allocate the split-KV fused scratch (if that path is gated on)
+            // HERE — the one guaranteed pre-capture, NON-capturing moment with the dims
+            // known. The decode dpos entry runs only DURING capture (can't malloc
+            // there), and prefill no longer reliably hits its own prealloc. Best-effort:
+            // on failure the dpos split branch simply falls through to the pipe kernel.
+            rsl_cuda_ensure_fd_scratch(self.stream.raw(), n_heads as c_int, head_dim as c_int);
             // Shared activation-slab ptrs (offset-0 hidden carries the residual
             // across layers; the chain overwrites the rest per layer).
             let (o_hidden, o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
