@@ -2471,6 +2471,327 @@ __global__ void __launch_bounds__(512, 2) gemm_q8_0_w8a8_tc_128x64_kernel(
     }
 }
 
+// ============================================================
+// 128x128 W8A8 TC GEMM at 1024 THREADS (32 warps) — the occupancy escape the
+// 512-thread 128x128 / 128x64 banks could NOT reach. The roofline says the
+// production 64x64 is DRAM-BW-bound at 85% peak moving 8x the weight (re-read
+// N/BN=8x); the cycle profile puts 66% in global staging, ~0% in barriers (the
+// double-buffer dissolved them), 34% in compute. Halving the re-reads (a 128x128
+// tile: weight N/128, activation M/128) is the lever — total traffic is
+// M*N*K*(1/BM+1/BN), halved vs 64x64. The GEMM_DIAG showed WHY every prior big
+// tile LOST: a 128x128 over 512 threads is 32 outputs/thread -> cacc[4][8] = 128
+// regs -> `__launch_bounds__(512,…)` can only fit 1 block/SM (33% occupancy, HALF
+// the 64x64's 2x512=32 warps) -> latency-bound, BW collapses 85%->31%. It was a
+// REGISTER wall (the 34 KB shared fits 2 blocks fine), and the fix is NOT a
+// smaller tile (128x64 still lost) but MORE THREADS: at 1024 threads (32 warps) a
+// 128x128 tile is 16 outputs/thread -> cacc[2][8] = ~64 regs, so
+// `__launch_bounds__(1024, 1)` runs 1 block of 1024 threads = 1024 threads/SM =
+// 32 warps = EXACTLY the 64x64's warp density (67% occupancy) with NO register
+// wall — the first big tile that keeps the 64x64's warp count AND halves the DRAM
+// traffic (cacc[2][8] = 64 regs, spill 0, parity BIT-EXACT — on-device confirmed).
+// But measured (sync double-buffer, iter 1): 155 us @ 39% eff-BW — LATENCY-bound.
+// The single 1024-thread block can't generate the memory-level parallelism the
+// 64x64's TWO independent resident blocks do, so DRAM starves despite matched
+// occupancy. The fix (iter 2, this version) is cp.async staging (rsl_gemm_q8_0_
+// stage_tile_cpasync): the next tile's global->shared copies issue ASYNC and
+// overlap the MMA, so one block hides DRAM latency without needing a 2nd resident
+// block — exactly the roofline's "LATENCY-bound -> cp.async" prescription, and the
+// untested combo (the prior cp.async 128x128 was 512 threads / 33% occ; this is
+// 1024 / 67%). SAME int8 WMMA + per-32 scale fold -> parity-equal (fair-W8A8 ref).
+// 8x4 warp grid over the 8x8 fragment grid, each warp owns a 1x2 fragment pair.
+// KT=1 (matches the proven cp.async pipeline). Env-gated (RUSTLLAMA_GEMM_128T) +
+// repacked (int4 staging) + N>=128; shape-gated so the small-N spec path keeps the
+// 64x64. Dynamic shared ~50 KB: Cs[32][16][16] 32 KB + As/Bs 2*128*32 = 8 KB each
+// + scales 2 KB (> the 48 KB static cap -> opted up via the max-dyn-shared attr).
+// ============================================================
+// Dynamic-shared byte size for the 128t kernel (KT=1): Cs 32 KB + scales 2 KB +
+// As/Bs 16 KB = 50 KB — over the 48 KB STATIC per-block cap, so it uses dynamic
+// shared (opted up via cudaFuncAttributeMaxDynamicSharedMemorySize at launch; the
+// hardware allows ~100 KB/SM, GEMM_DIAG-confirmed). Layout is alignment-ordered
+// (Cs/scales 4-aligned, then the 16-aligned As/Bs for the int4 vector stores).
+#define RSL_GEMM_128T_KT 1
+static constexpr int rsl_gemm_128t_smem_bytes() {
+    const int BM = 128, BN = 128, KT = RSL_GEMM_128T_KT, KW = KT * 32, WARPS = 32;
+    return WARPS * 16 * 16 * (int)sizeof(int)        // Cs
+           + 2 * BM * KT * (int)sizeof(float)        // dw
+           + 2 * BN * KT * (int)sizeof(float)        // xscl
+           + 2 * BM * KW + 2 * BN * KW;              // As + Bs (signed char)
+}
+template <bool REPACK>
+__global__ void __launch_bounds__(32 * 32, 1) gemm_q8_0_w8a8_tc_128t_kernel(
+    const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
+    const unsigned short *__restrict__ wd, const signed char *__restrict__ xq,
+    const float *__restrict__ xs, float *__restrict__ out, int M, int K, int N) {
+    constexpr int BM = 128, BN = 128, KT = RSL_GEMM_128T_KT, WARPS = 32, KW = KT * 32;
+    // Carve the dynamic shared blob: Cs (4-aligned) | dw | xscl | As | Bs (16-aligned
+    // for the int4 vector stores — every prior offset is a multiple of 16).
+    extern __shared__ __align__(16) unsigned char rsl_smem[];
+    int (*Cs)[16][16] = reinterpret_cast<int (*)[16][16]>(rsl_smem);
+    float *dw = reinterpret_cast<float *>(rsl_smem + WARPS * 16 * 16 * sizeof(int));
+    float *xscl = dw + 2 * BM * KT;
+    signed char *As = reinterpret_cast<signed char *>(xscl + 2 * BN * KT);
+    signed char *Bs = As + 2 * BM * KW;
+
+    const int rowBase = blockIdx.x * BM;
+    const int tokBase = blockIdx.y * BN;
+    const int warpId = threadIdx.y; // 0..31
+    const int lane = threadIdx.x;   // 0..31
+    const int tid = warpId * 32 + lane;
+    const int nthreads = WARPS * 32; // 1024
+    const int spr = K / 32;
+    // 8x4 warp grid over the 8x8 fragment grid: each warp owns a 1x2 fragment pair
+    // (one 16-row band wmr, two adjacent 16-token bands 2*wmc + {0,1}).
+    const int wmr = warpId >> 2; // 0..7 fragment row
+    const int wmc = warpId & 3;  // 0..3 which pair of token-frags
+
+    float cacc[2][8];
+#pragma unroll
+    for (int f = 0; f < 2; ++f)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) cacc[f][c] = 0.0f;
+
+    const int nTiles = spr; // KT=1 → one 32-wide sub-block per tile
+    // Per-buffer strides into the flat dynamic-shared arrays (As/Bs = [2][B*][KW],
+    // dw/xscl = [2][B*][KT]); buffer `b` begins at `b*<stride>`.
+    const int As_bs = BM * KW, Bs_bs = BN * KW, dw_bs = BM * KT, xscl_bs = BN * KT;
+    // cp.async double-buffer: the single big 1024-thread block can't generate the
+    // memory-level parallelism that the 64x64's TWO resident blocks do, so the sync
+    // double-buffer starved DRAM (39% eff-BW). cp.async issues the next tile's
+    // global->shared copies ASYNC (overlapping the MMA) so one block hides DRAM
+    // latency on its own — the roofline's prescription for the latency-bound big
+    // tile. Stage tile 0 async + commit, then each iter prefetches tile t+1 and
+    // waits on tile t.
+    rsl_gemm_q8_0_stage_tile_cpasync<REPACK, BM, BN, KT>(0, spr, M, N, K, rowBase, tokBase, tid,
+                                                         nthreads, w, wq, wd, xq, xs, As, Bs, dw,
+                                                         xscl);
+    __pipeline_commit();
+
+    for (int t = 0; t < nTiles; ++t) {
+        const int cur = t & 1;
+        if (t + 1 < nTiles) {
+            const int nxt = cur ^ 1;
+            rsl_gemm_q8_0_stage_tile_cpasync<REPACK, BM, BN, KT>(
+                (t + 1) * KT, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, wq, wd, xq, xs,
+                As + nxt * As_bs, Bs + nxt * Bs_bs, dw + nxt * dw_bs, xscl + nxt * xscl_bs);
+            __pipeline_commit();
+        }
+        // Wait for tile t's group (keep tile t+1's in flight if it was issued).
+        __pipeline_wait_prior((t + 1 < nTiles) ? 1 : 0);
+        __syncthreads();
+        const signed char *As_c = As + cur * As_bs;
+        const signed char *Bs_c = Bs + cur * Bs_bs;
+        const float *dw_c = dw + cur * dw_bs;
+        const float *xscl_c = xscl + cur * xscl_bs;
+        const int sub = 0; // KT=1
+#pragma unroll
+        for (int fi = 0; fi < 2; ++fi) {
+            const int fm = wmr;          // 0..7 fragment row
+            const int fn = 2 * wmc + fi; // 0..7 fragment col
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, signed char,
+                                   nvcuda::wmma::row_major> a_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, signed char,
+                                   nvcuda::wmma::col_major> b_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
+            nvcuda::wmma::fill_fragment(acc_frag, 0);
+#pragma unroll
+            for (int kk = 0; kk < 32; kk += 16) {
+                nvcuda::wmma::load_matrix_sync(a_frag, &As_c[fm * 16 * KW + kk], KW);
+                nvcuda::wmma::load_matrix_sync(b_frag, &Bs_c[fn * 16 * KW + kk], KW);
+                nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+            nvcuda::wmma::store_matrix_sync(&Cs[warpId][0][0], acc_frag, 16,
+                                            nvcuda::wmma::mem_row_major);
+#else
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32, mi = e >> 4, nj = e & 15, acc_i = 0;
+                for (int kk = 0; kk < 32; ++kk)
+                    acc_i += (int)As_c[(fm * 16 + mi) * KW + kk] *
+                             (int)Bs_c[(fn * 16 + nj) * KW + kk];
+                Cs[warpId][mi][nj] = acc_i;
+            }
+#endif
+            __syncwarp();
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                int e = lane + c * 32, mi = e >> 4, nj = e & 15;
+                int row = fm * 16 + mi, tok = fn * 16 + nj;
+                cacc[fi][c] +=
+                    xscl_c[tok * KT + sub] * dw_c[row * KT + sub] * (float)Cs[warpId][mi][nj];
+            }
+            __syncwarp(); // before this warp reuses Cs for the next fragment
+        }
+        __syncthreads(); // prefetched tile visible + current buffer free to reuse
+    }
+
+    // Write out[token][row] for each of the warp's 2 fragments.
+#pragma unroll
+    for (int fi = 0; fi < 2; ++fi) {
+        const int m0 = rowBase + wmr * 16;
+        const int n0 = tokBase + (2 * wmc + fi) * 16;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int e = lane + c * 32, mi = e >> 4, nj = e & 15;
+            int mg = m0 + mi, ng = n0 + nj;
+            if (mg < M && ng < N) out[(size_t)ng * M + mg] = cacc[fi][c];
+        }
+    }
+}
+
+// Capture-safe override for the 64x128 GEMM tile: accel pushes the verdict-driven
+// decision here (>=0 wins over the env) before the batched prefill GEMM runs, so
+// production auto-enables with NO env var (RUSTLLAMA_GEMM_64X128 stays a pre-verdict
+// override only). Mirrors `rsl_cuda_set_decode_attn_split_fused`.
+static int g_gemm_64x128_override = -1;
+extern "C" void rsl_cuda_set_gemm_64x128(int v) {
+    g_gemm_64x128_override = (v == 0 || v == 1) ? v : -1;
+}
+static inline int rsl_gemm_64x128_on() {
+    if (g_gemm_64x128_override >= 0) return g_gemm_64x128_override;
+    static int e64 = -1;
+    if (e64 < 0) {
+        const char *e = std::getenv("RUSTLLAMA_GEMM_64X128");
+        e64 = (e != nullptr && e[0] == '1') ? 1 : 0; // only "1..." is ON ("0" is OFF)
+    }
+    return e64;
+}
+
+// ============================================================
+// 64x128 W8A8 TC GEMM, FRAGMENT-DIRECT scale fold (no Cs shared round-trip).
+// The decisive finding: on this MIG slice DRAM saturation needs TWO resident
+// blocks/SM (the 64x64 gets 89% eff-BW at 2 blocks; EVERY 1-block big tile —
+// 128x128, 128t sync AND cp.async — stalls at ~40%). A 2-block BIGGER tile is the
+// only way to cut re-reads without losing BW, but the prior 2-block big tile
+// (128x64) dropped to 50% under its per-block overhead: a 40 B spill + the 16 KB
+// `Cs` shared round-trip (store_matrix_sync -> __syncwarp -> reload) done TWICE
+// per sub-block (2 frags/warp). This kernel removes that overhead entirely by
+// folding the per-32 weight*act scales DIRECTLY from the wmma accumulator fragment
+// registers `acc_frag.x[i]` — no `Cs` array, no store/sync/reload — using the
+// documented m16n8-composite TV map (row = (lane>>2) + (sub3>>1?8:0); col = half*8
+// + (lane&3)*2 + (i&1)), the SAME map rsl_hopper.cuh folds its wgmma tile with.
+// Tile is 64x128 (BM=64 keeps cacc[2][8] = 16 regs so `__launch_bounds__(512,2)`
+// holds 2 blocks/SM like the 64x64; BN=128 HALVES the weight re-read N/BN 8x->4x —
+// weight is the dominant operand). SAME sync double-buffer (rsl_gemm_q8_0_stage_
+// tile) + int8 WMMA as the 64x64 -> lean, 2 blocks, 89%-BW shot at HALF the weight
+// traffic (24 MB vs 32 MB => ~1.3-1.6x if BW holds). Static shared ~27 KB (no Cs,
+// no dynamic shared): As[2][64][64] 8 KB + Bs[2][128][64] 16 KB + scales 3 KB.
+// Env-gated (RUSTLLAMA_GEMM_64X128) + repacked + N>=128. GRADED vs the fair-W8A8
+// ref (the fragment-TV-map fold is the one thing that can break -> fail-closed).
+// ============================================================
+template <bool REPACK>
+__global__ void __launch_bounds__(16 * 32, 2) gemm_q8_0_w8a8_tc_64x128_kernel(
+    const unsigned char *__restrict__ w, const signed char *__restrict__ wq,
+    const unsigned short *__restrict__ wd, const signed char *__restrict__ xq,
+    const float *__restrict__ xs, float *__restrict__ out, int M, int K, int N) {
+    constexpr int BM = 64, BN = 128, KT = 2, WARPS = 16, KW = KT * 32;
+    __shared__ __align__(16) signed char As[2][BM][KW]; // 8 KB
+    __shared__ __align__(16) signed char Bs[2][BN][KW]; // 16 KB
+    __shared__ float dw[2][BM][KT];                     // per-row weight scale
+    __shared__ float xscl[2][BN][KT];                   // per-token act scale
+
+    const int rowBase = blockIdx.x * BM;
+    const int tokBase = blockIdx.y * BN;
+    const int warpId = threadIdx.y; // 0..15
+    const int lane = threadIdx.x;   // 0..31
+    const int tid = warpId * 32 + lane;
+    const int nthreads = WARPS * 32; // 512
+    const int spr = K / 32;
+    // 4x4 warp grid over the 4x8 fragment grid: each warp owns 1 frag-row (wmr) and
+    // 2 adjacent token frag-cols (2*wmc + {0,1}).
+    const int wmr = warpId & 3;  // 0..3 fragment row
+    const int wmc = warpId >> 2; // 0..3 which pair of token-frags
+
+    float cacc[2][8];
+#pragma unroll
+    for (int f = 0; f < 2; ++f)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) cacc[f][c] = 0.0f;
+
+    const int nTiles = (spr + KT - 1) / KT;
+    const int As_bs = BM * KW, Bs_bs = BN * KW, dw_bs = BM * KT, xscl_bs = BN * KT;
+    rsl_gemm_q8_0_stage_tile<REPACK, BM, BN, KT>(0, spr, M, N, K, rowBase, tokBase, tid, nthreads,
+                                                 w, wq, wd, xq, xs, &As[0][0][0], &Bs[0][0][0],
+                                                 &dw[0][0][0], &xscl[0][0][0]);
+    __syncthreads();
+
+    for (int t = 0; t < nTiles; ++t) {
+        const int cur = t & 1;
+        const int gt = t * KT;
+        const int nsub = (spr - gt < KT) ? (spr - gt) : KT;
+        if (t + 1 < nTiles) {
+            const int nxt = cur ^ 1;
+            rsl_gemm_q8_0_stage_tile<REPACK, BM, BN, KT>(
+                (t + 1) * KT, spr, M, N, K, rowBase, tokBase, tid, nthreads, w, wq, wd, xq, xs,
+                &As[nxt][0][0], &Bs[nxt][0][0], &dw[nxt][0][0], &xscl[nxt][0][0]);
+        }
+        const signed char *As_c = &As[cur][0][0];
+        const signed char *Bs_c = &Bs[cur][0][0];
+        const float *dw_c = &dw[cur][0][0];
+        const float *xscl_c = &xscl[cur][0][0];
+        for (int sub = 0; sub < nsub; ++sub) {
+            const int kbase = sub * 32;
+#pragma unroll
+            for (int fi = 0; fi < 2; ++fi) {
+                const int fm = wmr;          // 0..3 fragment row
+                const int fn = 2 * wmc + fi; // 0..7 fragment col
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, signed char,
+                                       nvcuda::wmma::row_major> a_frag;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, signed char,
+                                       nvcuda::wmma::col_major> b_frag;
+                nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
+                nvcuda::wmma::fill_fragment(acc_frag, 0);
+#pragma unroll
+                for (int kk = 0; kk < 32; kk += 16) {
+                    nvcuda::wmma::load_matrix_sync(a_frag, &As_c[fm * 16 * KW + kbase + kk], KW);
+                    nvcuda::wmma::load_matrix_sync(b_frag, &Bs_c[fn * 16 * KW + kbase + kk], KW);
+                    nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                }
+                // FRAGMENT-DIRECT fold: no Cs. Each thread's acc_frag.x[i] maps to a
+                // (row_local,col_local) in the 16x16 tile by the m16n8-composite map.
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    int row_local = (lane >> 2) + (((i & 3) >> 1) ? 8 : 0);
+                    int col_local = (i >> 2) * 8 + (lane & 3) * 2 + (i & 1);
+                    int row = fm * 16 + row_local; // 0..63
+                    int tok = fn * 16 + col_local; // 0..127
+                    cacc[fi][i] += xscl_c[tok * KT + sub] * dw_c[row * KT + sub] *
+                                   (float)acc_frag.x[i];
+                }
+#else
+                // Scalar fallback (arch < sm_72, never in the release list): compute
+                // each element's int32 dot for the SAME (row_local,col_local) map.
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    int row_local = (lane >> 2) + (((i & 3) >> 1) ? 8 : 0);
+                    int col_local = (i >> 2) * 8 + (lane & 3) * 2 + (i & 1);
+                    int row = fm * 16 + row_local, tok = fn * 16 + col_local, acc_i = 0;
+                    for (int kk = 0; kk < 32; ++kk)
+                        acc_i += (int)As_c[row * KW + kbase + kk] * (int)Bs_c[tok * KW + kbase + kk];
+                    cacc[fi][i] += xscl_c[tok * KT + sub] * dw_c[row * KT + sub] * (float)acc_i;
+                }
+#endif
+            }
+        }
+        __syncthreads(); // prefetched tile visible + current buffer free to reuse
+    }
+
+    // Write out[token][row] via the same fragment-TV map.
+#pragma unroll
+    for (int fi = 0; fi < 2; ++fi) {
+        const int fm = wmr, fn = 2 * wmc + fi;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int row_local = (lane >> 2) + (((i & 3) >> 1) ? 8 : 0);
+            int col_local = (i >> 2) * 8 + (lane & 3) * 2 + (i & 1);
+            int mg = rowBase + fm * 16 + row_local;
+            int ng = tokBase + fn * 16 + col_local;
+            if (mg < M && ng < N) out[(size_t)ng * M + mg] = cacc[fi][i];
+        }
+    }
+}
+
 // One-time repack of a packed Q8_0 weight into the 16-aligned, int4-stageable
 // layout the W8A8 TC GEMM wants: split each 34-byte block (2-byte f16 scale + 32
 // int8) into a contiguous int8 payload `wq[row*K + k]` + an f16-scale array
@@ -2848,6 +3169,23 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
     if (use128x64_env < 0)
         use128x64_env = (std::getenv("RUSTLLAMA_GEMM_128x64") != nullptr) ? 1 : 0;
     const bool use128x64 = (N >= 64) && use128x64_env && repacked && !use128;
+    // 128x128 @ 1024 threads: DEFAULT OFF (RUSTLLAMA_GEMM_128T=1 to opt in). The
+    // occupancy escape the 512-thread big tiles couldn't reach — 32 warps so a
+    // 128x128 tile is cacc[2][8] (not [4][8]) at 67% occupancy (== the 64x64) with
+    // HALF the DRAM re-reads. Repacked (int4 staging) + N>=128; takes precedence
+    // over the banked 128/128x64 dead ends.
+    static int use128t_env = -1;
+    if (use128t_env < 0)
+        use128t_env = (std::getenv("RUSTLLAMA_GEMM_128T") != nullptr) ? 1 : 0;
+    const bool use128t = (N >= 128) && use128t_env && repacked;
+    // 64x128 fragment-direct fold: DEFAULT OFF (RUSTLLAMA_GEMM_64X128=1). The lean
+    // 2-block-per-SM big tile — cacc[2][8] holds 2 blocks like the 64x64, BN=128
+    // halves the weight re-read, and the per-32 scale folds straight from the wmma
+    // accumulator fragment (no Cs round-trip). Repacked (int4 staging) + N>=128;
+    // checked FIRST (the live candidate).
+    // Verdict-driven (accel pushes rsl_cuda_set_gemm_64x128) with the env as a
+    // pre-verdict override; the live production tile when its verdicts pass.
+    const bool use64x128 = (N >= 128) && rsl_gemm_64x128_on() && repacked;
     // One-shot gate trace (opt-in: RUSTLLAMA_GEMM_128x64) — the pod A/B showed the
     // 128x64 path never engaged (identical eff-BW on/off) with the gate LOOKING
     // correct, so print each input the first time the env is set to localize which
@@ -2951,6 +3289,56 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                              fa3.numRegs, fa3.localSizeBytes, fa3.sharedSizeBytes, active3,
                              occ3 * 100.0);
             }
+            // 128x128 @ 1024 threads — the occupancy escape. WIN condition: regs<=64
+            // (so 1 block of 1024 threads fits the 65536-reg SM file) AND spill=0 AND
+            // activeBlocks/SM=1 -> occupancy 1024/1536 = 67% (== the 64x64's 2x512).
+            // If regs>64 it spills / drops below 1 block — then the tile is too big
+            // for 1024 threads and needs the Cs-elimination follow-up to shed regs.
+            // Opt the kernel into >48 KB dynamic shared BEFORE the occupancy query,
+            // else the query returns 0 blocks (the ~50 KB exceeds the default cap).
+            cudaFuncSetAttribute(gemm_q8_0_w8a8_tc_128t_kernel<true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 rsl_gemm_128t_smem_bytes());
+            cudaFuncAttributes fa4;
+            if (cudaFuncGetAttributes(&fa4, gemm_q8_0_w8a8_tc_128t_kernel<true>) == cudaSuccess) {
+                int nsm4 = 0, maxThreadsSM4 = 0, active4 = 0;
+                cudaDeviceGetAttribute(&nsm4, cudaDevAttrMultiProcessorCount, s->device);
+                cudaDeviceGetAttribute(&maxThreadsSM4, cudaDevAttrMaxThreadsPerMultiProcessor,
+                                       s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active4, gemm_q8_0_w8a8_tc_128t_kernel<true>, 1024,
+                    rsl_gemm_128t_smem_bytes());
+                double occ4 =
+                    maxThreadsSM4 > 0 ? (double)(active4 * 1024) / (double)maxThreadsSM4 : 0.0;
+                std::fprintf(stderr,
+                             "[gemm-diag] q8_0_w8a8_tc_128t (1024thr, 32 warps): "
+                             "regs/thread=%d LOCAL(spill)=%zu B static_smem=%zu B/block | "
+                             "block=1024thr activeBlocks/SM=%d -> occupancy=%.0f%%  "
+                             "(WANT: regs<=64 & spill=0 & activeBlocks/SM=1 => 67%%)\n",
+                             fa4.numRegs, fa4.localSizeBytes, fa4.sharedSizeBytes, active4,
+                             occ4 * 100.0);
+            }
+            // 64x128 fragment-direct kernel — the live candidate. WIN condition:
+            // regs<=64 & spill=0 & activeBlocks/SM=2 -> 67% (== the 64x64, so the
+            // lean 2-block structure held while BN=128 halved the weight re-read).
+            cudaFuncAttributes fa5;
+            if (cudaFuncGetAttributes(&fa5, gemm_q8_0_w8a8_tc_64x128_kernel<true>) == cudaSuccess) {
+                int nsm5 = 0, maxThreadsSM5 = 0, active5 = 0;
+                cudaDeviceGetAttribute(&nsm5, cudaDevAttrMultiProcessorCount, s->device);
+                cudaDeviceGetAttribute(&maxThreadsSM5, cudaDevAttrMaxThreadsPerMultiProcessor,
+                                       s->device);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active5, gemm_q8_0_w8a8_tc_64x128_kernel<true>, 512, 0);
+                double occ5 =
+                    maxThreadsSM5 > 0 ? (double)(active5 * 512) / (double)maxThreadsSM5 : 0.0;
+                std::fprintf(stderr,
+                             "[gemm-diag] q8_0_w8a8_tc_64x128 (512thr, frag-direct, no Cs): "
+                             "regs/thread=%d LOCAL(spill)=%zu B static_smem=%zu B/block | "
+                             "block=512thr activeBlocks/SM=%d -> occupancy=%.0f%%  "
+                             "(WANT: regs<=64 & spill=0 & activeBlocks/SM=2 => 67%%)\n",
+                             fa5.numRegs, fa5.localSizeBytes, fa5.sharedSizeBytes, active5,
+                             occ5 * 100.0);
+            }
         }
     }
     // In-kernel cycle profiler (opt-in: RUSTLLAMA_GEMM_CYCLES=1). Launch the PROF
@@ -3039,10 +3427,21 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             const int ITERS = 50;
             dim3 g128((unsigned)((M + 127) / 128), (unsigned)((N + 127) / 128));
             dim3 b128(32, 16);
+            dim3 b128t(32, 32); // 1024-thread (32-warp) block for the 128t kernel
             dim3 g1x64((unsigned)((M + 127) / 128), (unsigned)((N + 63) / 64));
+            dim3 g64x128((unsigned)((M + 63) / 64), (unsigned)((N + 127) / 128));
+            dim3 b64x128(32, 16); // 512-thread block for the 64x128 kernel
 #define RSL_RL_GEMM()                                                                      \
     do {                                                                                   \
-        if (use128x64) {                                                                   \
+        if (use64x128) {                                                                   \
+            gemm_q8_0_w8a8_tc_64x128_kernel<true>                                          \
+                <<<g64x128, b64x128, 0, s->stream>>>(nullptr, wq, wd, xq, xs, out, M, K,   \
+                                                     N);                                   \
+        } else if (use128t) {                                                              \
+            gemm_q8_0_w8a8_tc_128t_kernel<true>                                            \
+                <<<g128, b128t, rsl_gemm_128t_smem_bytes(), s->stream>>>(                  \
+                    nullptr, wq, wd, xq, xs, out, M, K, N);                                 \
+        } else if (use128x64) {                                                            \
             gemm_q8_0_w8a8_tc_128x64_kernel<true>                                          \
                 <<<g1x64, b128, 0, s->stream>>>(nullptr, wq, wd, xq, xs, out, M, K, N);    \
         } else if (use128) {                                                               \
@@ -3062,6 +3461,10 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
                     nullptr);                                                              \
         }                                                                                  \
     } while (0)
+            if (use128t)
+                cudaFuncSetAttribute(gemm_q8_0_w8a8_tc_128t_kernel<true>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     rsl_gemm_128t_smem_bytes());
             RSL_RL_GEMM(); // warmup
             cudaStreamSynchronize(s->stream);
             cudaEventRecord(e0, s->stream);
@@ -3080,8 +3483,14 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             double w_bytes = (double)M * K + (double)M * (K / 32) * 2.0;
             double a_bytes = (double)N * K + (double)N * (K / 32) * 2.0;
             double o_bytes = (double)M * N * 4.0;
-            double bn = use128x64 ? 64.0 : (use128 ? 128.0 : (double)RSL_Q4K_TC_BN);
-            double bm = use128x64 ? 128.0 : (use128 ? 128.0 : (double)RSL_Q4K_TC_BM);
+            double bn = use64x128 ? 128.0
+                        : use128t ? 128.0
+                        : use128x64 ? 64.0
+                        : (use128 ? 128.0 : (double)RSL_Q4K_TC_BN);
+            double bm = use64x128 ? 64.0
+                        : use128t ? 128.0
+                        : use128x64 ? 128.0
+                        : (use128 ? 128.0 : (double)RSL_Q4K_TC_BM);
             double min_bytes = w_bytes + a_bytes + o_bytes;
             double eff_bytes =
                 w_bytes * ((double)N / bn) + a_bytes * ((double)M / bm) + o_bytes;
@@ -3091,7 +3500,10 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             double pct = peak_gbs > 0 ? 100.0 / peak_gbs : 0.0;
             // Name the kernel RSL_RL_GEMM actually dispatched, so an A/B that flips
             // RUSTLLAMA_GEMM_128x64 is unambiguous instead of inferring it from eff-BW.
-            const char *kern = use128x64 ? "128x64" : (use128 ? "128x128" : "64x64");
+            const char *kern = use64x128 ? "64x128"
+                               : use128t ? "128t"
+                               : use128x64 ? "128x64"
+                               : (use128 ? "128x128" : "64x64");
             std::fprintf(stderr,
                          "[gemm-roofline] q8_0_w8a8_tc[%s] M=%d K=%d N=%d weights=%s: "
                          "%.1f us/call | %.2f int8-TOPS | eff-BW=%.0f GB/s (%.0f%% peak, "
@@ -3108,6 +3520,40 @@ extern "C" int rsl_cuda_gemm_q8_0_w8a8_tc(rsl_cuda_stream *s, const void *w,
             std::fprintf(stderr, "[gemm-roofline] verdict: %s\n", verdict);
             return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
         }
+    }
+    // 128x128 @ 1024 threads — opt-in (RUSTLLAMA_GEMM_128T=1) + N>=128 + repacked,
+    // via `use128t`. The occupancy escape (32 warps → 67% occ == the 64x64, half the
+    // re-reads); checked FIRST so it wins over the banked 128/128x64 dead ends.
+    if (use64x128) {
+        // Lean 2-block big tile, fragment-direct fold (no Cs). Static shared ~27 KB
+        // -> no dynamic-shared opt-in needed. Checked first (the live candidate).
+        static int e64_logged = 0;
+        if (!e64_logged) {
+            e64_logged = 1;
+            fprintf(stderr,
+                    "[rustllama] prefill GEMM: 64x128 fragment-direct tile ENGAGED "
+                    "(2-block/SM, BN=128 half weight re-read, no Cs round-trip) (logged once)\n");
+        }
+        dim3 g((unsigned)((M + 63) / 64), (unsigned)((N + 127) / 128));
+        dim3 b(32, 16); // 512 threads
+        gemm_q8_0_w8a8_tc_64x128_kernel<true><<<g, b, 0, s->stream>>>(
+            nullptr, wq, wd, xq, xs, out, M, K, N);
+        return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
+    }
+    if (use128t) {
+        // Opt the kernel into >48 KB shared ONCE (it carves ~68 KB dynamic shared).
+        static int t_attr = 0;
+        const int shb = rsl_gemm_128t_smem_bytes();
+        if (!t_attr) {
+            t_attr = 1;
+            cudaFuncSetAttribute(gemm_q8_0_w8a8_tc_128t_kernel<true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, shb);
+        }
+        dim3 g((unsigned)((M + 127) / 128), (unsigned)((N + 127) / 128));
+        dim3 b(32, 32); // 1024 threads
+        gemm_q8_0_w8a8_tc_128t_kernel<true><<<g, b, shb, s->stream>>>(
+            nullptr, wq, wd, xq, xs, out, M, K, N);
+        return rsl_cuda_check("rsl_cuda_gemm_q8_0_w8a8_tc");
     }
     // 128x64 tile — opt-in (RUSTLLAMA_GEMM_128x64=1) + repacked weights, via
     // `use128x64`. BANKED a DEAD END (latency-bound, 170 vs 130 us/call on the MIG

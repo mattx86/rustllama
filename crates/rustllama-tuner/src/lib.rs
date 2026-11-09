@@ -218,6 +218,19 @@ pub const VERDICT_GEMM_Q4K_W8A8_TC: &str = "gemm:q4_k_w8a8_tc";
 /// auto-enables only where correct AND faster. The Q8_0 analog of
 /// [`VERDICT_GEMM_Q4K_W8A8_TC`].
 pub const VERDICT_GEMM_Q8_0_W8A8_TC: &str = "gemm:q8_0_w8a8_tc";
+/// Q8_0 W8A8 prefill GEMM via the 64x128 FRAGMENT-DIRECT tile (BIT-EXACT vs the
+/// 64x64 TC GEMM — same int8 math, the per-32 scales fold straight from the wmma
+/// accumulator fragment so there is no `Cs` shared round-trip). The lean 2-block-
+/// per-SM big tile: BN=128 halves the weight re-read while BM=64 keeps 2 blocks/SM,
+/// so it's near compute-peak (on-device: 130.6->63.6 us/call = 2.05x). Backs
+/// `gemm_q8_0_64x128`; graded for CORRECTNESS by the 64x128 TC probe (the fragment
+/// TV-map fold is the one thing that can break). AND'd with the _FASTER perf verdict.
+pub const VERDICT_GEMM_Q8_0_64X128: &str = "gemm:q8_0_w8a8_tc_64x128";
+/// Perf half of the 64x128 gate: the probe times the 64x128 tile vs the 64x64 TC
+/// GEMM at a prefill shape and records whether 64x128 is FASTER (>1.05x). `accel`
+/// AND's it with [`VERDICT_GEMM_Q8_0_64X128`]; unmeasured/slower HW stays on the
+/// 64x64. Mirrors the split-fused faster-gate.
+pub const VERDICT_GEMM_Q8_0_64X128_FASTER: &str = "gemm:q8_0_w8a8_tc_64x128_faster";
 /// Q4_K W4A8 DECODE matvec (int8 activations, LOSSY). Backs `q4k_w4a8`, wired
 /// onto the single-row CUDA decode path ABOVE the bit-exact f32 warp matvec (it
 /// is dispatched first). Graded by a FAIR W8A8 probe (int8 activations) + the

@@ -7195,6 +7195,187 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         cu_tc_grade(name, &gpu_out, &cpu_out, MV_M, &mut counts);
     }
 
+    // The 128x128 @ 1024-thread (32-warp) prefill GEMM tile — SAME int8-TC math +
+    // per-32 scale fold + shared staging helper as the 64x64/128x64 kernels, only
+    // the warp->fragment map (8x4 warps, 1x2 frag pair/warp) + thread count differ.
+    // What can break it: the frag map / scale fold / masked write-out at 32 warps.
+    // Runs ONLY when RUSTLLAMA_GEMM_128T routes N>=128 through the 128t kernel (so
+    // the user's perf A/B validates it in the same pass), at N=256 (2 full 128-token
+    // blocks so both token halves + all 8 frag rows are exercised), graded vs the
+    // same fair-W8A8 reference. Export the env at process start.
+    #[allow(clippy::never_loop)]
+    for _t128t in 0..1usize {
+        if std::env::var("RUSTLLAMA_GEMM_128T").is_err() {
+            break; // not opted in → the launcher stays on the 64x64 path, nothing to grade
+        }
+        const N2: usize = 256;
+        let name = "gemm:q8_0_w8a8_tc_128t";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q8_0").expect("layout");
+        let cpu = cpu_matvec_for("q8_0");
+        let xb_host: Vec<f32> = gen_x(N2 * MV_K, 0x1287);
+        let Some((w, _)) = finite_ref(layout, cpu, &xb_host[..MV_K]) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut cpu_out = vec![0f32; N2 * MV_M];
+        for r in 0..N2 {
+            let xr = int8_act_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
+            let mut row = vec![0f32; MV_M];
+            cpu(&w, &xr, &mut row, MV_M, MV_K);
+            cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
+        }
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &xb_host),
+            ck::CudaDeviceBuffer::alloc(&stream, N2 * MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: live device buffers on `stream` sized for (N2,M)/(N2,K). With the
+        // env set, the launcher routes this N>=128 call through the 128t kernel.
+        let res = unsafe {
+            ck::gemm_q8_0_w8a8_tc(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+                N2,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        }
+        let gpu_out = cu_download_f32(&ob, N2 * MV_M);
+        cu_tc_grade(name, &gpu_out, &cpu_out, MV_M, &mut counts);
+    }
+
+    // The 64x128 fragment-direct GEMM — the ONE thing that can break it is the
+    // accumulator-fragment TV map it folds the per-32 scales with (row/col of each
+    // acc_frag.x[i]) + the masked write-out; a wrong map scrambles the output. This
+    // probe grades THAT at N=256 (2 full 128-token blocks → both wmc halves + all 4
+    // frag rows exercised) vs the same fair-W8A8 reference. Runs only when the env
+    // routes N>=128 through the 64x128 kernel; export it at process start.
+    #[allow(clippy::never_loop)]
+    for _t64x128 in 0..1usize {
+        // Force the 64x128 path via the capture-safe override (NOT the env) so
+        // validate-kernels banks the verdict unconditionally; cleared at the end.
+        ck::set_gemm_64x128(Some(true));
+        const N2: usize = 256;
+        let name = "gemm:q8_0_w8a8_tc_64x128";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q8_0").expect("layout");
+        let cpu = cpu_matvec_for("q8_0");
+        let xb_host: Vec<f32> = gen_x(N2 * MV_K, 0x64A8);
+        let Some((w, _)) = finite_ref(layout, cpu, &xb_host[..MV_K]) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut cpu_out = vec![0f32; N2 * MV_M];
+        for r in 0..N2 {
+            let xr = int8_act_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
+            let mut row = vec![0f32; MV_M];
+            cpu(&w, &xr, &mut row, MV_M, MV_K);
+            cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
+        }
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &xb_host),
+            ck::CudaDeviceBuffer::alloc(&stream, N2 * MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: live device buffers on `stream` sized for (N2,M)/(N2,K). With the
+        // env set, the launcher routes this N>=128 call through the 64x128 kernel.
+        let res = unsafe {
+            ck::gemm_q8_0_w8a8_tc(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+                N2,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        }
+        let gpu_out = cu_download_f32(&ob, N2 * MV_M);
+        cu_tc_grade(name, &gpu_out, &cpu_out, MV_M, &mut counts);
+
+        // PERF half (banks `gemm:q8_0_w8a8_tc_64x128_faster`): time the 64x128 tile
+        // vs the 64x64 TC GEMM at a prefill shape, toggling the override. accel ANDs
+        // this with the correctness verdict above, so the tile auto-enables only
+        // where it's both bit-exact AND faster.
+        const PM: usize = 2048;
+        const PK: usize = 4096;
+        const PN: usize = 512;
+        const WARMUP: usize = 3;
+        const ITERS: usize = 20;
+        let fname = "gemm:q8_0_w8a8_tc_64x128_faster";
+        let wp = gen_quant_bytes(layout, PM, PK, 0x64F5);
+        let xp: Vec<f32> = gen_x(PN * PK, 91);
+        if let (Some(wpb), Some(xpb), Some(mut opb)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &wp),
+            cu_upload_f32(&stream, &xp),
+            ck::CudaDeviceBuffer::alloc(&stream, PN * PM * 4),
+        ) {
+            let (wptr, xptr, optr) = (
+                wpb.as_ptr(),
+                xpb.as_ptr() as *const f32,
+                opb.as_mut_ptr() as *mut f32,
+            );
+            // SAFETY: live device buffers sized for (PM,PK,PN); each wrapper syncs.
+            let (t_128, t_64) = unsafe {
+                ck::set_gemm_64x128(Some(true));
+                for _ in 0..WARMUP {
+                    let _ = ck::gemm_q8_0_w8a8_tc(&stream, wptr, xptr, optr, PM, PK, PN);
+                }
+                let t0 = std::time::Instant::now();
+                for _ in 0..ITERS {
+                    let _ = ck::gemm_q8_0_w8a8_tc(&stream, wptr, xptr, optr, PM, PK, PN);
+                }
+                let t128 = t0.elapsed().as_secs_f64();
+                ck::set_gemm_64x128(Some(false)); // force the 64x64 TC baseline
+                for _ in 0..WARMUP {
+                    let _ = ck::gemm_q8_0_w8a8_tc(&stream, wptr, xptr, optr, PM, PK, PN);
+                }
+                let t1 = std::time::Instant::now();
+                for _ in 0..ITERS {
+                    let _ = ck::gemm_q8_0_w8a8_tc(&stream, wptr, xptr, optr, PM, PK, PN);
+                }
+                let t64 = t1.elapsed().as_secs_f64();
+                ck::set_gemm_64x128(Some(true)); // restore (cleared after the loop)
+                (t128, t64)
+            };
+            let detail = format!(
+                "64x128 {:.3} vs 64x64 {:.3} ms/call ({PM}x{PK}x{PN})",
+                t_128 * 1e3 / ITERS as f64,
+                t_64 * 1e3 / ITERS as f64,
+            );
+            if t_128 < t_64 * 0.95 {
+                cu_emit(fname, "OK", &detail);
+                *counts.entry("OK").or_default() += 1;
+            } else {
+                cu_emit(fname, "SLOW", &detail);
+                *counts.entry("SLOW").or_default() += 1;
+            }
+        }
+    }
+    // Clear the forced override so it doesn't leak into later probes / normal use.
+    ck::set_gemm_64x128(None);
+
     // ---- Q4_K W4A8 DECODE matvec (verdict: matvec:q4_k_w4a8, LOSSY + perf-gated) ----
     // The decode (single-row) twin of the W8A8 GEMM above. Same two-part gate:
     // (1) correctness vs the FAIR W8A8 reference (int8-activation round-trip →

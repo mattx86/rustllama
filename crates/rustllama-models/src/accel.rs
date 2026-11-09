@@ -707,6 +707,9 @@ fn try_gemm_q8_0_w8a8_tc_batched(
     let Ok(mut guard) = cache.lock() else {
         return false;
     };
+    // Pick the 64x128 fragment-direct tile (2.05x, bit-exact) when its verdicts
+    // pass, else the 64x64; resolved once, pushed as the capture-safe override.
+    ck::set_gemm_64x128(Some(gemm_q8_0_64x128_enabled()));
     guard.gemm_packed_batched_q8_0_w8a8_tc(weight_key, w_bytes, x, out, m, k, n)
 }
 
@@ -1249,6 +1252,34 @@ fn q4k_w8a8_tc_enabled() -> bool {
 fn q8_0_w8a8_tc_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q8_0_W8A8_TC) && cuda_active())
+}
+
+/// **AUTOMATIC** — no env var: within the Q8_0 W8A8 TC GEMM path, use the 64x128
+/// FRAGMENT-DIRECT tile (BIT-EXACT vs the 64x64, but ~2x faster — it folds the
+/// per-32 scales straight from the wmma accumulator with no `Cs` round-trip, on a
+/// lean 2-block-per-SM tile that halves the weight re-read) where BOTH its verdicts
+/// pass: correctness (`gemm:q8_0_w8a8_tc_64x128`) AND faster-than-64x64
+/// (`gemm:q8_0_w8a8_tc_64x128_faster`). Pushed as the capture-safe override before
+/// the batched GEMM; fail-closed to the 64x64 off CUDA or where either verdict is
+/// unset (the fragment-TV-map fold is the one thing that can misbehave on an
+/// unvalidated arch). Cached.
+fn gemm_q8_0_64x128_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        if !cuda_active() {
+            return false;
+        }
+        // Env overrides the verdict (the pre-verdict A/B switch), mirroring the
+        // decode-pipeline gate so `RUSTLLAMA_GEMM_64X128=0` forces the 64x64 baseline.
+        match std::env::var("RUSTLLAMA_GEMM_64X128").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q8_0_64X128)
+                    && kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q8_0_64X128_FASTER)
+            }
+        }
+    })
 }
 
 /// **AUTOMATIC** — no env var: the Q8_0 f32-reuse PREFILL GEMM (bit-exact,
@@ -11882,6 +11913,10 @@ pub fn try_prefill_attn_block_cuda_f32(
     };
     // Select the batched device-I/O GEMM path from the per-model prefill-GEMM
     // verdicts — the SAME selection the host-in/host-out prefill path makes.
+    // Within the Q8_0 W8A8 TC path, pick the 64x128 fragment-direct tile (2.05x,
+    // bit-exact) when its verdicts pass — this device-resident prefill path is the
+    // one that actually runs (not try_gemm_q8_0_w8a8_tc_batched).
+    ck::set_gemm_64x128(Some(gemm_q8_0_64x128_enabled()));
     g.set_prefill_gemm(
         q8_0_w8a8_tc_enabled(),
         q8_0_gemm_f32_enabled(),
@@ -12288,7 +12323,9 @@ pub fn try_prefill_step_cuda_graph_f32(
     // the mirror dtype never mismatches what decode expects.
     g.set_kv_mirror_f16(kv_mirror_f16_active(head_dim));
     // Same batched device-I/O GEMM selection the eager prefill block makes, so the
-    // captured GEMMs take the per-model-verdict-selected path (W8A8-TC / f32).
+    // captured GEMMs take the per-model-verdict-selected path (W8A8-TC / f32), incl.
+    // the 64x128 fragment-direct tile (its override must be set before capture).
+    ck::set_gemm_64x128(Some(gemm_q8_0_64x128_enabled()));
     g.set_prefill_gemm(
         q8_0_w8a8_tc_enabled(),
         q8_0_gemm_f32_enabled(),

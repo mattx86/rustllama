@@ -1136,6 +1136,9 @@ extern "C" {
     // `attn:decode_split_fused` verdict). v: 0=off, 1=on, else = clear the override
     // (fall back to RUSTLLAMA_DECODE_ATTN_SPLIT_FUSED).
     fn rsl_cuda_set_decode_attn_split_fused(v: c_int);
+    // Capture-safe override for the 64x128 fragment-direct prefill GEMM tile
+    // (1 on / 0 off / -1 env). accel pushes the verdict-driven decision.
+    fn rsl_cuda_set_gemm_64x128(v: c_int);
     // Eager pre-capture allocation of the split-KV fused decode scratch (partials +
     // per-head arrival counter). No-op unless the fused-split gate is on; MUST be
     // called OUTSIDE graph capture (cudaMalloc is illegal mid-capture). Best-effort.
@@ -3665,6 +3668,19 @@ pub fn set_decode_attn_split_fused(sel: Option<bool>) {
     };
     // SAFETY: a trivial C setter storing one int to a process global; no pointers.
     unsafe { rsl_cuda_set_decode_attn_split_fused(v) }
+}
+
+/// Push the verdict-driven decision for the 64x128 fragment-direct prefill GEMM
+/// tile (`Some(true)` = use it, `Some(false)` = force the 64x64, `None` = fall back
+/// to the env). accel resolves this once from the kernel verdicts.
+pub fn set_gemm_64x128(sel: Option<bool>) {
+    let v: c_int = match sel {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    };
+    // SAFETY: a trivial C setter storing one int to a process global; no pointers.
+    unsafe { rsl_cuda_set_gemm_64x128(v) }
 }
 
 /// Fused split-KV decode attention (atomic last-block-combines) — standalone EAGER
