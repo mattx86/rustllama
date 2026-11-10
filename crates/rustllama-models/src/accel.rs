@@ -11158,6 +11158,22 @@ pub fn set_decode_split_fused_force(v: Option<bool>) {
     DECODE_SPLIT_FUSED_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
+static DECODE_FLASH_GQA_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Force the GQA-group-shared split-KV decode-flash path on/off for the current process
+/// (the `tune --decode-flash-gqa` A/B harness only). `None` clears the override → the
+/// `RUSTLLAMA_DECODE_FLASH_GQA` env / the `attn:decode_flash_gqa{,_faster}` verdicts
+/// decide. Like the split-fused force: the decode step graph re-captures on a model
+/// reload, so the A/B sets this, reloads, measures per arm.
+pub fn set_decode_flash_gqa_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DECODE_FLASH_GQA_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
 /// reserved below free VRAM when `load_inner` projects the expert-promotion
 /// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
@@ -11356,6 +11372,38 @@ pub fn decode_attn_split_fused_enabled() -> bool {
             }
         }
     })
+}
+
+/// Whether the GQA-group-shared split-KV decode flash is enabled. The kv-head-keyed
+/// kernel loads each K/V position ONCE per GQA group (vs n_gqa× in the split-fused
+/// body) — the decode-flash decomposition (vs llama.cpp, sm_120 MIG) attributed ~n_gqa
+/// of the measured 4.5× per-KV-position flash gap to that redundant read. Bit-exact to
+/// the split-fused body run n_gqa times. Gated on BOTH the correctness verdict
+/// [`VERDICT_DECODE_FLASH_GQA`] (parity vs the CPU reference) AND the perf verdict
+/// [`VERDICT_DECODE_FLASH_GQA_FASTER`] (measured faster than split-fused at decode).
+/// Takes PRECEDENCE over the split-fused kernel when on. `RUSTLLAMA_DECODE_FLASH_GQA=1`
+/// force-enables (the on-pod A/B lever), `=0` disables. The `.cu` launcher additionally
+/// requires a real-GQA model (n_kv_heads < n_heads) with n_gqa ∈ {2,4,8}; other shapes
+/// keep the split-fused path. Fail-closed: unmeasured / not-a-win ⇒ OFF.
+pub fn decode_flash_gqa_enabled() -> bool {
+    // Transient A/B override (`tune --decode-flash-gqa`) wins and does NOT touch the
+    // OnceLock, so the env/verdict decision survives the force being cleared.
+    match DECODE_FLASH_GQA_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("RUSTLLAMA_DECODE_FLASH_GQA").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                kernel_verdict(rustllama_tuner::VERDICT_DECODE_FLASH_GQA)
+                    && kernel_verdict(rustllama_tuner::VERDICT_DECODE_FLASH_GQA_FASTER)
+            }
+        },
+    )
 }
 
 /// Whether the shared attention KV mirror is stored f16 (vs f32) — whole-mirror
@@ -12263,6 +12311,11 @@ pub fn try_decode_step_cuda_graph_f32(
     // BEFORE capture, so the graph records it (and `ensure_fd_scratch` — run inside
     // `decode_step_graph_f32` pre-capture — sees the override and allocates the scratch).
     ck::set_decode_attn_split_fused(Some(decode_attn_split_fused_enabled()));
+    // GQA-group-shared split-KV decode flash takes precedence over the split-fused
+    // kernel for a real-GQA model when its verdicts pass (the .cu dpos entry orders the
+    // GQA branch first). Pushed the same way BEFORE capture so the graph records it and
+    // `ensure_fd_scratch` sizes the (larger, kv-head-split) partials scratch.
+    ck::set_decode_flash_gqa(Some(decode_flash_gqa_enabled()));
     let ok = unsafe {
         g.decode_step_graph_f32(
             layers, hidden, k_caches, v_caches, n_heads, n_kv_heads, head_dim, d_model, pos,

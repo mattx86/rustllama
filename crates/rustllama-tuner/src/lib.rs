@@ -444,6 +444,19 @@ pub const VERDICT_DECODE_SPLIT_FUSED: &str = "attn:decode_splitfused";
 /// not-a-win ⇒ OFF, re-enabling only per (system,model) where it wins. Split TAKES
 /// PRECEDENCE over pipe when both pass (it is the faster of the two).
 pub const VERDICT_DECODE_SPLIT_FUSED_FASTER: &str = "attn:decode_split_fused_faster";
+/// CORRECTNESS gate for the GQA-group-shared split-KV decode flash — the kv-head-keyed
+/// kernel that loads each K/V position ONCE per GQA group (vs n_gqa× in the split-fused
+/// body), bit-exact to running the split-fused body n_gqa times. Banked by
+/// `doctor --cuda-parity` (`attn:decode_flash_gqa` probe) graded vs the CPU reference on
+/// a real-GQA shape. Only meaningful when n_kv_heads < n_heads and n_gqa ∈ {2,4,8}.
+pub const VERDICT_DECODE_FLASH_GQA: &str = "attn:decode_flash_gqa";
+/// PERF gate for the GQA-group-shared split-KV decode flash — measured FASTER at DECODE
+/// than the split-fused kernel (the current best) before it engages. Banked by
+/// `tune --decode-flash-gqa` (a WHOLE-DECODE reload A/B, like the split-fused gate: the
+/// shared-load win only shows in the real step where the FFN matvecs evict K/V).
+/// `accel::decode_flash_gqa_enabled` AND's it with [`VERDICT_DECODE_FLASH_GQA`];
+/// unmeasured / not-a-win ⇒ OFF. Takes PRECEDENCE over the split-fused kernel when on.
+pub const VERDICT_DECODE_FLASH_GQA_FASTER: &str = "attn:decode_flash_gqa_faster";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror

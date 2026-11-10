@@ -5590,6 +5590,36 @@ static inline int rsl_splitfused_on() {
     return sf_env;
 }
 
+// GQA-GROUP-SHARED decode flash gate (Phase 1 of the decode-flash BW campaign).
+// When on (verdict override pushed from accel.rs, or RUSTLLAMA_DECODE_FLASH_GQA=1),
+// a real-GQA model (n_kv_heads < n_heads, n_gqa ∈ {2,4,8}) routes its decode flash
+// through the kv-head-keyed body below — each KV position read ONCE per group vs
+// n_gqa× in the split-fused body. Takes precedence over split-fused when engaged.
+static int g_decode_flash_gqa_override = -1;
+extern "C" void rsl_cuda_set_decode_flash_gqa(int v) {
+    g_decode_flash_gqa_override = (v == 0 || v == 1) ? v : -1;
+}
+static inline int rsl_flash_gqa_on() {
+    if (g_decode_flash_gqa_override >= 0) return g_decode_flash_gqa_override;
+    static int e = -1;
+    if (e < 0) {
+        const char *s = std::getenv("RUSTLLAMA_DECODE_FLASH_GQA");
+        e = (s && s[0] == '1') ? 1 : 0;
+    }
+    return e;
+}
+// n_gqa values the templated GQA body is instantiated for (others fall back to
+// the split-fused kernel). Kept small so qreg/acc register pressure + the per-head
+// shmem stay bounded.
+static inline bool rsl_gqa_ng_supported(int n_gqa) {
+    return n_gqa == 2 || n_gqa == 4 || n_gqa == 8;
+}
+static inline size_t rsl_gqa_shmem_bytes(int n_gqa, int head_dim) {
+    return (size_t)(n_gqa * RSL_FLASH_DECODE_W * head_dim +
+                    2 * n_gqa * RSL_FLASH_DECODE_W) *
+           sizeof(float);
+}
+
 // Eagerly allocate the split-KV fused decode scratch (partials + per-head arrival
 // counter) BEFORE the whole-decode-step graph captures. Why a dedicated entry: the
 // dpos decode kernel entry is ONLY ever called DURING capture (where cudaMalloc is
@@ -5603,7 +5633,8 @@ static inline int rsl_splitfused_on() {
 extern "C" int rsl_cuda_ensure_fd_scratch(rsl_cuda_stream *s, int n_heads,
                                           int head_dim) {
     if (!s || n_heads <= 0 || head_dim <= 0) return -1;
-    if (!rsl_splitfused_on()) return 0;  // gate off → nothing to allocate
+    const int gqa_on = rsl_flash_gqa_on();
+    if (!rsl_splitfused_on() && !gqa_on) return 0;  // gate off → nothing to allocate
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
     cudaStreamIsCapturing(s->stream, &cap);
     if (cap != cudaStreamCaptureStatusNone) return 0;  // never malloc mid-capture
@@ -5611,8 +5642,14 @@ extern "C" int rsl_cuda_ensure_fd_scratch(rsl_cuda_stream *s, int n_heads,
     int nsm = 0;
     cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, s->device);
     int n_splits = rsl_decode_attn_n_splits(nsm, n_heads);
-    if (n_splits <= 1) return 0;  // grid not starved / nothing to split
-    size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
+    // The GQA-shared decode grid keys on kv-heads (fewer than n_heads), so it uses
+    // MORE splits (rsl_decode_attn_n_splits(nsm, n_kv_heads) ≥ this n_heads-based
+    // value, clamped at 16). n_kv_heads isn't passed here, so size the partials for
+    // the clamp max (16) when GQA may engage — a tiny over-allocation (≤ n_heads×16×
+    // (head_dim+2) floats) that guarantees the launch's `fd_*_cap >= need` passes.
+    int ns_alloc = gqa_on ? 16 : n_splits;
+    if (ns_alloc <= 1) return 0;  // grid not starved / nothing to split
+    size_t need = (size_t)n_heads * ns_alloc * (head_dim + 2);
     if (s->fd_partials_cap < need) {
         if (s->fd_partials) cudaFree(s->fd_partials);
         if (cudaMalloc(&s->fd_partials, need * sizeof(float)) == cudaSuccess) {
@@ -6093,6 +6130,261 @@ extern "C" int rsl_cuda_flash_attn_decode_splitfused_f32(
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_f32");
 }
 
+// ===========================================================================
+// GQA-GROUP-SHARED split-KV decode flash (Phase 1 of the decode-flash BW campaign).
+//
+// `flash_decode_splitfused_body` above keys the grid on the Q-HEAD (blockIdx.x=hh,
+// kv_h = hh/n_gqa), so the NG query heads that share one KV head EACH re-stream that
+// head's K and V from the mirror → the decode KV mirror is read n_gqa× redundantly.
+// The measured decode-flash decomposition (vs llama.cpp, sm_120 MIG) put rustllama's
+// per-KV-position cost 4.5× llama.cpp's, ~n_gqa of that from this redundancy. This
+// body keys the grid on the KV HEAD (blockIdx.x = kv_h) and runs all NG query heads
+// of the group in ONE block: each K/V position is loaded ONCE (kloc/vloc regs) and
+// reused across NG online-softmax states. BIT-EXACT to running the split-fused body
+// NG times — identical dot/reduce/rescale order; only WHERE K/V are read changes —
+// so the parity probe grades it against the CPU reference. Grid (n_kv_heads × n_splits)
+// still fills the slice (n_splits scaled to kv-heads). Partials keep the per-q-head
+// slot; the arrival counter is per KV head (NG q-heads combine on the last split).
+// Templated on NG so qreg/acc size exactly; engages for NG ∈ {2,4,8}.
+template <int NG>
+__device__ __forceinline__ void flash_decode_splitfused_gqa_body(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_kv_heads, int head_dim, int max_ctx, int kv_len, int n_splits,
+    float scale, int window, float softcap) {
+    extern __shared__ float smem[];
+    const int W = RSL_FLASH_DECODE_W;
+    float *sh_acc = smem;                              // [NG][W][head_dim]
+    float *sh_m = sh_acc + (size_t)NG * W * head_dim;  // [NG][W]
+    float *sh_l = sh_m + (size_t)NG * W;               // [NG][W]
+    const int kv_h = blockIdx.x;
+    const int sp = blockIdx.y;
+    if (kv_h >= n_kv_heads || sp >= n_splits) return;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    constexpr int SEGMAX = (RSL_FLASH_MAX_HEAD_DIM + 31) / 32;
+    float qreg[NG][SEGMAX];
+    float acc[NG][SEGMAX];
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+        const int q_off = (kv_h * NG + g) * head_dim;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+            qreg[g][seg] = q[q_off + d];
+            acc[g][seg] = 0.f;
+        }
+    }
+    float m[NG], l[NG];
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+        m[g] = -INFINITY;
+        l[g] = 0.f;
+    }
+    const int chunk = (kv_len + n_splits - 1) / n_splits;
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    const int c0 = sp * chunk;
+    const int c1 = min(kv_len, c0 + chunk);
+    for (int t = c0 + warp; t < c1; t += W) {
+        if (t < t_start) continue;
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float kloc[SEGMAX], vloc[SEGMAX];
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            kloc[seg] = k[kv_off + d];  // K loaded ONCE for all NG heads
+        float pp[NG], rr[NG];
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+            float partial = 0.f;
+            for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+                partial += qreg[g][seg] * kloc[seg];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_down_sync(0xffffffffu, partial, off);
+            float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+            if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+            float m_new = fmaxf(m[g], s_dot);
+            rr[g] = isfinite(m[g]) ? expf(m[g] - m_new) : 0.f;
+            pp[g] = expf(s_dot - m_new);
+            l[g] = l[g] * rr[g] + pp[g];
+            m[g] = m_new;
+        }
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            vloc[seg] = v[kv_off + d];  // V loaded ONCE for all NG heads
+#pragma unroll
+        for (int g = 0; g < NG; ++g)
+            for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+                acc[g][seg] = acc[g][seg] * rr[g] + pp[g] * vloc[seg];
+    }
+    // Per-head cross-warp publish (identical to the split-fused body, looped over NG).
+#pragma unroll
+    for (int g = 0; g < NG; ++g)
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            sh_acc[(g * W + warp) * head_dim + d] = acc[g][seg];
+    if (lane == 0)
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+            sh_m[g * W + warp] = m[g];
+            sh_l[g * W + warp] = l[g];
+        }
+    __syncthreads();
+    const int tid = warp * 32 + lane;
+    const int nthreads = W * 32;
+    const int stride = head_dim + 2;
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+        float m_g = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < W; ++w) m_g = fmaxf(m_g, sh_m[g * W + w]);
+        float l_g = 0.f;
+#pragma unroll
+        for (int w = 0; w < W; ++w)
+            l_g += sh_l[g * W + w] *
+                   (isfinite(sh_m[g * W + w]) ? expf(sh_m[g * W + w] - m_g) : 0.f);
+        const int hh = kv_h * NG + g;
+        float *pout = partials + (size_t)(hh * n_splits + sp) * stride;
+        for (int d = tid; d < head_dim; d += nthreads) {
+            float o = 0.f;
+#pragma unroll
+            for (int w = 0; w < W; ++w)
+                o += sh_acc[(g * W + w) * head_dim + d] *
+                     (isfinite(sh_m[g * W + w]) ? expf(sh_m[g * W + w] - m_g) : 0.f);
+            pout[d] = o;
+        }
+        if (tid == 0) {
+            pout[head_dim] = m_g;
+            pout[head_dim + 1] = l_g;
+        }
+    }
+    // Arrival signal — per-KV-head counter; the last split for kv_h combines all NG.
+    __syncthreads();  // (A) all pout writes issued
+    __threadfence();  // (B) device-wide release
+    __syncthreads();  // (C) fences done before the arrival is signalled
+    __shared__ int s_last;
+    if (tid == 0) {
+        int prev = atomicAdd(&counter[kv_h], 1);
+        s_last = (prev == n_splits - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_last) return;
+    if (tid == 0) counter[kv_h] = 0;  // self-reset for the next graph replay
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+        const int hh = kv_h * NG + g;
+        const float *base = partials + (size_t)hh * n_splits * stride;
+        float M = -INFINITY;
+        for (int s2 = 0; s2 < n_splits; ++s2) M = fmaxf(M, base[s2 * stride + head_dim]);
+        float L = 0.f;
+        for (int s2 = 0; s2 < n_splits; ++s2) {
+            float cm = base[s2 * stride + head_dim];
+            L += base[s2 * stride + head_dim + 1] * (isfinite(cm) ? expf(cm - M) : 0.f);
+        }
+        float inv = (L > 0.f) ? 1.f / L : 0.f;
+        for (int d = tid; d < head_dim; d += nthreads) {
+            float o = 0.f;
+            for (int s2 = 0; s2 < n_splits; ++s2) {
+                float cm = base[s2 * stride + head_dim];
+                o += base[s2 * stride + d] * (isfinite(cm) ? expf(cm - M) : 0.f);
+            }
+            out[hh * head_dim + d] = o * inv;
+        }
+    }
+}
+
+template <int NG>
+__global__ void flash_attn_decode_splitfused_gqa_f32_kernel(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_kv_heads, int head_dim, int max_ctx, int kv_len, int n_splits,
+    float scale, int window, float softcap) {
+    flash_decode_splitfused_gqa_body<NG>(q, k, v, partials, counter, out, n_kv_heads,
+                                         head_dim, max_ctx, kv_len, n_splits, scale,
+                                         window, softcap);
+}
+
+// Device-pos twin for the capture-once WHOLE-decode-step graph (kv_len from d_pos[0]).
+template <int NG>
+__global__ void flash_attn_decode_splitfused_gqa_f32_dpos_kernel(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_kv_heads, int head_dim, int max_ctx, const int *d_pos,
+    int n_splits, float scale, int window, float softcap) {
+    flash_decode_splitfused_gqa_body<NG>(q, k, v, partials, counter, out, n_kv_heads,
+                                         head_dim, max_ctx, d_pos[0] + 1, n_splits,
+                                         scale, window, softcap);
+}
+
+// Host launch switch (NG known only at runtime). Capture-safe (pure launch): usable
+// inside the whole-decode-step graph. Returns false for an unsupported NG.
+static inline bool rsl_launch_splitfused_gqa_dpos(
+    dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const float *q,
+    const float *k, const float *v, float *partials, int *counter, float *out,
+    int n_kv_heads, int n_gqa, int head_dim, int max_ctx, const int *d_pos,
+    int n_splits, float scale, int window, float softcap) {
+    switch (n_gqa) {
+    case 2:
+        flash_attn_decode_splitfused_gqa_f32_dpos_kernel<2><<<grid, block, shmem, stream>>>(
+            q, k, v, partials, counter, out, n_kv_heads, head_dim, max_ctx, d_pos,
+            n_splits, scale, window, softcap);
+        return true;
+    case 4:
+        flash_attn_decode_splitfused_gqa_f32_dpos_kernel<4><<<grid, block, shmem, stream>>>(
+            q, k, v, partials, counter, out, n_kv_heads, head_dim, max_ctx, d_pos,
+            n_splits, scale, window, softcap);
+        return true;
+    case 8:
+        flash_attn_decode_splitfused_gqa_f32_dpos_kernel<8><<<grid, block, shmem, stream>>>(
+            q, k, v, partials, counter, out, n_kv_heads, head_dim, max_ctx, d_pos,
+            n_splits, scale, window, softcap);
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Standalone entry for the GQA-shared fused kernel — the `attn:decode_flash_gqa`
+// parity probe lever (EAGER only; memsets the per-kv-head counter then launches).
+extern "C" int rsl_cuda_flash_attn_decode_splitfused_gqa_f32(
+    rsl_cuda_stream *s, const float *q, const float *k, const float *v,
+    float *partials, int *counter, float *out, int n_heads, int n_kv_heads,
+    int head_dim, int max_ctx, int kv_len, int n_splits, int window, float softcap) {
+    if (!s || !q || !k || !v || !partials || !counter || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || n_splits < 1) return -1;
+    int n_gqa = n_heads / n_kv_heads;
+    if (!rsl_gqa_ng_supported(n_gqa)) return -2;  // caller falls back to split-fused
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float), s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_gqa_f32");
+    }
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 block(32, RSL_FLASH_DECODE_W);
+    dim3 grid((unsigned)n_kv_heads, (unsigned)n_splits);
+    size_t shmem = rsl_gqa_shmem_bytes(n_gqa, head_dim);
+    cudaMemsetAsync(counter, 0, (size_t)n_kv_heads * sizeof(int), s->stream);
+    bool launched = false;
+    switch (n_gqa) {
+    case 2:
+        flash_attn_decode_splitfused_gqa_f32_kernel<2><<<grid, block, shmem, s->stream>>>(
+            q, k, v, partials, counter, out, n_kv_heads, head_dim, max_ctx, kv_len,
+            n_splits, scale, window, softcap);
+        launched = true;
+        break;
+    case 4:
+        flash_attn_decode_splitfused_gqa_f32_kernel<4><<<grid, block, shmem, s->stream>>>(
+            q, k, v, partials, counter, out, n_kv_heads, head_dim, max_ctx, kv_len,
+            n_splits, scale, window, softcap);
+        launched = true;
+        break;
+    case 8:
+        flash_attn_decode_splitfused_gqa_f32_kernel<8><<<grid, block, shmem, s->stream>>>(
+            q, k, v, partials, counter, out, n_kv_heads, head_dim, max_ctx, kv_len,
+            n_splits, scale, window, softcap);
+        launched = true;
+        break;
+    default:
+        break;
+    }
+    if (!launched) return -2;
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_gqa_f32");
+}
+
 // `window` (0 = full causal) + `softcap` (0 = off): SWA / Gemma2 support,
 // threaded straight into the kernel (byte-identical passthroughs at 0/0).
 extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
@@ -6410,6 +6702,40 @@ extern "C" int rsl_cuda_flash_attn_decode_f32_dpos(rsl_cuda_stream *s,
     // scratch is already allocated (prealloc'd pre-capture in rsl_cuda_flash_attn_prefill_f32;
     // cudaMalloc is illegal during capture) — else falls through to pipe/base (safe).
     // nsm is cached on the first (pre-capture) call so no cudaDeviceGetAttribute recurs.
+    //
+    // GQA-group-shared split-KV decode flash: takes PRECEDENCE over split-fused for a
+    // real-GQA model (n_kv_heads < n_heads, NG ∈ {2,4,8}). The grid keys on kv-heads
+    // with MORE splits (rsl_decode_attn_n_splits(nsm, n_kv_heads)) to keep ~SM-count
+    // blocks; each K/V position is read ONCE per group vs n_gqa× in the split-fused
+    // body. Capture-safe pure launch; engages only when the (generously pre-sized)
+    // scratch is present + the per-head shmem fits. Else falls through to split-fused.
+    if (rsl_flash_gqa_on() && n_kv_heads < n_heads && rsl_gqa_ng_supported(n_gqa)) {
+        static int g_nsm = -1;
+        if (g_nsm < 0)
+            cudaDeviceGetAttribute(&g_nsm, cudaDevAttrMultiProcessorCount, s->device);
+        int n_splits = rsl_decode_attn_n_splits(g_nsm, n_kv_heads);
+        size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
+        size_t gshmem = rsl_gqa_shmem_bytes(n_gqa, head_dim);
+        if (n_splits > 1 && gshmem <= (size_t)48 * 1024 && s->fd_partials &&
+            s->fd_partials_cap >= need && s->fd_counter &&
+            s->fd_counter_cap >= (size_t)n_kv_heads) {
+            static int g_logged = 0;
+            if (!g_logged) {
+                g_logged = 1;
+                fprintf(stderr,
+                        "[rustllama] decode flash: GQA-GROUP-SHARED split-KV ENGAGED "
+                        "(n_kv_heads=%d n_gqa=%d n_splits=%d -> %d blocks; K/V read 1x "
+                        "per group, not %dx) (logged once)\n",
+                        n_kv_heads, n_gqa, n_splits, n_kv_heads * n_splits, n_gqa);
+            }
+            dim3 ggrid((unsigned)n_kv_heads, (unsigned)n_splits);
+            if (rsl_launch_splitfused_gqa_dpos(ggrid, block, gshmem, s->stream, q, k, v,
+                                               s->fd_partials, s->fd_counter, out,
+                                               n_kv_heads, n_gqa, head_dim, max_ctx,
+                                               d_pos, n_splits, scale, window, softcap))
+                return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32_dpos");
+        }
+    }
     if (rsl_splitfused_on()) {
         static int s_nsm = -1;
         if (s_nsm < 0)

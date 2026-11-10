@@ -8526,6 +8526,98 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             }
         }
 
+        // attn:decode_flash_gqa (GQA-group-shared split-KV decode flash): keys the grid
+        // on the KV head and runs all n_gqa query heads of the group in ONE block, so
+        // each K/V position is read ONCE per group (vs n_gqa× in attn:decode_splitfused).
+        // BIT-EXACT to the split-fused body run n_gqa times — same f32 online-softmax, so
+        // graded vs the SAME f32 CPU flash-decode reference at a tight tolerance. Shape
+        // n_heads=8 / n_kv_heads=2 ⇒ n_gqa=4 (a supported template). This is the
+        // CORRECTNESS gate for the shared-load dot + the per-kv-head atomic combine (a
+        // reduction/ordering bug collapses cos). WRITE-BLIND (no NVIDIA here) — pod-run.
+        {
+            let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
+                (8usize, 2usize, 128usize, 256usize, 200usize);
+            let n_splits = 4usize;
+            let q = gen_x(n_heads * head_dim, 83);
+            let kc = gen_x(n_kv_heads * max_ctx * head_dim, 89);
+            let vc = gen_x(n_kv_heads * max_ctx * head_dim, 97);
+            let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+            if let (Some(qb), Some(kb), Some(vb), Some(mut ob), Some(mut pb), Some(mut cb)) = (
+                cu_upload_f32(&stream, &q),
+                cu_upload_f32(&stream, &kc),
+                cu_upload_f32(&stream, &vc),
+                ck::CudaDeviceBuffer::alloc(&stream, n_heads * head_dim * 4),
+                ck::CudaDeviceBuffer::alloc(&stream, n_heads * n_splits * (head_dim + 2) * 4),
+                ck::CudaDeviceBuffer::alloc(&stream, n_heads * 4),
+            ) {
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in dec_cases {
+                    let mut cpu = vec![0f32; n_heads * head_dim];
+                    k::gqa_attention_flash_decode_capped_windowed(
+                        &q,
+                        &kc,
+                        &vc,
+                        &mut cpu,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
+                    );
+                    // SAFETY: same contract as attn:decode_splitfused; the counter is
+                    // indexed by kv-head (n_kv_heads ≤ n_heads, so [n_heads] is safe).
+                    let res = unsafe {
+                        ck::flash_attn_decode_splitfused_gqa_f32(
+                            &stream,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr() as *const f32,
+                            vb.as_ptr() as *const f32,
+                            pb.as_mut_ptr() as *mut f32,
+                            cb.as_mut_ptr() as *mut i32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len,
+                            n_splits,
+                            window as i32,
+                            softcap,
+                        )
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e}"));
+                        break;
+                    }
+                    let (cos, max_rel) = compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
+                        cu_emit("attn:decode_flash_gqa", "KERNEL_ERR", &e);
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str = if worst_cos > 0.9999 && worst_rel < 0.005 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            "attn:decode_flash_gqa",
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} n_gqa=4 n_splits={n_splits} (pass+swa16+cap50)"),
+                        );
+                    }
+                }
+            }
+        }
+
         // attn:decode_pipeline (software-pipelined decode flash — prefetch the next
         // position's K+V to overlap the load latency the clock64 profiler found
         // dominant, K 46% + V 41%). This probe is the CORRECTNESS gate only: the pipe
