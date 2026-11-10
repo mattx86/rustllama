@@ -5214,6 +5214,172 @@ pub fn measure_decode_split_fused(
     })
 }
 
+/// Outcome of [`measure_decode_flash_pipe4`] — the float4 + depth-2-prefetch decode
+/// flash A/B. Same shape as [`DecodeSplitFusedReport`]: `capable` is `true` only when
+/// the whole-decode step graph engaged; `off_tps`/`on_tps` are the median decode tok/s
+/// of the SPLIT-FUSED baseline vs the pipe4 kernel; `faster = Some(on > off*margin)`.
+#[derive(Debug, Clone, Default)]
+pub struct DecodeFlashPipe4Report {
+    pub capable: bool,
+    pub off_tps: Option<f64>,
+    pub on_tps: Option<f64>,
+    pub faster: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// A/B the FLOAT4 + depth-2-prefetch decode flash (`pipe4`) by measured DECODE tok/s,
+/// against the SPLIT-FUSED kernel as baseline (split-fused is the shipped CUDA default
+/// on a grid-starved slice; pipe4's whole point is to beat it by hiding K/V load
+/// latency — the per-position loop is ~87% load-latency-bound, which the vectorized
+/// loads + register prefetch attack). pipe4 takes precedence over split-fused in the
+/// `.cu` dpos entry, so forcing it ON runs it; forcing it OFF (with split forced on)
+/// runs the split-fused baseline. The dot REASSOCIATES (contiguous vs strided lane
+/// dims) so correctness is graded separately (`doctor --cuda-parity
+/// attn:decode_flash_pipe4`, cos>0.9999); this gates on SPEED.
+///
+/// CRITICAL (same as the split-fused / pipe A/Bs): the latency-hiding win only appears
+/// with the whole-decode STEP GRAPH engaged and a real per-token K/V stream — an
+/// isolated-kernel A/B keeps K/V warm in L2 and hides the stalls the prefetch fills.
+/// So both arms force the step graph on and RELOAD per arm (the kernel is baked at
+/// graph capture). The win GROWS with context (load latency is the KV-growing term),
+/// so the A/B uses a mid-length prompt where the gain is already clear of noise.
+/// CUDA-only + head_dim % 128 == 0 (the float4 lane layout); off those it returns
+/// before loading and the verdict is left unset (fail-closed to split-fused).
+pub fn measure_decode_flash_pipe4(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    repeats: usize,
+) -> Result<DecodeFlashPipe4Report, String> {
+    if !rustllama_models::accel::cuda_active() {
+        return Ok(DecodeFlashPipe4Report {
+            capable: false,
+            error: Some("no active NVIDIA GPU — pipe4 decode flash cannot run".into()),
+            ..Default::default()
+        });
+    }
+    // Require ON to beat the split-fused baseline by >2% to clear same-process noise.
+    // The win is ~+7% at this prompt length and grows to ~+20% at long context, so a
+    // 2% bar passes comfortably where real and fails closed on a wash. Fail-closed.
+    const WIN_MARGIN: f64 = 1.02;
+    // Mid-length prompt: load latency is the KV-growing term, so a near-empty KV hides
+    // the win (pipe4 is a ~wash at KV16). 1024 is where the gain is unambiguous (~+12%)
+    // without a giant KV reservation per arm.
+    const PROMPT_TOKENS: u32 = 1024;
+    const DECODE_TOKENS: u32 = 128;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // Fresh load per arm (the step graph bakes the kernel at capture). `pipe4`=false
+    // measures the SPLIT-FUSED baseline (split forced on, pipe4 forced off); `pipe4`=true
+    // measures pipe4 (forced on, precedence over split-fused). Returns (median tok/s, err).
+    let load_and_bench = |pipe4: bool| -> (Option<f64>, Option<String>) {
+        rustllama_models::accel::set_decode_split_fused_force(Some(true));
+        rustllama_models::accel::set_decode_flash_pipe4_force(Some(pipe4));
+        let mut cpu = match ContiguousEngine::load_with_options_and_layout(
+            model_path,
+            ctx_size,
+            true,
+            KvDtype::F32,
+            &cfg.kv_cache_layout,
+        ) {
+            Ok(e) => e,
+            Err(e) => return (None, Some(format!("load failed: {e}"))),
+        };
+        cpu.set_prefix_cache(false);
+        cpu.set_flash_attention(cfg.flash_attention);
+        apply_measurement_placement(&mut cpu, cfg.n_gpu_layers);
+
+        let vocab = cpu.vocab_size() as i32;
+        let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+            .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+            .collect();
+
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+            return (None, Some(format!("warmup failed: {e}")));
+        }
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            match cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+                Ok(_) => {
+                    let stats = cpu.last_request_stats();
+                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // Force the whole-decode step graph ON for both arms (the latency-hiding win is
+    // in-graph only) and confirm it actually engaged — else the A/B is meaningless.
+    rustllama_models::accel::set_dev_step_force(Some(true));
+    let hits0 = rustllama_models::accel::dev_step_hits();
+    let (off_tps, off_err) = load_and_bench(false);
+    let (on_tps, on_err) = load_and_bench(true);
+    let engaged = rustllama_models::accel::dev_step_hits() > hits0;
+
+    // Clear the overrides → serve-time env/verdicts decide from here.
+    rustllama_models::accel::set_decode_flash_pipe4_force(None);
+    rustllama_models::accel::set_decode_split_fused_force(None);
+    rustllama_models::accel::set_dev_step_force(None);
+
+    if !engaged {
+        return Ok(DecodeFlashPipe4Report {
+            capable: false,
+            off_tps,
+            on_tps,
+            faster: None,
+            error: Some(
+                "whole-decode step graph never engaged (the latency-hiding win is \
+                 in-graph only) — verdict left unset"
+                    .into(),
+            ),
+        });
+    }
+
+    let faster = match (off_tps, on_tps) {
+        (Some(off), Some(on)) if off > 0.0 => Some(on > off * WIN_MARGIN),
+        _ => None,
+    };
+    Ok(DecodeFlashPipe4Report {
+        capable: true,
+        off_tps,
+        on_tps,
+        faster,
+        error: off_err.or(on_err),
+    })
+}
+
 /// Outcome of [`measure_moe_vram_margin_candidates`] — the MoE VRAM-margin A/B.
 ///
 /// `capable` is `true` only when a reload actually engaged the tiered-expert

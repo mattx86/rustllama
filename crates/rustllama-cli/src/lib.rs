@@ -684,6 +684,18 @@ pub enum Command {
         /// (Stage 1e-e).
         #[arg(long)]
         decode_split_fused: bool,
+        /// FLOAT4 + depth-2-prefetch decode-flash A/B (`pipe4`): with the whole-decode
+        /// step graph forced ON, measure DECODE tok/s with the split-fused kernel then
+        /// pipe4 (vectorized K/V loads + register prefetch that hide the ~87%
+        /// load-latency the per-position loop spends on K/V), reloading per arm, and
+        /// persist the PERF verdict `attn:decode_flash_pipe4_faster` that — ANDed with
+        /// the `attn:decode_flash_pipe4` parity verdict from `--validate-kernels` —
+        /// auto-enables pipe4 only where it beats the split-fused baseline at decode on
+        /// this device+model (pipe4 takes precedence over split-fused when it wins; the
+        /// win grows with context). CUDA-only, head_dim % 128 == 0; a `tune --all`
+        /// sub-stage (Stage 1e-f).
+        #[arg(long)]
+        decode_flash_pipe4: bool,
         /// Whole-mirror f16 KV decode A/B (ships the built-but-inert
         /// `attn:kv_mirror_f16` mirror where it wins): force the shared attention KV
         /// mirror f32 then f16 on one f32-KV-storage load, measure DECODE tok/s, and
@@ -1493,6 +1505,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             prefill_step_graph,
             decode_pipeline,
             decode_split_fused,
+            decode_flash_pipe4,
             kv_mirror_f16,
             moe_vram_margin,
             cacheblend,
@@ -1833,6 +1846,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if decode_split_fused {
                 return cmd_tune_decode_split_fused(&config_path, model, repeats);
+            }
+            if decode_flash_pipe4 {
+                return cmd_tune_decode_flash_pipe4(&config_path, model, repeats);
             }
             if kv_mirror_f16 {
                 return cmd_tune_kv_mirror_f16(&config_path, model, repeats);
@@ -7250,6 +7266,76 @@ fn cmd_tune_decode_split_fused(
     Ok(())
 }
 
+/// `tune --decode-flash-pipe4` (Stage 1e-f): A/B the FLOAT4 + depth-2-prefetch decode
+/// flash (`pipe4`) against the SPLIT-FUSED baseline and persist the PERF verdict
+/// `attn:decode_flash_pipe4_faster`, which — ANDed with the `attn:decode_flash_pipe4`
+/// parity verdict from `--validate-kernels` — `accel::decode_flash_pipe4_enabled` reads
+/// to auto-enable pipe4 only where it beats split-fused at DECODE on this device+model
+/// (pipe4 takes precedence over split-fused when it wins). pipe4's dot reassociates, so
+/// its CORRECTNESS is established separately (the parity probe); this gates on SPEED.
+/// The A/B is WHOLE-DECODE (step graph forced on, model reloaded per arm) at a mid-
+/// length prompt where the latency-hiding win is already clear of noise (it grows with
+/// context). CUDA-only + head_dim % 128 == 0; on any other host
+/// `measure_decode_flash_pipe4` returns BEFORE loading, so it prints "skipped" and
+/// persists nothing — the path stays force-gated only (fail-closed to split-fused).
+fn cmd_tune_decode_flash_pipe4(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_decode_flash_pipe4, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+
+    println!("rustllama tune --decode-flash-pipe4");
+    println!("  model = {}", model_path.display());
+
+    // pipe4 is an F32-KV decode-flash; the measurement forces f32 + forces the whole-
+    // decode step graph on (the latency-hiding win is in-graph only) and compares against
+    // the split-fused baseline. CUDA-only + head_dim/engagement checks are inside it.
+    let m_cfg = MeasurementConfig {
+        kv_dtype: rustllama_engine::KvDtype::F32,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+
+    let report = measure_decode_flash_pipe4(&model_path, &m_cfg, repeats.max(3) as usize)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    match (report.capable, report.off_tps, report.on_tps, report.faster) {
+        (true, Some(off), Some(on), Some(fast)) => {
+            println!("  split-fused (OFF)  = {off:.1} tok/s");
+            println!(
+                "  pipe4 (ON)         = {on:.1} tok/s  ({:+.1}%)",
+                (on / off - 1.0) * 100.0
+            );
+            println!(
+                "  → {}",
+                if fast {
+                    "ENABLE — float4 + prefetch decode flash is faster here"
+                } else {
+                    "keep split-fused — pipe4 is not a win here"
+                }
+            );
+            let name = rustllama_tuner::VERDICT_DECODE_FLASH_PIPE4_FASTER;
+            persist_kernel_verdicts(&[(name.to_string(), fast)])?;
+            println!("  → persisted verdict {name} = {fast}");
+        }
+        _ => {
+            println!(
+                "  → not measured ({}); verdict left unset — path stays off",
+                report
+                    .error
+                    .unwrap_or_else(|| "decode pipe4 A/B did not engage".into())
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `tune --kv-mirror-f16` (Stage 1e-b): A/B the whole-mirror f16 KV decode win and
 /// persist the PERF verdict `attn:kv_mirror_f16_faster`, which — ANDed with the
 /// correctness verdict `attn:kv_mirror_f16` — `accel::kv_mirror_f16_enabled` reads to
@@ -9641,6 +9727,17 @@ fn cmd_tune_all(
                 && t.kernel_build_id == build_id
         })
         .unwrap_or(false);
+    // FLOAT4 + prefetch (pipe4) decode-flash PERF verdict — build-stamped (a kernel-
+    // source edit changes pipe4's cost), its own (CUDA-only) key. `Some(false)`
+    // (measured no-win) still counts as decided, so use `contains_key`.
+    let has_decode_flash_pipe4 = cached
+        .as_ref()
+        .map(|t| {
+            t.kernel_verdicts
+                .contains_key(rustllama_tuner::VERDICT_DECODE_FLASH_PIPE4_FASTER)
+                && t.kernel_build_id == build_id
+        })
+        .unwrap_or(false);
     // Whole-mirror f16 KV perf verdict — build-stamped like dev-prefill, its own
     // (CUDA-only) key. `Some(false)` (measured no-win) still counts as decided, so
     // use `contains_key` (re-runs on a kernel-source/build change via build_id).
@@ -9908,6 +10005,31 @@ fn cmd_tune_all(
             &[],
         ) {
             tracing::warn!(error = %e, "stage 1e-e (decode-split-fused perf) failed; continuing");
+        }
+    }
+
+    println!();
+    println!(
+        "Stage 1e-f/10: decode-flash-pipe4 perf (A/B float4+prefetch decode flash vs split-fused, f32 KV)"
+    );
+    println!("--------");
+    if skip(has_decode_flash_pipe4) {
+        println!("(skipped: decode-flash-pipe4 verdict already cached for this build)");
+    } else {
+        // Whole-decode f32-KV A/B; CUDA-only + head_dim % 128 == 0 (the stage self-skips
+        // otherwise). Forces the step graph ON for both arms (the latency-hiding win is
+        // in-graph only) and reloads per arm (the kernel is baked at graph capture). Runs
+        // AFTER 1e-e so pipe4 is A/B'd against the split-fused baseline it supersedes.
+        // Subprocess for a clean GPU context.
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--decode-flash-pipe4",
+            thorough,
+            "1e-f (decode-flash-pipe4 perf)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 1e-f (decode-flash-pipe4 perf) failed; continuing");
         }
     }
 
