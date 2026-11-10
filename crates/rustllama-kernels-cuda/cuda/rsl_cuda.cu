@@ -5620,6 +5620,28 @@ static inline size_t rsl_gqa_shmem_bytes(int n_gqa, int head_dim) {
            sizeof(float);
 }
 
+// FLOAT4 + software-pipelined split-KV decode flash gate (the profiler-directed fix:
+// the per-position loop is 87% K/V LOAD-LATENCY-bound — each scalar load stalls ~200+
+// cyc, DRAM or L2, which is why GQA byte-sharing didn't help). When on (verdict
+// override from accel.rs, or RUSTLLAMA_DECODE_FLASH_PIPE4=1), a head_dim%128==0 model
+// routes its decode flash through the pipe4 body: float4-vectorized K/V loads (4 scalar
+// loads → 1 wide transaction) + a depth-2 register prefetch (next positions' loads in
+// flight while the current one computes). Same split-fused scratch; takes precedence
+// over the plain split-fused kernel when engaged.
+static int g_decode_flash_pipe4_override = -1;
+extern "C" void rsl_cuda_set_decode_flash_pipe4(int v) {
+    g_decode_flash_pipe4_override = (v == 0 || v == 1) ? v : -1;
+}
+static inline int rsl_flash_pipe4_on() {
+    if (g_decode_flash_pipe4_override >= 0) return g_decode_flash_pipe4_override;
+    static int e = -1;
+    if (e < 0) {
+        const char *s = std::getenv("RUSTLLAMA_DECODE_FLASH_PIPE4");
+        e = (s && s[0] == '1') ? 1 : 0;
+    }
+    return e;
+}
+
 // Eagerly allocate the split-KV fused decode scratch (partials + per-head arrival
 // counter) BEFORE the whole-decode-step graph captures. Why a dedicated entry: the
 // dpos decode kernel entry is ONLY ever called DURING capture (where cudaMalloc is
@@ -5634,7 +5656,9 @@ extern "C" int rsl_cuda_ensure_fd_scratch(rsl_cuda_stream *s, int n_heads,
                                           int head_dim) {
     if (!s || n_heads <= 0 || head_dim <= 0) return -1;
     const int gqa_on = rsl_flash_gqa_on();
-    if (!rsl_splitfused_on() && !gqa_on) return 0;  // gate off → nothing to allocate
+    // pipe4 shares the split-fused scratch layout (per-q-head partials, n_heads-based
+    // n_splits), so it needs the scratch allocated but NOT the GQA over-sizing.
+    if (!rsl_splitfused_on() && !gqa_on && !rsl_flash_pipe4_on()) return 0;
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
     cudaStreamIsCapturing(s->stream, &cap);
     if (cap != cudaStreamCaptureStatusNone) return 0;  // never malloc mid-capture
@@ -6385,6 +6409,249 @@ extern "C" int rsl_cuda_flash_attn_decode_splitfused_gqa_f32(
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_gqa_f32");
 }
 
+// ===========================================================================
+// FLOAT4 + depth-2 software-pipelined split-KV decode flash (the profiler-directed
+// fix). The clock64 phase profiler found the per-position loop 87% K/V LOAD-LATENCY-
+// bound (46% Kload + 41% Vload, 13% reduce/softmax) — each scalar load stalls ~200+ cyc
+// (DRAM or L2; that latency, not bandwidth, is why GQA byte-sharing was a wash). This
+// body: (1) float4-vectorizes the K/V loads — lane l owns the 4 CONTIGUOUS dims
+// [128*c + 4*l .. +3] of float4 chunk c, so head_dim's loads collapse from 4 scalar to
+// VC=head_dim/128 wide transactions; (2) keeps a DEPTH-2 register prefetch so the next
+// positions' loads are in flight while the current position computes, filling the
+// latency. Online-softmax recurrence + the atomic last-block combine are unchanged. The
+// dot REASSOCIATES (contiguous vs strided lane dims) so it is graded within the split-
+// fused reassociation tolerance (cos>0.9999), not bit-exact; the V-accumulate + combine
+// are per-dim identical. Templated on VC ∈ {1,2} (head_dim 128 / 256); other head_dims
+// keep the scalar split-fused path. In-graph-safe (pure compute + register prefetch).
+template <int VC>
+__device__ __forceinline__ void flash_decode_splitfused_pipe4_body(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_heads, int n_gqa, int head_dim, int max_ctx, int kv_len,
+    int n_splits, float scale, int window, float softcap) {
+    extern __shared__ float smem[];
+    const int W = RSL_FLASH_DECODE_W;
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + W * head_dim;
+    float *sh_l = sh_m + W;
+    const int hh = blockIdx.x, sp = blockIdx.y;
+    if (hh >= n_heads || sp >= n_splits) return;
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    float4 qreg[VC], accf[VC];
+#pragma unroll
+    for (int c = 0; c < VC; ++c) {
+        qreg[c] = reinterpret_cast<const float4 *>(q + hh * head_dim + 128 * c)[lane];
+        accf[c] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    float m = -INFINITY, l = 0.f;
+    const int chunk = (kv_len + n_splits - 1) / n_splits;
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    const int c0 = sp * chunk, c1 = min(kv_len, c0 + chunk);
+    // SWA skip is a PREFIX (t_start is a lower bound — once t>=t_start every larger t is
+    // too), so advance to the first valid position once; no mid-loop skips (clean pipe).
+    int t0 = c0 + warp;
+    if (t0 < t_start) t0 += ((t_start - t0 + W - 1) / W) * W;
+    // Depth-2 register prefetch over t = t0, t0+W, ... < c1.
+    float4 kb[2][VC], vb[2][VC];
+    int nload = t0;
+#pragma unroll
+    for (int s2 = 0; s2 < 2; ++s2) {
+        if (nload < c1) {
+            const int kv_off = (kv_h * max_ctx + nload) * head_dim;
+#pragma unroll
+            for (int c = 0; c < VC; ++c) {
+                kb[s2][c] = reinterpret_cast<const float4 *>(k + kv_off + 128 * c)[lane];
+                vb[s2][c] = reinterpret_cast<const float4 *>(v + kv_off + 128 * c)[lane];
+            }
+            nload += W;
+        }
+    }
+    for (int i = 0;; ++i) {
+        const int cur = t0 + i * W;
+        if (cur >= c1) break;
+        const int sl = i & 1;
+        float partial = 0.f;
+#pragma unroll
+        for (int c = 0; c < VC; ++c)
+            partial += qreg[c].x * kb[sl][c].x + qreg[c].y * kb[sl][c].y +
+                       qreg[c].z * kb[sl][c].z + qreg[c].w * kb[sl][c].w;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+#pragma unroll
+        for (int c = 0; c < VC; ++c) {
+            accf[c].x = accf[c].x * rescale + p * vb[sl][c].x;
+            accf[c].y = accf[c].y * rescale + p * vb[sl][c].y;
+            accf[c].z = accf[c].z * rescale + p * vb[sl][c].z;
+            accf[c].w = accf[c].w * rescale + p * vb[sl][c].w;
+        }
+        m = m_new;
+        if (nload < c1) {
+            const int kv_off = (kv_h * max_ctx + nload) * head_dim;
+#pragma unroll
+            for (int c = 0; c < VC; ++c) {
+                kb[sl][c] = reinterpret_cast<const float4 *>(k + kv_off + 128 * c)[lane];
+                vb[sl][c] = reinterpret_cast<const float4 *>(v + kv_off + 128 * c)[lane];
+            }
+            nload += W;
+        }
+    }
+    // Publish acc (float4 → sh_acc in natural dim order), m, l — combine reads by dim.
+#pragma unroll
+    for (int c = 0; c < VC; ++c)
+        reinterpret_cast<float4 *>(sh_acc + warp * head_dim + 128 * c)[lane] = accf[c];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+    float m_g = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+#pragma unroll
+    for (int w = 0; w < W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    const int tid = warp * 32 + lane;
+    const int nthreads = W * 32;
+    const int stride = head_dim + 2;
+    float *pout = partials + (size_t)(hh * n_splits + sp) * stride;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+#pragma unroll
+        for (int w = 0; w < W; ++w)
+            o += sh_acc[w * head_dim + d] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        pout[d] = o;
+    }
+    if (tid == 0) {
+        pout[head_dim] = m_g;
+        pout[head_dim + 1] = l_g;
+    }
+    __syncthreads();
+    __threadfence();
+    __syncthreads();
+    __shared__ int s_last;
+    if (tid == 0) {
+        int prev = atomicAdd(&counter[hh], 1);
+        s_last = (prev == n_splits - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_last) return;
+    const float *base = partials + (size_t)hh * n_splits * stride;
+    __shared__ float sM, sInvL;
+    if (tid == 0) {
+        float M = -INFINITY;
+        for (int s2 = 0; s2 < n_splits; ++s2) M = fmaxf(M, base[s2 * stride + head_dim]);
+        float L = 0.f;
+        for (int s2 = 0; s2 < n_splits; ++s2) {
+            float cm = base[s2 * stride + head_dim];
+            L += base[s2 * stride + head_dim + 1] * (isfinite(cm) ? expf(cm - M) : 0.f);
+        }
+        sM = M;
+        sInvL = (L > 0.f) ? 1.f / L : 0.f;
+        counter[hh] = 0;
+    }
+    __syncthreads();
+    const float Mg = sM, inv = sInvL;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        for (int s2 = 0; s2 < n_splits; ++s2) {
+            float cm = base[s2 * stride + head_dim];
+            o += base[s2 * stride + d] * (isfinite(cm) ? expf(cm - Mg) : 0.f);
+        }
+        out[hh * head_dim + d] = o * inv;
+    }
+}
+
+template <int VC>
+__global__ void flash_attn_decode_splitfused_pipe4_f32_kernel(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_heads, int n_gqa, int head_dim, int max_ctx, int kv_len,
+    int n_splits, float scale, int window, float softcap) {
+    flash_decode_splitfused_pipe4_body<VC>(q, k, v, partials, counter, out, n_heads,
+                                           n_gqa, head_dim, max_ctx, kv_len, n_splits,
+                                           scale, window, softcap);
+}
+
+template <int VC>
+__global__ void flash_attn_decode_splitfused_pipe4_f32_dpos_kernel(
+    const float *q, const float *k, const float *v, float *partials, int *counter,
+    float *out, int n_heads, int n_gqa, int head_dim, int max_ctx, const int *d_pos,
+    int n_splits, float scale, int window, float softcap) {
+    flash_decode_splitfused_pipe4_body<VC>(q, k, v, partials, counter, out, n_heads,
+                                           n_gqa, head_dim, max_ctx, d_pos[0] + 1,
+                                           n_splits, scale, window, softcap);
+}
+
+// Host launch switch by VC = head_dim/128 (head_dim%128==0 required). Capture-safe.
+static inline bool rsl_launch_splitfused_pipe4_dpos(
+    dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const float *q,
+    const float *k, const float *v, float *partials, int *counter, float *out,
+    int n_heads, int n_gqa, int head_dim, int max_ctx, const int *d_pos, int n_splits,
+    float scale, int window, float softcap) {
+    if (head_dim % 128 != 0) return false;
+    switch (head_dim / 128) {
+    case 1:
+        flash_attn_decode_splitfused_pipe4_f32_dpos_kernel<1><<<grid, block, shmem, stream>>>(
+            q, k, v, partials, counter, out, n_heads, n_gqa, head_dim, max_ctx, d_pos,
+            n_splits, scale, window, softcap);
+        return true;
+    case 2:
+        flash_attn_decode_splitfused_pipe4_f32_dpos_kernel<2><<<grid, block, shmem, stream>>>(
+            q, k, v, partials, counter, out, n_heads, n_gqa, head_dim, max_ctx, d_pos,
+            n_splits, scale, window, softcap);
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Standalone entry for the pipe4 kernel — the `attn:decode_flash_pipe4` parity probe
+// lever (EAGER only; memsets the per-q-head counter then launches).
+extern "C" int rsl_cuda_flash_attn_decode_splitfused_pipe4_f32(
+    rsl_cuda_stream *s, const float *q, const float *k, const float *v,
+    float *partials, int *counter, float *out, int n_heads, int n_kv_heads,
+    int head_dim, int max_ctx, int kv_len, int n_splits, int window, float softcap) {
+    if (!s || !q || !k || !v || !partials || !counter || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || n_splits < 1) return -1;
+    if (head_dim % 128 != 0 || head_dim / 128 > 2) return -2;  // caller falls back
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float), s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_pipe4_f32");
+    }
+    dim3 block(32, RSL_FLASH_DECODE_W);
+    dim3 grid((unsigned)n_heads, (unsigned)n_splits);
+    size_t shmem =
+        (size_t)(RSL_FLASH_DECODE_W * head_dim + 2 * RSL_FLASH_DECODE_W) * sizeof(float);
+    cudaMemsetAsync(counter, 0, (size_t)n_heads * sizeof(int), s->stream);
+    switch (head_dim / 128) {
+    case 1:
+        flash_attn_decode_splitfused_pipe4_f32_kernel<1><<<grid, block, shmem, s->stream>>>(
+            q, k, v, partials, counter, out, n_heads, n_gqa, head_dim, max_ctx, kv_len,
+            n_splits, scale, window, softcap);
+        break;
+    case 2:
+        flash_attn_decode_splitfused_pipe4_f32_kernel<2><<<grid, block, shmem, s->stream>>>(
+            q, k, v, partials, counter, out, n_heads, n_gqa, head_dim, max_ctx, kv_len,
+            n_splits, scale, window, softcap);
+        break;
+    default:
+        return -2;
+    }
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_splitfused_pipe4_f32");
+}
+
 // `window` (0 = full causal) + `softcap` (0 = off): SWA / Gemma2 support,
 // threaded straight into the kernel (byte-identical passthroughs at 0/0).
 extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
@@ -6703,6 +6970,34 @@ extern "C" int rsl_cuda_flash_attn_decode_f32_dpos(rsl_cuda_stream *s,
     // cudaMalloc is illegal during capture) — else falls through to pipe/base (safe).
     // nsm is cached on the first (pre-capture) call so no cudaDeviceGetAttribute recurs.
     //
+    // FLOAT4 + depth-2 pipelined split-KV decode flash: TOP precedence (the profiler-
+    // directed fix for the 87% load-latency-bound loop). Same per-q-head split-fused
+    // scratch; head_dim%128==0 only (VC ∈ {1,2}). Capture-safe pure launch.
+    if (rsl_flash_pipe4_on() && (head_dim % 128 == 0) && (head_dim / 128) <= 2) {
+        static int p_nsm = -1;
+        if (p_nsm < 0)
+            cudaDeviceGetAttribute(&p_nsm, cudaDevAttrMultiProcessorCount, s->device);
+        int n_splits = rsl_decode_attn_n_splits(p_nsm, n_heads);
+        size_t need = (size_t)n_heads * n_splits * (head_dim + 2);
+        if (n_splits > 1 && s->fd_partials && s->fd_partials_cap >= need &&
+            s->fd_counter && s->fd_counter_cap >= (size_t)n_heads) {
+            static int p_logged = 0;
+            if (!p_logged) {
+                p_logged = 1;
+                fprintf(stderr,
+                        "[rustllama] decode flash: FLOAT4+PIPE2 split-KV ENGAGED "
+                        "(n_heads=%d n_splits=%d -> %d blocks; vectorized loads + depth-2 "
+                        "prefetch) (logged once)\n",
+                        n_heads, n_splits, n_heads * n_splits);
+            }
+            dim3 sgrid((unsigned)n_heads, (unsigned)n_splits);
+            if (rsl_launch_splitfused_pipe4_dpos(sgrid, block, shmem, s->stream, q, k, v,
+                                                 s->fd_partials, s->fd_counter, out,
+                                                 n_heads, n_gqa, head_dim, max_ctx, d_pos,
+                                                 n_splits, scale, window, softcap))
+                return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32_dpos");
+        }
+    }
     // GQA-group-shared split-KV decode flash: takes PRECEDENCE over split-fused for a
     // real-GQA model (n_kv_heads < n_heads, NG ∈ {2,4,8}). The grid keys on kv-heads
     // with MORE splits (rsl_decode_attn_n_splits(nsm, n_kv_heads)) to keep ~SM-count

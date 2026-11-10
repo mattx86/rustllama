@@ -457,6 +457,19 @@ pub const VERDICT_DECODE_FLASH_GQA: &str = "attn:decode_flash_gqa";
 /// `accel::decode_flash_gqa_enabled` AND's it with [`VERDICT_DECODE_FLASH_GQA`];
 /// unmeasured / not-a-win ⇒ OFF. Takes PRECEDENCE over the split-fused kernel when on.
 pub const VERDICT_DECODE_FLASH_GQA_FASTER: &str = "attn:decode_flash_gqa_faster";
+/// CORRECTNESS gate for the float4 + depth-2 pipelined split-KV decode flash — the
+/// profiler-directed fix for the 87% load-latency-bound per-position loop (float4-
+/// vectorized K/V loads + a depth-2 register prefetch to hide the ~200-cyc stalls).
+/// Banked by `doctor --cuda-parity` (`attn:decode_flash_pipe4` probe, graded vs the f32
+/// CPU flash-decode reference within the split-fused reassociation tolerance — the dot
+/// reassociates for the contiguous-dim float4 layout). head_dim % 128 == 0 only.
+pub const VERDICT_DECODE_FLASH_PIPE4: &str = "attn:decode_flash_pipe4";
+/// PERF gate for the float4 + pipelined split-KV decode flash — measured FASTER at
+/// DECODE than the split-fused kernel. Banked by `tune --decode-flash-pipe4` (a whole-
+/// decode reload A/B, like the split-fused gate). `accel::decode_flash_pipe4_enabled`
+/// AND's it with [`VERDICT_DECODE_FLASH_PIPE4`]; unmeasured / not-a-win ⇒ OFF. TOP
+/// precedence among the decode-flash kernels when on.
+pub const VERDICT_DECODE_FLASH_PIPE4_FASTER: &str = "attn:decode_flash_pipe4_faster";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror

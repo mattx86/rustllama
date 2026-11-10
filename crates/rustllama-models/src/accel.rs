@@ -11174,6 +11174,22 @@ pub fn set_decode_flash_gqa_force(v: Option<bool>) {
     DECODE_FLASH_GQA_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
+static DECODE_FLASH_PIPE4_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Force the float4 + depth-2 pipelined split-KV decode-flash path on/off for the
+/// current process (the `tune --decode-flash-pipe4` A/B harness only). `None` clears the
+/// override → the `RUSTLLAMA_DECODE_FLASH_PIPE4` env / the `attn:decode_flash_pipe4{,_faster}`
+/// verdicts decide. Like the split-fused force: the decode step graph re-captures on a
+/// model reload, so the A/B sets this, reloads, measures per arm.
+pub fn set_decode_flash_pipe4_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DECODE_FLASH_PIPE4_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
 /// reserved below free VRAM when `load_inner` projects the expert-promotion
 /// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
@@ -11404,6 +11420,40 @@ pub fn decode_flash_gqa_enabled() -> bool {
             }
         },
     )
+}
+
+/// Whether the float4 + depth-2 pipelined split-KV decode flash is enabled. The
+/// per-position decode-flash loop is 87% K/V LOAD-LATENCY-bound (clock64 phase profiler:
+/// 46% Kload + 41% Vload, each scalar load stalling ~200+ cyc DRAM-or-L2), so this
+/// kernel float4-vectorizes the loads (4 scalar → 1 wide transaction) and keeps a
+/// depth-2 register prefetch (next positions' loads in flight during compute) to hide
+/// that latency — the fix the profiler itself prints. Gated on BOTH the correctness
+/// verdict [`VERDICT_DECODE_FLASH_PIPE4`] (parity within the split-fused reassociation
+/// tolerance) AND the perf verdict [`VERDICT_DECODE_FLASH_PIPE4_FASTER`] (measured faster
+/// than split-fused at decode). TOP precedence among the decode-flash kernels when on.
+/// `RUSTLLAMA_DECODE_FLASH_PIPE4=1` force-enables (the on-pod A/B lever), `=0` disables.
+/// The `.cu` launcher additionally requires head_dim % 128 == 0 (VC ∈ {1,2}); other
+/// head_dims keep the split-fused path. Fail-closed: unmeasured / not-a-win ⇒ OFF.
+pub fn decode_flash_pipe4_enabled() -> bool {
+    match DECODE_FLASH_PIPE4_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        match std::env::var("RUSTLLAMA_DECODE_FLASH_PIPE4")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                kernel_verdict(rustllama_tuner::VERDICT_DECODE_FLASH_PIPE4)
+                    && kernel_verdict(rustllama_tuner::VERDICT_DECODE_FLASH_PIPE4_FASTER)
+            }
+        }
+    })
 }
 
 /// Whether the shared attention KV mirror is stored f16 (vs f32) — whole-mirror
@@ -12316,6 +12366,10 @@ pub fn try_decode_step_cuda_graph_f32(
     // GQA branch first). Pushed the same way BEFORE capture so the graph records it and
     // `ensure_fd_scratch` sizes the (larger, kv-head-split) partials scratch.
     ck::set_decode_flash_gqa(Some(decode_flash_gqa_enabled()));
+    // float4 + depth-2 pipelined split-KV decode flash: TOP precedence among the decode-
+    // flash kernels (the .cu dpos entry orders the pipe4 branch first). Pushed before
+    // capture so the graph records it; shares the split-fused scratch (no extra alloc).
+    ck::set_decode_flash_pipe4(Some(decode_flash_pipe4_enabled()));
     let ok = unsafe {
         g.decode_step_graph_f32(
             layers, hidden, k_caches, v_caches, n_heads, n_kv_heads, head_dim, d_model, pos,

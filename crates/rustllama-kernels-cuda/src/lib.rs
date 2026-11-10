@@ -1112,6 +1112,25 @@ extern "C" {
         window: c_int,
         softcap: f32,
     ) -> c_int;
+    // float4 + depth-2 pipelined split-KV decode flash (EAGER probe entry). Returns -2
+    // for head_dim % 128 != 0 (caller falls back to the split-fused kernel).
+    fn rsl_cuda_flash_attn_decode_splitfused_pipe4_f32(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        partials: *mut f32,
+        counter: *mut c_int,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len: c_int,
+        n_splits: c_int,
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
     // Device-pos twins of rope_f32 / kv_scatter_rows_f32 / flash_attn_decode_f32
     // for the PERSISTENT capture-once decode step graph: the position is read from
     // a 1-int device buffer `d_pos`, so the captured graph is static (only d_pos's
@@ -1159,6 +1178,10 @@ extern "C" {
     // the `attn:decode_flash_gqa` verdict). v: 0=off, 1=on, else = clear the override
     // (fall back to RUSTLLAMA_DECODE_FLASH_GQA).
     fn rsl_cuda_set_decode_flash_gqa(v: c_int);
+    // Capture-safe override for the float4+pipe2 split-KV decode flash (driven by the
+    // `attn:decode_flash_pipe4` verdict). v: 0=off, 1=on, else = clear the override
+    // (fall back to RUSTLLAMA_DECODE_FLASH_PIPE4).
+    fn rsl_cuda_set_decode_flash_pipe4(v: c_int);
     // Capture-safe override for the 64x128 fragment-direct prefill GEMM tile
     // (1 on / 0 off / -1 env). accel pushes the verdict-driven decision.
     fn rsl_cuda_set_gemm_64x128(v: c_int);
@@ -3709,6 +3732,22 @@ pub fn set_decode_flash_gqa(sel: Option<bool>) {
     unsafe { rsl_cuda_set_decode_flash_gqa(v) }
 }
 
+/// Push the verdict-driven decision for the float4 + depth-2 pipelined split-KV decode
+/// flash (`Some(true)` = use it, `Some(false)` = off, `None` = fall back to the
+/// `RUSTLLAMA_DECODE_FLASH_PIPE4` env). Set ONCE before the first decode so the captured
+/// graph records the chosen kernel; driven by `accel::decode_flash_pipe4_enabled()` from
+/// the `attn:decode_flash_pipe4` (correct) + `attn:decode_flash_pipe4_faster` (measured)
+/// verdicts. TOP precedence among the decode-flash kernels when on. Inert off-NVIDIA.
+pub fn set_decode_flash_pipe4(sel: Option<bool>) {
+    let v: c_int = match sel {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    };
+    // SAFETY: a trivial C setter storing one int to a process global; no pointers.
+    unsafe { rsl_cuda_set_decode_flash_pipe4(v) }
+}
+
 /// Push the verdict-driven decision for the 64x128 fragment-direct prefill GEMM
 /// tile (`Some(true)` = use it, `Some(false)` = force the 64x64, `None` = fall back
 /// to the env). accel resolves this once from the kernel verdicts.
@@ -3802,6 +3841,58 @@ pub unsafe fn flash_attn_decode_splitfused_gqa_f32(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_splitfused_gqa_f32(
+        stream.raw(),
+        q,
+        k,
+        v,
+        partials,
+        counter,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        n_splits as c_int,
+        window as c_int,
+        softcap,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// float4 + depth-2 pipelined split-KV decode attention — standalone EAGER entry for
+/// the `attn:decode_flash_pipe4` parity probe. Same scratch contract as
+/// [`flash_attn_decode_splitfused_f32`] (per-q-head partials + `[n_heads]` counter).
+/// Returns `Err(CudaError::Kernel(-2))` for head_dim % 128 != 0 (the caller then grades
+/// the ordinary split-fused kernel instead).
+///
+/// SAFETY: `q`/`out` = [n_heads,head_dim], `k`/`v` = [n_kv_heads,max_ctx,head_dim],
+/// `partials` = [n_heads*n_splits*(head_dim+2)], `counter` = [n_heads]; all device
+/// pointers on `stream`; `n_heads % n_kv_heads == 0`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_splitfused_pipe4_f32(
+    stream: &CudaStream,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    partials: *mut f32,
+    counter: *mut c_int,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    n_splits: usize,
+    window: i32,
+    softcap: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_splitfused_pipe4_f32(
         stream.raw(),
         q,
         k,
