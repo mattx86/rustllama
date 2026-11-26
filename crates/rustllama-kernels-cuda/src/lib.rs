@@ -1131,6 +1131,22 @@ extern "C" {
         window: c_int,
         softcap: f32,
     ) -> c_int;
+    // CP (context parallelism): one decode-attention PARTIAL over a compact position
+    // block on `device`, returned to host as [n_heads*(head_dim+2)] {acc,m,l} per head.
+    fn rsl_cuda_cp_decode_partial_f32(
+        device: c_int,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        partials: *mut f32,
+        n_heads: c_int,
+        n_gqa: c_int,
+        head_dim: c_int,
+        kv_len: c_int,
+        scale: f32,
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
     // Device-pos twins of rope_f32 / kv_scatter_rows_f32 / flash_attn_decode_f32
     // for the PERSISTENT capture-once decode step graph: the position is read from
     // a 1-int device buffer `d_pos`, so the captured graph is static (only d_pos's
@@ -3909,6 +3925,58 @@ pub unsafe fn flash_attn_decode_splitfused_pipe4_f32(
         window as c_int,
         softcap,
     );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// CP (context parallelism): compute ONE decode-attention partial over a compact
+/// position block on `device`. Host-API + self-contained (the C side allocs /
+/// uploads / launches / downloads / frees) so a caller can run partials per device
+/// over the sequence's position blocks and merge them on the host with the flash
+/// online-softmax rescale. `q` is `[n_heads*head_dim]`; `k`/`v` are head-major
+/// `[n_kv_heads, kv_len, head_dim]` (n_kv_heads = n_heads / n_gqa); `partials_out` is
+/// `[n_heads*(head_dim+2)]` filled with `{acc[head_dim], m, l}` per head. `n_gqa` is
+/// q-heads-per-kv-head. Returns the raw rc (0 = ok). Pure host memory in/out — no
+/// `CudaStream`, since each call targets a specific device.
+#[allow(clippy::too_many_arguments)]
+pub fn cp_decode_partial_f32(
+    device: u32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    partials_out: &mut [f32],
+    n_heads: usize,
+    n_gqa: usize,
+    head_dim: usize,
+    kv_len: usize,
+    scale: f32,
+    window: i32,
+    softcap: f32,
+) -> Result<(), CudaError> {
+    let n_kv = n_heads / n_gqa.max(1);
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(k.len(), n_kv * kv_len * head_dim);
+    debug_assert_eq!(v.len(), n_kv * kv_len * head_dim);
+    debug_assert_eq!(partials_out.len(), n_heads * (head_dim + 2));
+    let rc = unsafe {
+        rsl_cuda_cp_decode_partial_f32(
+            device as c_int,
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            partials_out.as_mut_ptr(),
+            n_heads as c_int,
+            n_gqa as c_int,
+            head_dim as c_int,
+            kv_len as c_int,
+            scale,
+            window as c_int,
+            softcap,
+        )
+    };
     if rc == 0 {
         Ok(())
     } else {

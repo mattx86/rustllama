@@ -12379,8 +12379,10 @@ impl LlamaModel {
             // device. Under a pipeline split the layers live on different GPUs, so the
             // single-device graph would run them all on stage 0 (and alloc the
             // all-layers f32 KV mirror there — the OOM we are splitting). Disable it so
-            // the eager per-layer loop runs each layer on its stage device.
+            // the eager per-layer loop runs each layer on its stage device. CP likewise
+            // needs the host attention path (position-split KV), so disable it there too.
             && !crate::accel::multi_gpu_plan_active()
+            && !crate::accel::multi_gpu_mode_is_context()
             && crate::accel::dev_step_cuda_graph_enabled()
             && (0..n_layers_used).all(|i| {
                 kv.layer_cap(i) == kv.max_ctx && matches!(kv.layers[i], KvLayer::F32 { .. })
@@ -12598,7 +12600,13 @@ impl LlamaModel {
             // below, which applies it. Non-scaled + linear/NTK keep the device
             // blocks, fed `self.rope_inv_freq` — the scaled table, byte-identical to
             // the base table when the model carries no scaling.
-            let device_attn = if self.yarn_mscale == 1.0 && !is_ring_l {
+            // CP (context parallelism) owns the attention: it splits the host KV by
+            // POSITION across devices and merges the online-softmax partials, so it
+            // must run on the host attention path below — skip the fused device block.
+            let device_attn = if self.yarn_mscale == 1.0
+                && !is_ring_l
+                && !crate::accel::multi_gpu_mode_is_context()
+            {
                 if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
                     // Per-layer SWA window (0 ⇒ full causal) + Gemma2 attention-logit
                     // soft-cap (0.0 ⇒ no cap), threaded into every device block's
@@ -13051,25 +13059,49 @@ impl LlamaModel {
                             v[dst..dst + head_dim]
                                 .copy_from_slice(&v_buf[h * head_dim..(h + 1) * head_dim]);
                         }
-                        // Seed the CUDA decode KV mirror with the prefill
-                        // history on the first decode step after a prefill (a
-                        // no-op once resident). Without it the native-CUDA
-                        // decode path's resident-mirror gap check declines for
-                        // the whole generation (decode starts at
-                        // pos = prompt_len against an empty mirror), so decode
-                        // attention silently runs on the CPU while the matvec
-                        // stays on the GPU.
-                        crate::accel::decode_seed_kv_f32(
+                        // Sliding-window span + Gemma2 soft-cap for this layer, HOISTED
+                        // here because they now feed the CP hook as well as the GPU hook
+                        // + CPU fallback below.
+                        let swa_win = cfg.swa_window(layer_idx);
+                        let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+                        // CP (context parallelism): split the host KV by POSITION across
+                        // the usable CUDA devices, compute each block's online-softmax
+                        // partial, and merge them into `attn_out`. Returns false (the
+                        // paths below run unchanged) unless CP mode is active with ≥2 CUDA
+                        // devices on a full-causal layer. The KV stays on host, so CP
+                        // serves a context limited by RAM, not VRAM — slower (re-uploads
+                        // blocks per step) but far longer-reaching than the VRAM mirror.
+                        let cp_handled = crate::accel::try_cp_decode_attention(
+                            &q_buf,
                             k,
                             v,
-                            layer_idx,
-                            cur_pos as u32,
-                            n_heads as u32,
-                            n_kv_heads as u32,
-                            head_dim as u32,
-                            max_ctx as u32,
-                            cfg.n_layers as u32,
+                            &mut attn_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            cur_pos,
+                            1.0 / (head_dim as f32).sqrt(),
+                            swa_win as u32,
+                            softcap,
                         );
+                        // Seed the CUDA decode KV mirror with the prefill history on the
+                        // first decode step after a prefill (a no-op once resident).
+                        // Skipped under CP — it uses the host KV + per-device partials,
+                        // not the single-device mirror.
+                        if !cp_handled {
+                            crate::accel::decode_seed_kv_f32(
+                                k,
+                                v,
+                                layer_idx,
+                                cur_pos as u32,
+                                n_heads as u32,
+                                n_kv_heads as u32,
+                                head_dim as u32,
+                                max_ctx as u32,
+                                cfg.n_layers as u32,
+                            );
+                        }
                         // USM-resident SYCL path first (opt-in via
                         // `RUSTLLAMA_USM_ATTN=1`). On integrated GPUs
                         // (Iris Xe + shared LPDDR) the K/V cache stays
@@ -13078,29 +13110,25 @@ impl LlamaModel {
                         // to the GPU. The kernel reads them in place.
                         // Returns true if the kernel ran; false falls
                         // through to the CPU flash/standard path below.
-                        // Sliding-window span for this layer (0 ⇒ full attention) +
-                        // Gemma2 attention-logit soft-cap (0.0 ⇒ no cap). Both are now
-                        // THREADED into the GPU flash kernel (bit-exact to the CPU
-                        // capped+windowed path), so an SWA / Gemma2 layer runs on the
-                        // GPU too (no more fail-closed decline). Computed here so they
-                        // feed both the GPU hook and the CPU fallback below.
-                        let swa_win = cfg.swa_window(layer_idx);
-                        let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
-                        let gpu_handled = crate::accel::try_flash_attn_decode_gpu_f32(
-                            &q_buf,
-                            &k_buf,
-                            &v_buf,
-                            &mut attn_out,
-                            layer_idx,
-                            cur_pos as u32,
-                            n_heads as u32,
-                            n_kv_heads as u32,
-                            head_dim as u32,
-                            max_ctx as u32,
-                            cfg.n_layers as u32,
-                            swa_win as u32,
-                            softcap,
-                        );
+                        // CP already filled `attn_out` when active (short-circuit, so the
+                        // GPU flash is skipped); otherwise try the USM/CUDA device flash.
+                        // `swa_win`/`softcap` were hoisted above.
+                        let gpu_handled = cp_handled
+                            || crate::accel::try_flash_attn_decode_gpu_f32(
+                                &q_buf,
+                                &k_buf,
+                                &v_buf,
+                                &mut attn_out,
+                                layer_idx,
+                                cur_pos as u32,
+                                n_heads as u32,
+                                n_kv_heads as u32,
+                                head_dim as u32,
+                                max_ctx as u32,
+                                cfg.n_layers as u32,
+                                swa_win as u32,
+                                softcap,
+                            );
                         if gpu_handled {
                             // attn_out already populated by the SYCL
                             // kernel; skip CPU flash + standard paths.

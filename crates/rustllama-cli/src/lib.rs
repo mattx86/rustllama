@@ -13136,8 +13136,12 @@ fn vram_capped_auto_ctx(resolved_ctx: u32, model_path: &std::path::Path) -> (u32
     // the plan (so `multi_gpu_plan_active()` is not yet true here on the pp path).
     if !rustllama_models::accel::cuda_active()
         || rustllama_models::accel::multi_gpu_mode_is_pipeline()
+        || rustllama_models::accel::multi_gpu_mode_is_context()
         || rustllama_models::accel::multi_gpu_plan_active()
     {
+        // CP keeps the KV on HOST and streams per-step position blocks to the GPUs,
+        // so its context is bounded by RAM, not VRAM — the single-GPU VRAM cap would
+        // wrongly shrink it. (PP splits the mirror across stage GPUs; both lift the cap.)
         return (resolved_ctx, None);
     }
     let Ok((dims, _quant)) = read_dims_and_quant_from_gguf(model_path) else {

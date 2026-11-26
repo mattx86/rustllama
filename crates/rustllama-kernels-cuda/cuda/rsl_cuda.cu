@@ -5955,6 +5955,60 @@ __global__ void flash_attn_decode_combine_f32_kernel(const float *partials,
     }
 }
 
+// CP (CONTEXT parallelism) host-API: compute ONE decode-attention PARTIAL — the
+// online-softmax {acc[head_dim], m, l} per head — over a COMPACT position block
+// (q vs the k/v of positions [0,kv_len), head-major, stride = kv_len) on `device`.
+// Self-contained: sets the device, allocs + uploads + launches the split kernel with
+// n_splits=1 (one partial covering the whole block), syncs, downloads, frees. A
+// caller runs this per device over the sequence's position blocks and merges the N
+// partials on the host with the exact flash online-softmax rescale (m=max; l=Σ l_i
+// e^{m_i−m}; out=Σ acc_i e^{m_i−m} / l) — Ring-Attention-style context parallelism.
+// `partials_host` is [n_heads*(head_dim+2)]. The dot/softmax depend only on the
+// (already-RoPE'd) k vectors, not the absolute position index, so a position-split +
+// online-softmax merge is BIT-EXACT vs the whole attention. Returns 0 on success.
+// WRITE-BLIND forward use; validated by `attn:context_parallel` + on 2-GPU HW.
+extern "C" int rsl_cuda_cp_decode_partial_f32(
+    int device, const float *q_host, const float *k_host, const float *v_host,
+    float *partials_host, int n_heads, int n_gqa, int head_dim, int kv_len,
+    float scale, int window, float softcap) {
+    if (n_heads <= 0 || head_dim <= 0 || kv_len <= 0 || n_gqa <= 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (n_heads % n_gqa) != 0) return -2;
+    if (cudaSetDevice(device) != cudaSuccess) return -3;
+    const int n_kv = n_heads / n_gqa;              // kv-heads (kernel: kv_h = hh / n_gqa)
+    const size_t q_sz = (size_t)n_heads * head_dim;
+    const size_t kv_sz = (size_t)n_kv * (size_t)kv_len * head_dim; // head-major, max_ctx=kv_len
+    const size_t p_sz = (size_t)n_heads * (head_dim + 2);
+    float *dq = nullptr, *dk = nullptr, *dv = nullptr, *dp = nullptr;
+    int rc = -4;
+    bool ok = cudaMalloc(&dq, q_sz * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dk, kv_sz * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dv, kv_sz * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dp, p_sz * sizeof(float)) == cudaSuccess;
+    if (ok) {
+        cudaMemcpy(dq, q_host, q_sz * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(dk, k_host, kv_sz * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(dv, v_host, kv_sz * sizeof(float), cudaMemcpyHostToDevice);
+        dim3 block(32, RSL_FLASH_DECODE_W);
+        size_t shmem =
+            (size_t)(RSL_FLASH_DECODE_W * head_dim + 2 * RSL_FLASH_DECODE_W) * sizeof(float);
+        dim3 grid((unsigned)n_heads, 1u);
+        // max_ctx == kv_len: a COMPACT block, so the kernel's (kv_h*max_ctx + t)
+        // indexing reads exactly this block's packed [n_kv, kv_len, head_dim].
+        flash_attn_decode_split_f32_kernel<<<grid, block, shmem>>>(
+            dq, dk, dv, dp, n_heads, n_gqa, head_dim, /*max_ctx=*/kv_len, kv_len,
+            /*n_splits=*/1, scale, window, softcap);
+        if (cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess) {
+            cudaMemcpy(partials_host, dp, p_sz * sizeof(float), cudaMemcpyDeviceToHost);
+            rc = 0;
+        }
+    }
+    if (dq) cudaFree(dq);
+    if (dk) cudaFree(dk);
+    if (dv) cudaFree(dv);
+    if (dp) cudaFree(dp);
+    return rc;
+}
+
 // Fused split-KV + combine ("last-block-combines", graph-CAPTURABLE — no cooperative
 // launch / grid.sync, which is NOT reliably capturable into a stream-captured CUDA
 // graph). grid (n_heads, n_splits), ONE regular kernel: every block computes its

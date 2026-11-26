@@ -2121,13 +2121,14 @@ fn multi_gpu_plan() -> Option<std::sync::Arc<MultiGpuPlan>> {
 /// `[inference].multi_gpu` into this env var at startup (env winning, the same
 /// pattern as `disabled_gpus` / `cpu_enabled`), so this one read covers both the
 /// config key and the env override. 0 = unset/auto, 1 = off, 2 = pipeline, 3 =
-/// tensor.
+/// tensor, 4 = context (CP: split the KV along POSITION across devices).
 fn multi_gpu_mode_code() -> u8 {
     match std::env::var("RUSTLLAMA_MULTI_GPU") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
             "off" => 1,
             "pp" => 2,
             "tp" => 3,
+            "cp" => 4,
             _ => 0,
         },
         Err(_) => 0,
@@ -2140,14 +2141,26 @@ pub fn multi_gpu_mode_is_pipeline() -> bool {
     multi_gpu_mode_code() == 2
 }
 
+/// CP — is CONTEXT-parallel mode selected (config or env)? Read by the serve
+/// placement path to install the position-split plan, and by the ctx-cap +
+/// decode forward. Context parallelism replicates the weights on every device and
+/// splits the KV cache along POSITION (device d holds a contiguous block of
+/// sequence positions), combining the per-device attention partials with the exact
+/// online-softmax merge (the split/combine kernel pair). It trades weight memory
+/// (replicated) for a per-GPU KV footprint of ctx/N — the right axis for a context
+/// LONGER than one GPU can hold, orthogonal to (and composable with) pipeline.
+pub fn multi_gpu_mode_is_context() -> bool {
+    multi_gpu_mode_code() == 4
+}
+
 /// TP-5 — are the TENSOR-parallel dispatch arms (column/row-parallel matvec)
-/// allowed? True unless the mode is explicitly `off` (1) or `pp` (2) — pipeline
-/// already disables TP via `pipeline_active()`, and `off` disables all cross-GPU
-/// work. Default (auto/tensor) ⇒ true, preserving the auto-on-when-usable behavior.
-/// Cheap (env check + one atomic); the `tp_*_usable()` gates still require ≥2 GPUs,
-/// so this is inert on a single-GPU box.
+/// allowed? True unless the mode is explicitly `off` (1), `pp` (2), or `cp` (4) —
+/// pipeline + context parallelism each own the attention/placement path, and `off`
+/// disables all cross-GPU work. Default (auto/tensor) ⇒ true, preserving the
+/// auto-on-when-usable behavior. Cheap (env check + one atomic); the `tp_*_usable()`
+/// gates still require ≥2 GPUs, so this is inert on a single-GPU box.
 pub fn multi_gpu_tp_allowed() -> bool {
-    !matches!(multi_gpu_mode_code(), 1 | 2)
+    !matches!(multi_gpu_mode_code(), 1 | 2 | 4)
 }
 
 /// The default CUDA device index the single-device dispatch path uses (0).
@@ -2773,6 +2786,245 @@ pub fn attn_head_parallel_self_check() -> Option<(bool, f32)> {
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
     Some((worst <= 1e-4, worst))
+}
+
+/// CP write-blind parity self-check (CUDA): CONTEXT-parallel decode attention.
+/// Splits the KV along POSITION into 2 contiguous blocks, computes each block's
+/// online-softmax PARTIAL on a (separate, if ≥2 present) CUDA device via
+/// [`ck::cp_decode_partial_f32`], then MERGES the two partials on the host with the
+/// exact flash rescale (`M=max(m_b)`, `L=Σ l_b e^{m_b−M}`, `out=Σ acc_b e^{m_b−M}/L`)
+/// — Ring-Attention-style. Grades vs a straight CPU softmax-attention reference.
+/// Because the dot/softmax depend only on the (already-RoPE'd) k vectors, not the
+/// absolute position, the position-split + merge is bit-exact — this validates the
+/// per-device-block partial + cross-device gather + online-softmax combine that the
+/// CP forward relies on. On a single GPU both blocks run on device 0 (algebra +
+/// wrapper plumbing); the real cross-device split is exercised on 2+ GPU HW. `None`
+/// off CUDA. Read by `doctor --cuda-parity attn:context_parallel`.
+pub fn attn_context_parallel_self_check() -> Option<(bool, f32)> {
+    if !cuda_active() {
+        return None;
+    }
+    set_current_layer_idx(0);
+    // Small GQA decode: 8 Q-heads, 4 KV-heads (gqa=2), head_dim 64, 40 positions.
+    let (n_heads, n_kv_heads, head_dim, kv_len) = (8usize, 4usize, 64usize, 40usize);
+    let n_gqa = n_heads / n_kv_heads;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let q: Vec<f32> = (0..n_heads * head_dim)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+        .collect();
+    // head-major [n_kv_heads, kv_len, head_dim]
+    let k: Vec<f32> = (0..n_kv_heads * kv_len * head_dim)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.03)
+        .collect();
+    let v: Vec<f32> = (0..n_kv_heads * kv_len * head_dim)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.02)
+        .collect();
+
+    // CPU reference: whole softmax attention of the single query over all positions.
+    let mut reference = vec![0f32; n_heads * head_dim];
+    for h in 0..n_heads {
+        let kv_h = h / n_gqa;
+        let mut scores = vec![0f32; kv_len];
+        for (t, sc) in scores.iter_mut().enumerate() {
+            let mut dot = 0f32;
+            for d in 0..head_dim {
+                dot += q[h * head_dim + d] * k[(kv_h * kv_len + t) * head_dim + d];
+            }
+            *sc = dot * scale;
+        }
+        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut z = 0f32;
+        for sc in &mut scores {
+            *sc = (*sc - m).exp();
+            z += *sc;
+        }
+        for d in 0..head_dim {
+            let mut o = 0f32;
+            for (t, &p) in scores.iter().enumerate() {
+                o += (p / z) * v[(kv_h * kv_len + t) * head_dim + d];
+            }
+            reference[h * head_dim + d] = o;
+        }
+    }
+
+    // CP path: split positions into 2 blocks, partial per device, host-merge.
+    let n_dev = usable_cuda_device_count().max(1);
+    let blocks = 2usize;
+    let block_size = kv_len.div_ceil(blocks);
+    let stride = head_dim + 2;
+    let mut partials: Vec<Vec<f32>> = Vec::with_capacity(blocks);
+    for b in 0..blocks {
+        let p0 = b * block_size;
+        let p1 = ((b + 1) * block_size).min(kv_len);
+        if p0 >= p1 {
+            continue;
+        }
+        let blen = p1 - p0;
+        // compact block K/V [n_kv_heads, blen, head_dim]
+        let mut kb = vec![0f32; n_kv_heads * blen * head_dim];
+        let mut vb = vec![0f32; n_kv_heads * blen * head_dim];
+        for kv_h in 0..n_kv_heads {
+            let src = (kv_h * kv_len + p0) * head_dim;
+            let dst = kv_h * blen * head_dim;
+            let n = blen * head_dim;
+            kb[dst..dst + n].copy_from_slice(&k[src..src + n]);
+            vb[dst..dst + n].copy_from_slice(&v[src..src + n]);
+        }
+        let dev = if (b as u32) < n_dev as u32 {
+            b as u32
+        } else {
+            0
+        };
+        let mut part = vec![0f32; n_heads * stride];
+        if ck::cp_decode_partial_f32(
+            dev, &q, &kb, &vb, &mut part, n_heads, n_gqa, head_dim, blen, scale, 0, 0.0,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        partials.push(part);
+    }
+    if partials.is_empty() {
+        return None;
+    }
+
+    // Host online-softmax merge of the per-block partials.
+    let mut out = vec![0f32; n_heads * head_dim];
+    for h in 0..n_heads {
+        let mut big_m = f32::NEG_INFINITY;
+        for part in &partials {
+            big_m = big_m.max(part[h * stride + head_dim]);
+        }
+        let mut big_l = 0f32;
+        for part in &partials {
+            let m_b = part[h * stride + head_dim];
+            let l_b = part[h * stride + head_dim + 1];
+            if m_b.is_finite() {
+                big_l += l_b * (m_b - big_m).exp();
+            }
+        }
+        let inv = if big_l > 0.0 { 1.0 / big_l } else { 0.0 };
+        for d in 0..head_dim {
+            let mut o = 0f32;
+            for part in &partials {
+                let m_b = part[h * stride + head_dim];
+                if m_b.is_finite() {
+                    o += part[h * stride + d] * (m_b - big_m).exp();
+                }
+            }
+            out[h * head_dim + d] = o * inv;
+        }
+    }
+
+    let worst = reference
+        .iter()
+        .zip(&out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    Some((worst <= 1e-4, worst))
+}
+
+/// CP forward: compute a layer's DECODE attention for the current query by splitting
+/// the KV along POSITION across the usable CUDA devices. Device `d` owns the fixed
+/// position block `[d*B, (d+1)*B)` (B = ceil(max_ctx / N)); each participating device
+/// computes its block's online-softmax partial over the compact block extracted from
+/// the host KV cache, and the partials are merged on the host with the exact flash
+/// rescale. Writes `[n_heads*head_dim]` to `out`. Returns false (caller runs the
+/// normal single-device attention) unless CP mode is active, CUDA has ≥2 usable
+/// devices, the GQA split is clean, and the layer is full-causal (window 0, no
+/// softcap — SWA/softcap under a position split needs a GLOBAL window and is deferred).
+///
+/// First-correct path: it re-extracts + re-uploads each device's block per step
+/// (the `cp_decode_partial_f32` host-API allocs/uploads/frees). That re-streams the
+/// KV each token — correct but not yet fast; a persistent per-device block mirror
+/// (seed once, append the new token to its owner) is the perf follow-up. The memory
+/// goal already holds: no device ever holds more than its ctx/N block.
+#[allow(clippy::too_many_arguments)]
+pub fn try_cp_decode_attention(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    pos: usize,
+    scale: f32,
+    window: u32,
+    softcap: f32,
+) -> bool {
+    if !cuda_active() || !multi_gpu_mode_is_context() {
+        return false;
+    }
+    if window != 0 || softcap != 0.0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+        return false;
+    }
+    let n_dev = usable_cuda_device_count();
+    if n_dev < 2 {
+        return false;
+    }
+    let n_gqa = n_heads / n_kv_heads;
+    let kv_len = pos + 1;
+    let block_size = max_ctx.div_ceil(n_dev);
+    let stride = head_dim + 2;
+    let mut partials: Vec<Vec<f32>> = Vec::with_capacity(n_dev);
+    for d in 0..n_dev {
+        let p0 = d * block_size;
+        if p0 >= kv_len {
+            break; // later blocks hold no positions yet
+        }
+        let p1 = ((d + 1) * block_size).min(kv_len);
+        let blen = p1 - p0;
+        let mut kb = vec![0f32; n_kv_heads * blen * head_dim];
+        let mut vb = vec![0f32; n_kv_heads * blen * head_dim];
+        for kv_h in 0..n_kv_heads {
+            let src = (kv_h * max_ctx + p0) * head_dim;
+            let dst = kv_h * blen * head_dim;
+            let n = blen * head_dim;
+            kb[dst..dst + n].copy_from_slice(&k_cache[src..src + n]);
+            vb[dst..dst + n].copy_from_slice(&v_cache[src..src + n]);
+        }
+        let mut part = vec![0f32; n_heads * stride];
+        if ck::cp_decode_partial_f32(
+            d as u32, q, &kb, &vb, &mut part, n_heads, n_gqa, head_dim, blen, scale, 0, 0.0,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        partials.push(part);
+    }
+    if partials.is_empty() {
+        return false;
+    }
+    for h in 0..n_heads {
+        let mut big_m = f32::NEG_INFINITY;
+        for part in &partials {
+            big_m = big_m.max(part[h * stride + head_dim]);
+        }
+        let mut big_l = 0f32;
+        for part in &partials {
+            let m_b = part[h * stride + head_dim];
+            let l_b = part[h * stride + head_dim + 1];
+            if m_b.is_finite() {
+                big_l += l_b * (m_b - big_m).exp();
+            }
+        }
+        let inv = if big_l > 0.0 { 1.0 / big_l } else { 0.0 };
+        for d in 0..head_dim {
+            let mut o = 0f32;
+            for part in &partials {
+                let m_b = part[h * stride + head_dim];
+                if m_b.is_finite() {
+                    o += part[h * stride + d] * (m_b - big_m).exp();
+                }
+            }
+            out[h * head_dim + d] = o * inv;
+        }
+    }
+    true
 }
 
 /// Single-row packed matvec on a SPECIFIC CUDA device (Phase 4 cross-GPU

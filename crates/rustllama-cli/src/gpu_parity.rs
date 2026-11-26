@@ -11321,6 +11321,34 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- CP: context-parallel decode attention. The KV is split along POSITION into
+    // 2 blocks, each block's online-softmax partial is computed on a (separate, if ≥2)
+    // CUDA device, and the two partials are merged on the host with the exact flash
+    // rescale, graded vs a CPU softmax-attention reference. Position-split + merge is
+    // bit-exact (softmax depends on the k vectors, not the index); on one GPU both
+    // blocks run on device 0 → validates the partial + merge algebra + wrapper. Real
+    // cross-device position split on multi-GPU HW. WRITE-BLIND.
+    {
+        let name = rustllama_tuner::VERDICT_ATTN_CONTEXT_PARALLEL;
+        match rustllama_models::accel::attn_context_parallel_self_check() {
+            None => {
+                cu_emit(name, "SKIP", "no-cuda-device");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+            Some((passed, worst)) => {
+                let key: &'static str = if passed { "OK" } else { "MISCOMPUTE" };
+                *counts.entry(key).or_default() += 1;
+                cu_emit(
+                    name,
+                    key,
+                    &format!(
+                        "worst_abs={worst:.5} (40 pos → 2 position blocks → online-softmax merge vs whole; cross-device on multi-GPU HW)"
+                    ),
+                );
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

@@ -610,6 +610,15 @@ pub const VERDICT_MATVEC_TP_ROW: &str = "matvec:tp_row";
 /// real cross-device head shard is confirmed on 2+ GPU HW.
 pub const VERDICT_ATTN_HEAD_PARALLEL: &str = "attn:head_parallel";
 
+/// CP write-blind parity verdict — CONTEXT-parallel decode attention. The KV is
+/// split along POSITION into blocks, each block's online-softmax partial is computed
+/// on a (separate) CUDA device, and the partials are merged with the exact flash
+/// rescale, graded vs a CPU softmax-attention reference. Position-split + merge is
+/// bit-exact (softmax depends on the k vectors, not the index); on one GPU both
+/// blocks run on device 0, validating the partial + merge algebra + wrapper — the
+/// real cross-device position split is confirmed on 2+ GPU HW.
+pub const VERDICT_ATTN_CONTEXT_PARALLEL: &str = "attn:context_parallel";
+
 // --- P6-fusions: the three forward-path fusion verdicts ----------------
 //
 // Each is a PARITY verdict: `tune --validate-kernels` grades the fused SYCL
