@@ -4231,6 +4231,20 @@ async fn serve(
             (serving, model_id)
         } else {
             let max_ctx = resolve_config_ctx(cfg.inference.ctx_size, path) as usize;
+            // Phase A: cap an AUTO context to the single-GPU VRAM fit. The decode KV
+            // mirror is all-layers f32 and scales with ctx, so an uncapped 32K auto
+            // window OOMs an 8 GB GPU (the whole mirror lands on one device). Only
+            // bites when ctx_size is the AUTO sentinel (0) — an explicit ctx is
+            // honored as-is — and only on a single active CUDA GPU.
+            let max_ctx = if cfg.inference.ctx_size == 0 {
+                let (capped, note) = vram_capped_auto_ctx(max_ctx as u32, path);
+                if let Some(note) = note {
+                    tracing::warn!(model = %path.display(), "{note}");
+                }
+                capped as usize
+            } else {
+                max_ctx
+            };
             tracing::info!(model = %path.display(), max_ctx, "loading CPU engine");
             // (keep_quant_raw + promote_memory_env were hoisted above the engine
             // branch so the paged engine gets them too — see the block before
@@ -11000,8 +11014,16 @@ fn cmd_tune_multi_gpu(
         n_gpu_layers: cfg.inference.n_gpu_layers,
         optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
-    let ctx_size =
-        (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
+    // Phase A: measure at the ctx serve ACTUALLY uses (AUTO → trained window ∩ cap
+    // ∩ single-GPU VRAM fit), not the tiny `prompt+decode+8` synthetic ctx that let
+    // every mode trivially fit GPU0 and banked an OOMing `pp` by noise. With the
+    // VRAM cap applied (as serve does single-GPU), the modes load without the
+    // OOM-retry storm, and the existing "fastest among successful loads" winner
+    // picks the mode that actually fits. (Phase B will lift the cap for a
+    // distributing arm so PP/TP's larger-ctx advantage is measured.)
+    let resolved_ctx = resolve_config_ctx(cfg.inference.ctx_size, &model_path);
+    let (serve_ctx, _) = vram_capped_auto_ctx(resolved_ctx, &model_path);
+    let ctx_size = (serve_ctx as usize).max(prompt_tokens as usize + decode_tokens as usize + 8);
 
     println!("rustllama tune --multi-gpu");
     println!("  model         = {}", model_path.display());
@@ -13037,6 +13059,60 @@ fn resolve_config_ctx(config_ctx: u32, model_path: &std::path::Path) -> u32 {
     }
     let ctx_train = rustllama_server::peek_gguf_ctx_train(model_path).unwrap_or(0);
     rustllama_engine::auto_ctx_from_train(ctx_train)
+}
+
+/// Phase A (multi-GPU OOM campaign): when ctx is AUTO (the zero-config default) on
+/// a SINGLE active CUDA GPU, cap the resolved context so the whole-model decode KV
+/// footprint fits device VRAM. The decode path mirrors EVERY layer's KV to the
+/// device as an f32 buffer sized by max_ctx (accel.rs `mirror_bytes = n_kv *
+/// max_ctx * head_dim * 4`), and the T2 whole-step graph runs all layers
+/// device-resident — so the GPU footprint is ~`n_layers * 2 * n_kv * head_dim *
+/// ctx * (4 mirror + kv_bytes)` and scales with CTX, *not* `n_gpu_layers` (shedding
+/// layers only trims the storage half; the all-layers f32 mirror is fixed). At a
+/// 32K auto context with F32 KV that is ~18 GiB for a 4B model — an instant OOM on
+/// an 8 GB GPU, with each per-layer device op then failing + retrying forever.
+/// Worst-case f32 (the mirror is always f32, and the coherence guardrail can force
+/// f32 storage) keeps the cap safe whatever kv_dtype the load resolves. Returns the
+/// (possibly reduced) ctx + a note when it bit. Bypassed off CUDA and when a
+/// distributing multi-GPU plan is active (Phase B splits the mirror across
+/// devices, lifting this) — and only ever reduces a value, never raises it.
+fn vram_capped_auto_ctx(resolved_ctx: u32, model_path: &std::path::Path) -> (u32, Option<String>) {
+    if !rustllama_models::accel::cuda_active() || rustllama_models::accel::multi_gpu_plan_active() {
+        return (resolved_ctx, None);
+    }
+    let Ok((dims, _quant)) = read_dims_and_quant_from_gguf(model_path) else {
+        return (resolved_ctx, None);
+    };
+    let Some(free) = rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0) else {
+        return (resolved_ctx, None);
+    };
+    // f32 storage (4) + always-f32 device mirror (4) = 8 bytes/element, per K and V
+    // (the 2), per kv-head × head_dim, per layer, per ctx token.
+    let bytes_per_ctx =
+        (dims.n_layers.max(1) as u64) * 2 * (dims.n_kv_heads as u64) * (dims.head_dim as u64) * 8;
+    if bytes_per_ctx == 0 {
+        return (resolved_ctx, None);
+    }
+    const SCRATCH_RESERVE: u64 = 768 << 20; // ~0.75 GiB activations / scratch / CUDA context
+    let budget = (((free as f64) * 0.80) as u64).saturating_sub(SCRATCH_RESERVE);
+    // Largest ctx whose whole-model footprint fits; floor to a 256 multiple, keep a
+    // sane minimum so a very tight GPU still opens a usable window.
+    let ctx_cap = (((budget / bytes_per_ctx) as u32) / 256 * 256).max(2048);
+    if resolved_ctx <= ctx_cap {
+        return (resolved_ctx, None);
+    }
+    let note = format!(
+        "auto ctx {resolved_ctx} → {ctx_cap}: the whole-model decode KV footprint (f32 storage \
+         + the always-f32 device mirror, all {} layers) is ~{} per 1K ctx tokens, so {resolved_ctx} \
+         ctx would need ~{} on the one active GPU (~{} free). Capped so the model fits with all \
+         layers on GPU. Set [inference].ctx_size explicitly to override, choose a smaller kv_dtype, \
+         or use multi-GPU (Phase B) to serve the full trained window across both GPUs.",
+        dims.n_layers,
+        human_bytes(bytes_per_ctx * 1024),
+        human_bytes(bytes_per_ctx * resolved_ctx as u64),
+        human_bytes(free),
+    );
+    (ctx_cap, Some(note))
 }
 
 fn resolve_model_path(s: &str) -> anyhow::Result<PathBuf> {
