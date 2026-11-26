@@ -2021,11 +2021,18 @@ impl LlamaWeights {
                         gguf,
                         &format!("{prefix}.ffn_down_shexp.weight"),
                     ),
-                    // GGUF MoE loads (DeepSeek-V3 / Qwen3-MoE) keep the
-                    // shared expert ungated; the Qwen2-MoE sigmoid gate
-                    // is wired on the MLX/safetensors load path, which
-                    // populates this. Preserve existing GGUF behavior.
-                    shared_router: None,
+                    // Qwen2-MoE (Qwen1.5-MoE) sigmoid-GATES its always-on shared
+                    // expert by `sigmoid(ffn_gate_inp_shexp · hidden)`. Load that gate
+                    // vector so the forward applies it (moe.rs matches on
+                    // `shared_router`); WITHOUT it the shared expert ran UNSCALED and
+                    // its wide (5632) FFN swamped the routed sum → incoherent output.
+                    // `load_optional` ⇒ None for archs without the tensor, so DeepSeek-V3
+                    // (always-on shared, no gate) and Qwen3-MoE / Mixtral (no shared
+                    // expert) are byte-identical to before.
+                    shared_router: load_optional_weight(
+                        gguf,
+                        &format!("{prefix}.ffn_gate_inp_shexp.weight"),
+                    ),
                     gate_per_expert,
                     up_per_expert,
                     down_per_expert,
