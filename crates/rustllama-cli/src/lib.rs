@@ -11048,6 +11048,35 @@ fn cmd_tune_multi_gpu(
     let (serve_ctx, _) = vram_capped_auto_ctx(resolved_ctx, &model_path);
     let ctx_size = (serve_ctx as usize).max(prompt_tokens as usize + decode_tokens as usize + 8);
 
+    // Phase C1 — CAPACITY-first auto-select. If a pipeline split serves a materially
+    // larger window than a single GPU can (the single-GPU cap had to shrink the
+    // trained window to fit VRAM), `pp` is the only mode that "can load the entire
+    // model" at its context — bank it WITHOUT a speed A/B (PP is the capacity win;
+    // its decode is naturally a touch slower than a single GPU's but it is the only
+    // way to serve the full window). When a single GPU already serves the full
+    // resolved window, capacity is equal → fall through to the speed measurement
+    // (which also lets TP win once Phase C2 lands). Analytic (no OOM-storm load).
+    if let Ok((dims, _q)) = read_dims_and_quant_from_gguf(&model_path) {
+        if let Some(pp_ctx) = pp_window_ctx_estimate(&dims, &model_path) {
+            // "Materially larger" = PP serves >= 1.25× the single-GPU window AND the
+            // single-GPU cap actually shrank the resolved (trained ∩ cap) window.
+            let single_gpu_shrank = serve_ctx < resolved_ctx;
+            if single_gpu_shrank && pp_ctx >= (serve_ctx as f64 * 1.25) as u32 {
+                println!("rustllama tune --multi-gpu");
+                println!("  model         = {}", model_path.display());
+                println!(
+                    "  CAPACITY: pipeline serves ~{pp_ctx} ctx across {} GPUs vs ~{serve_ctx} \
+                     on one (trained window {resolved_ctx}); banking `pp` so the full window \
+                     loads across both cards.",
+                    rustllama_models::accel::usable_cuda_device_count()
+                );
+                persist_multi_gpu_winner("pp")?;
+                println!("  → persisted multi_gpu_mode = pp (auto-applies when [inference].multi_gpu is unset)");
+                return Ok(());
+            }
+        }
+    }
+
     println!("rustllama tune --multi-gpu");
     println!("  model         = {}", model_path.display());
     println!("  ctx_size      = {ctx_size}");
@@ -13144,6 +13173,40 @@ fn vram_capped_auto_ctx(resolved_ctx: u32, model_path: &std::path::Path) -> (u32
         human_bytes(free),
     );
     (ctx_cap, Some(note))
+}
+
+/// Phase C1 (capacity-aware multi-GPU auto-select): a conservative estimate of the
+/// largest context a PIPELINE split can serve across the usable CUDA GPUs. Under PP
+/// the KV STORAGE lives on host; the GPU footprint is the resident weights + the
+/// all-layers f32 decode mirror (which scales with ctx), split across the stage
+/// GPUs. So the combined window is `(Σ free_i × 0.80 − N × 512 MiB reserve −
+/// weights) / (n_layers × 2 × n_kv × head_dim × 4)`. Weights are over-estimated by
+/// the GGUF file size × 1.1 (covers the non-layer embedding / LM-head the stage
+/// planner doesn't separately budget) so a `pp` we bank genuinely installs. `None`
+/// on <2 usable CUDA GPUs (PP is meaningless) or when the fit can't be computed.
+fn pp_window_ctx_estimate(
+    dims: &rustllama_tuner::placement::ModelDims,
+    model_path: &std::path::Path,
+) -> Option<u32> {
+    let n = rustllama_models::accel::usable_cuda_device_count();
+    if n < 2 {
+        return None;
+    }
+    let mut agg_free: u64 = 0;
+    for i in 0..n as u32 {
+        agg_free += rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(i)?;
+    }
+    let weights = (std::fs::metadata(model_path).ok()?.len() as f64 * 1.1) as u64;
+    const PER_GPU_RESERVE: u64 = 512 << 20;
+    let budget = (((agg_free as f64) * 0.80) as u64)
+        .saturating_sub(PER_GPU_RESERVE * n as u64)
+        .saturating_sub(weights);
+    let mirror_per_ctx =
+        (dims.n_layers.max(1) as u64) * 2 * (dims.n_kv_heads as u64) * (dims.head_dim as u64) * 4;
+    if mirror_per_ctx == 0 || budget == 0 {
+        return None;
+    }
+    Some((((budget / mirror_per_ctx) as u32) / 256 * 256).max(2048))
 }
 
 fn resolve_model_path(s: &str) -> anyhow::Result<PathBuf> {
