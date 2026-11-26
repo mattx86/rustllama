@@ -392,7 +392,18 @@ pub fn plan_pipeline_stages(
     opts: &AutoPlacementOpts,
     per_layer_kv_bytes: u64,
 ) -> Option<HeatPlan> {
-    let tiers = build_tiers(per_device_perf, opts, false)?;
+    // Phase B: the flat `reserve_bytes` (default ~1 GiB) exists so the SINGLE-device
+    // planner leaves headroom for KV + activations + the CUDA context. The pipeline
+    // path reserves the KV EXPLICITLY per layer (`per_layer_kv_bytes` below), so
+    // reusing the full flat reserve double-counts KV and wrongly rejects a model that
+    // fits (e.g. a 4B at 32K F32 across 2×8 GB rejected by a hair). Drop the flat
+    // reserve to an activations/CUDA-context-only floor; the per-layer KV reserve
+    // carries the rest.
+    let stage_opts = AutoPlacementOpts {
+        reserve_bytes: opts.reserve_bytes.min(512 << 20),
+        ..opts.clone()
+    };
+    let tiers = build_tiers(per_device_perf, &stage_opts, false)?;
     // GPU tiers in the order build_tiers emits them (CUDA by index, then SYCL) —
     // stage 0 = the first GPU. (device, budget_bytes)
     let gpu_tiers: Vec<(DeviceTarget, u64)> = tiers
@@ -460,10 +471,19 @@ pub fn plan_pipeline_stages(
         s.len()
     };
     let placement_error = overflow.then(|| {
+        // The per-stage cost is dominated by the per-layer KV mirror, which scales
+        // with ctx_size — so an overflow is almost always "ctx too big for the
+        // combined VRAM", not the (fixed) weights. Guide the user at the real lever.
+        let total_budget: u64 = gpu_tiers.iter().map(|(_, b)| *b).sum();
         format!(
-            "pipeline: model ({} MiB of layers) overflows all {} GPUs' budgets",
+            "pipeline: model needs ~{} MiB ({} MiB weights + per-layer KV at this ctx) \
+             across {} GPUs but their combined budget is only ~{} MiB. Lower \
+             [inference].ctx_size (the KV mirror scales with it) or choose a smaller \
+             kv_dtype.",
+            (gpu_resident_bytes + per_layer_kv_bytes * n_layers as u64) / (1 << 20),
             gpu_resident_bytes / (1 << 20),
-            gpu_tiers.len()
+            gpu_tiers.len(),
+            total_budget / (1 << 20),
         )
     });
 

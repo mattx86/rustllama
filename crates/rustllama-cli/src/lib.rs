@@ -4730,7 +4730,30 @@ async fn serve(
             // when the model doesn't satisfy them, instead of silently
             // spilling weights to the CPU / host RAM.
             let force_gpu_fit = !cfg.inference.cpu_enabled || cfg.inference.vram_only;
-            let applied_n_gpu_layers = if force_gpu_fit {
+            let applied_n_gpu_layers = if rustllama_models::accel::multi_gpu_mode_is_pipeline() {
+                // Phase B: pipeline parallelism explicitly requested. Run the heat
+                // planner, whose pp branch splits the layers (and their per-stage KV
+                // mirror) into contiguous per-GPU stages and installs the MultiGpuPlan.
+                // This takes PRECEDENCE over a cached per-tensor n_gpu_layers winner
+                // (which bypasses auto_place_heat and left the stage plan uninstalled —
+                // the bug that kept GPU1 idle): pp makes every layer GPU-resident across
+                // stages. On <2 GPUs the pp branch finds no stage plan and falls through
+                // inside auto_place_heat to the single-device planner, so this is a safe
+                // no-op on one GPU.
+                let decision = cpu.auto_place_heat(&placement_opts);
+                if let Some(err) = &decision.placement_error {
+                    anyhow::bail!("pipeline placement failed for {}: {err}", path.display());
+                }
+                tracing::info!(
+                    model = %model_key,
+                    n_gpu_layers = decision.n_gpu_layers,
+                    total_layers = decision.total_layers,
+                    pipeline = rustllama_models::accel::multi_gpu_plan_active(),
+                    reason = %decision.reason,
+                    "multi-GPU pipeline placement",
+                );
+                decision.n_gpu_layers
+            } else if force_gpu_fit {
                 let decision = cpu.auto_place_heat(&placement_opts);
                 if decision.vram_only_noop {
                     tracing::warn!(
@@ -13077,7 +13100,15 @@ fn resolve_config_ctx(config_ctx: u32, model_path: &std::path::Path) -> u32 {
 /// distributing multi-GPU plan is active (Phase B splits the mirror across
 /// devices, lifting this) — and only ever reduces a value, never raises it.
 fn vram_capped_auto_ctx(resolved_ctx: u32, model_path: &std::path::Path) -> (u32, Option<String>) {
-    if !rustllama_models::accel::cuda_active() || rustllama_models::accel::multi_gpu_plan_active() {
+    // Bypass off CUDA, and whenever pipeline parallelism is requested or already
+    // installed: PP splits the all-layers f32 mirror across the stage GPUs, so the
+    // full trained window fits — the single-GPU cap would wrongly shrink it. The
+    // MODE check matters because this runs at engine-load, BEFORE placement installs
+    // the plan (so `multi_gpu_plan_active()` is not yet true here on the pp path).
+    if !rustllama_models::accel::cuda_active()
+        || rustllama_models::accel::multi_gpu_mode_is_pipeline()
+        || rustllama_models::accel::multi_gpu_plan_active()
+    {
         return (resolved_ctx, None);
     }
     let Ok((dims, _quant)) = read_dims_and_quant_from_gguf(model_path) else {

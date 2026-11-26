@@ -12375,6 +12375,12 @@ impl LlamaModel {
             && self.yarn_mscale == 1.0
             && n_layers_used == n_blocks_total
             && crate::accel::stream_window() == 0
+            // Phase B: the whole-decode-step CUDA graph captures EVERY layer on ONE
+            // device. Under a pipeline split the layers live on different GPUs, so the
+            // single-device graph would run them all on stage 0 (and alloc the
+            // all-layers f32 KV mirror there — the OOM we are splitting). Disable it so
+            // the eager per-layer loop runs each layer on its stage device.
+            && !crate::accel::multi_gpu_plan_active()
             && crate::accel::dev_step_cuda_graph_enabled()
             && (0..n_layers_used).all(|i| {
                 kv.layer_cap(i) == kv.max_ctx && matches!(kv.layers[i], KvLayer::F32 { .. })
