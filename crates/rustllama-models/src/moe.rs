@@ -584,7 +584,27 @@ pub fn moe_ffn_one_into(
     // gated; on success `out` holds the routed-expert sum and the shared expert
     // (below) still adds in. A miss (not all promoted, unsupported dtype, verdict
     // off) falls through unchanged.
-    if crate::accel::try_moe_ffn_grouped_dev_resident(
+    // EP (expert parallelism): when `multi_gpu = "ep"` with ≥2 CUDA GPUs, dispatch
+    // this token's routed experts to the device that OWNS each (expert e → device
+    // e / ceil(n_experts/N)), run a per-device grouped FFN over the device's subset,
+    // and sum the partials — splitting the expert weight memory across the GPUs. A
+    // decline (EP off / <2 GPUs / an expert not promoted) resets `out` and falls
+    // through to the single-device grouped / per-expert paths unchanged.
+    if crate::accel::multi_gpu_mode_is_expert()
+        && crate::accel::try_moe_ffn_ep(
+            hidden,
+            &block.gate_per_expert,
+            &block.up_per_expert,
+            &block.down_per_expert,
+            picks,
+            n_experts,
+            d_model,
+            d_ff,
+            out,
+        )
+    {
+        // EP: routed experts summed across the GPUs. Shared expert below adds in.
+    } else if crate::accel::try_moe_ffn_grouped_dev_resident(
         hidden,
         &block.gate_per_expert,
         &block.up_per_expert,

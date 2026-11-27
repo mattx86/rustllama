@@ -430,6 +430,10 @@ pub struct InferenceConfig {
     ///   combining per-device attention partials with the online-softmax merge.
     ///   The axis for a context longer than one GPU can hold; trades weight memory
     ///   for KV capacity, so it wins over `pp` only when weights are small vs the KV.
+    /// - `"ep"` — **expert** parallelism (MoE only): split the routed experts across
+    ///   the GPUs (device d owns experts `[d*E/N, (d+1)*E/N)`), dispatching each
+    ///   token's picks to their owner and summing the partials. Splits the expert
+    ///   weight memory so a MoE whose experts exceed one GPU runs across N.
     ///
     /// The `RUSTLLAMA_MULTI_GPU` env var OVERRIDES this at read time.
     /// WRITE-BLIND: the real cross-GPU execution is validated on 2+ GPU hardware;
@@ -1722,9 +1726,9 @@ pub fn validate(cfg: &Config) -> Result<()> {
     // TP-5 — `[inference].multi_gpu`, when set, must be one of the known modes.
     if let Some(m) = cfg.inference.multi_gpu.as_ref() {
         let m = m.trim().to_ascii_lowercase();
-        if !matches!(m.as_str(), "off" | "pp" | "tp" | "cp") {
+        if !matches!(m.as_str(), "off" | "pp" | "tp" | "cp" | "ep") {
             return Err(ConfigError::Validation(format!(
-                "[inference].multi_gpu must be \"off\", \"pp\", \"tp\", or \"cp\" (got \"{m}\")"
+                "[inference].multi_gpu must be \"off\", \"pp\", \"tp\", \"cp\", or \"ep\" (got \"{m}\")"
             )));
         }
     }
@@ -2181,7 +2185,7 @@ mod tests {
         assert!(c.inference.multi_gpu.is_none());
         assert!(validate(&c).is_ok());
         // Each known mode is accepted (case-insensitive).
-        for m in ["off", "pp", "tp", "cp", "PP", "Tp", "CP"] {
+        for m in ["off", "pp", "tp", "cp", "ep", "PP", "Tp", "CP", "EP"] {
             c.inference.multi_gpu = Some(m.into());
             assert!(validate(&c).is_ok(), "mode {m} should be valid");
         }

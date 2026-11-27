@@ -2124,6 +2124,18 @@ impl ContiguousEngine {
                     // non-MoE arms (budget 0, inert) are exercised by the unit tests.
                     project_moe_tier_budget_bytes(Some(avail), true, expert_b, non_expert_b, margin)
                 };
+                // EP (expert parallelism): promote ALL experts, not just the
+                // single-device VRAM budget's worth. The experts are managed memory
+                // (host-backed until accessed), and EP dispatches each device's subset
+                // to that device so its pages settle there — splitting the expert
+                // weight memory across the GPUs. A single-device budget would leave the
+                // cold tail un-promoted, and EP would then decline (fall back to one
+                // GPU) for any token routing to an un-promoted expert.
+                let vram_expert_bytes = if rustllama_models::accel::multi_gpu_mode_is_expert() {
+                    model.weights.vram_byte_breakdown().0
+                } else {
+                    vram_expert_bytes
+                };
                 if vram_expert_bytes > 0 {
                     // Usage ranking (hottest-first) from the persisted per-model
                     // sidecar, so a tight budget buys the most-routed experts. Cold

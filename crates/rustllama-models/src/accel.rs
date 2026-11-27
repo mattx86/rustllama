@@ -430,6 +430,7 @@ fn try_matvec_packed_cuda(
 /// guaranteed here by the owning `Tensor`'s `Storage::Device` allocation
 /// outliving the call.
 unsafe fn try_matvec_packed_cuda_dev_resident(
+    device: u32,
     kind: ck::CudaPackedKind,
     w_ptr_dev: *const core::ffi::c_void,
     w_nbytes: usize,
@@ -438,14 +439,17 @@ unsafe fn try_matvec_packed_cuda_dev_resident(
     m: usize,
     k: usize,
 ) -> bool {
-    let Some(cache) = cuda_cache() else {
+    // `cuda_cache_for(0)` == `cuda_cache()` (the single-device path, byte-identical);
+    // EP passes the EXPERT's OWNING device so its managed pages settle there.
+    let Some(cache) = cuda_cache_for(device) else {
         return false;
     };
     let Ok(mut guard) = cache.lock() else {
         return false;
     };
-    // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
-    // `>= w_nbytes` bytes on this cache's (default) device for the call.
+    // SAFETY: caller guarantees `w_ptr_dev` is a live device-accessible (managed)
+    // buffer of `>= w_nbytes` bytes for the call; managed memory is reachable from
+    // any device, migrating to `device` on access.
     let ok = unsafe { guard.matvec_packed_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k) };
     if ok {
         note_moe_dev_resident_hit();
@@ -2121,7 +2125,8 @@ fn multi_gpu_plan() -> Option<std::sync::Arc<MultiGpuPlan>> {
 /// `[inference].multi_gpu` into this env var at startup (env winning, the same
 /// pattern as `disabled_gpus` / `cpu_enabled`), so this one read covers both the
 /// config key and the env override. 0 = unset/auto, 1 = off, 2 = pipeline, 3 =
-/// tensor, 4 = context (CP: split the KV along POSITION across devices).
+/// tensor, 4 = context (CP: split the KV along POSITION), 5 = expert (EP: split the
+/// MoE experts across devices).
 fn multi_gpu_mode_code() -> u8 {
     match std::env::var("RUSTLLAMA_MULTI_GPU") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -2129,6 +2134,7 @@ fn multi_gpu_mode_code() -> u8 {
             "pp" => 2,
             "tp" => 3,
             "cp" => 4,
+            "ep" => 5,
             _ => 0,
         },
         Err(_) => 0,
@@ -2153,6 +2159,17 @@ pub fn multi_gpu_mode_is_context() -> bool {
     multi_gpu_mode_code() == 4
 }
 
+/// EP — is EXPERT-parallel mode selected (config or env)? Read by the MoE forward to
+/// dispatch each token's routed experts to the device that owns them (expert `e` →
+/// device `e / ceil(n_experts/N)`), running a per-device grouped FFN over the
+/// resident subset and summing the partials. The promoted experts are managed
+/// memory, so consistent per-device access settles them across the GPUs — splitting
+/// the expert weight memory the way PP splits layers. Inert off CUDA / <2 GPUs / on
+/// a dense (non-MoE) model.
+pub fn multi_gpu_mode_is_expert() -> bool {
+    multi_gpu_mode_code() == 5
+}
+
 /// TP-5 — are the TENSOR-parallel dispatch arms (column/row-parallel matvec)
 /// allowed? True unless the mode is explicitly `off` (1), `pp` (2), or `cp` (4) —
 /// pipeline + context parallelism each own the attention/placement path, and `off`
@@ -2160,7 +2177,7 @@ pub fn multi_gpu_mode_is_context() -> bool {
 /// auto-on-when-usable behavior. Cheap (env check + one atomic); the `tp_*_usable()`
 /// gates still require ≥2 GPUs, so this is inert on a single-GPU box.
 pub fn multi_gpu_tp_allowed() -> bool {
-    !matches!(multi_gpu_mode_code(), 1 | 2 | 4)
+    !matches!(multi_gpu_mode_code(), 1 | 2 | 4 | 5)
 }
 
 /// The default CUDA device index the single-device dispatch path uses (0).
@@ -5753,6 +5770,30 @@ pub fn try_moe_ffn_grouped_dev_resident(
     d_ff: usize,
     out: &mut [f32],
 ) -> bool {
+    try_moe_ffn_grouped_dev_resident_on(0, hidden, gate, up, down, picks, d_model, d_ff, out)
+}
+
+/// EP (expert parallelism): the grouped routed-expert FFN run on a SPECIFIC CUDA
+/// device. Identical to [`try_moe_ffn_grouped_dev_resident`] (device 0) except it
+/// locks `cuda_cache_for(device)`, so the kernel launches on `device` and its stream.
+/// The promoted expert weights are CUDA MANAGED memory (device-agnostic): accessing
+/// expert `e` consistently from its owning device migrates its pages there once and
+/// keeps them resident — so dispatching each device's pick-subset here settles the
+/// experts across the GPUs (the EP split), with managed oversubscription as the
+/// safety net for a model whose experts exceed one GPU. Callers sum the per-device
+/// partials. `out` is OVERWRITTEN with THIS device's weighted expert sum.
+#[allow(clippy::too_many_arguments)]
+pub fn try_moe_ffn_grouped_dev_resident_on(
+    device: u32,
+    hidden: &[f32],
+    gate: &[Tensor],
+    up: &[Tensor],
+    down: &[Tensor],
+    picks: &[(usize, f32)],
+    d_model: usize,
+    d_ff: usize,
+    out: &mut [f32],
+) -> bool {
     if !cuda_active() || picks.is_empty() || hidden.len() != d_model || out.len() != d_model {
         return false;
     }
@@ -5813,7 +5854,7 @@ pub fn try_moe_ffn_grouped_dev_resident(
         down_ptrs.push(d);
         weights.push(*w);
     }
-    let Some(cache) = cuda_cache() else {
+    let Some(cache) = cuda_cache_for(device) else {
         return false;
     };
     let Ok(mut guard) = cache.lock() else {
@@ -5834,6 +5875,149 @@ pub fn try_moe_ffn_grouped_dev_resident(
         }
     }
     ok
+}
+
+/// EP (expert parallelism) forward: dispatch a token's routed experts across the
+/// usable CUDA devices by OWNER (expert `e` → device `e / ceil(n_experts/N)`), run
+/// the per-device grouped FFN over each device's pick-subset, and SUM the partials
+/// into `out`. The promoted experts are managed memory, so the consistent per-device
+/// access settles each device's experts' pages there — splitting the expert weight
+/// memory across the GPUs, the EP analog of PP's layer split. Returns false (the
+/// caller runs its single-device grouped / per-expert path) unless EP mode is active,
+/// CUDA has ≥2 usable devices, and EVERY non-empty device-group's grouped FFN
+/// succeeded. `out` must be pre-zeroed; on success it holds the routed-expert sum,
+/// on a mid-way decline it is re-zeroed so the fallback starts clean.
+#[allow(clippy::too_many_arguments)]
+pub fn try_moe_ffn_ep(
+    hidden: &[f32],
+    gate: &[Tensor],
+    up: &[Tensor],
+    down: &[Tensor],
+    picks: &[(usize, f32)],
+    n_experts: usize,
+    d_model: usize,
+    d_ff: usize,
+    out: &mut [f32],
+) -> bool {
+    if !cuda_active() || !multi_gpu_mode_is_expert() || picks.is_empty() {
+        return false;
+    }
+    let n_dev = usable_cuda_device_count();
+    if n_dev < 2 || n_experts == 0 || out.len() != d_model {
+        return false;
+    }
+    let per_dev = n_experts.div_ceil(n_dev);
+    if per_dev == 0 {
+        return false;
+    }
+    static EP_DBG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dbg = std::env::var("RUSTLLAMA_EP_DEBUG").ok().as_deref() == Some("1")
+        && EP_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4;
+    // PER-EXPERT dispatch (NOT the grouped FFN): the grouped kernel needs
+    // d_ff % 256 == 0, which excludes models like Qwen1.5-MoE (expert d_ff 1408).
+    // The device-resident per-matvec path handles any d_ff. Each routed expert's
+    // gate/up/down run on its OWNER device (managed pages migrate + settle there),
+    // the silu is on host, and `out` accumulates the weighted expert sum. A single
+    // weight that is not a device-resident (promoted) managed buffer declines the
+    // whole call → caller runs its single-device path (`out` reset to zero).
+    let mut gate_buf = vec![0f32; d_ff];
+    let mut up_buf = vec![0f32; d_ff];
+    let mut ff_buf = vec![0f32; d_ff];
+    let mut down_buf = vec![0f32; d_model];
+    let dev_wptr = |t: &Tensor| -> Option<(ck::CudaPackedKind, *const core::ffi::c_void, usize)> {
+        match (
+            t.storage.device_backend(),
+            t.storage.device_ptr(),
+            dtype_to_cuda_kind(t.dtype),
+        ) {
+            (Some((rustllama_tensor::DeviceBackend::Cuda, _)), Some(p), Some(k)) => {
+                Some((k, p as *const core::ffi::c_void, t.storage.len_bytes()))
+            }
+            _ => None,
+        }
+    };
+    for (expert_idx, weight) in picks {
+        let e = *expert_idx;
+        if e >= gate.len() || e >= up.len() || e >= down.len() {
+            for v in out.iter_mut() {
+                *v = 0.0;
+            }
+            return false;
+        }
+        let dev = ((e / per_dev) as u32).min(n_dev as u32 - 1);
+        let (Some((kg, gp, gn)), Some((ku, upp, un)), Some((kd, dp, dn))) =
+            (dev_wptr(&gate[e]), dev_wptr(&up[e]), dev_wptr(&down[e]))
+        else {
+            if dbg {
+                eprintln!("[ep-dbg] e={e} dev={dev}: expert not device-resident → decline");
+            }
+            for v in out.iter_mut() {
+                *v = 0.0;
+            }
+            return false;
+        };
+        // SAFETY: the pointers are live managed buffers of the given kind/bytes,
+        // owned by the per-expert `Tensor`s that outlive this call.
+        let ok = unsafe {
+            try_matvec_packed_cuda_dev_resident(
+                dev,
+                kg,
+                gp,
+                gn,
+                hidden,
+                &mut gate_buf,
+                d_ff,
+                d_model,
+            ) && try_matvec_packed_cuda_dev_resident(
+                dev,
+                ku,
+                upp,
+                un,
+                hidden,
+                &mut up_buf,
+                d_ff,
+                d_model,
+            )
+        };
+        if !ok {
+            if dbg {
+                eprintln!("[ep-dbg] e={e} dev={dev}: gate/up matvec declined");
+            }
+            for v in out.iter_mut() {
+                *v = 0.0;
+            }
+            return false;
+        }
+        rustllama_kernels_cpu::silu_mul_f32(&gate_buf, &up_buf, &mut ff_buf);
+        let ok = unsafe {
+            try_matvec_packed_cuda_dev_resident(
+                dev,
+                kd,
+                dp,
+                dn,
+                &ff_buf,
+                &mut down_buf,
+                d_model,
+                d_ff,
+            )
+        };
+        if !ok {
+            if dbg {
+                eprintln!("[ep-dbg] e={e} dev={dev}: down matvec declined");
+            }
+            for v in out.iter_mut() {
+                *v = 0.0;
+            }
+            return false;
+        }
+        if dbg {
+            eprintln!("[ep-dbg] e={e} dev={dev}: ok");
+        }
+        for (o, db) in out.iter_mut().zip(down_buf.iter()) {
+            *o += *weight * *db;
+        }
+    }
+    true
 }
 
 // ============================================================
@@ -18290,7 +18474,9 @@ pub fn try_matvec_tensor_usm_f32(
                     }
                     // SAFETY: as above.
                     if unsafe {
-                        try_matvec_packed_cuda_dev_resident(ck_kind, dptr, w_nbytes, x, out, m, k)
+                        try_matvec_packed_cuda_dev_resident(
+                            0, ck_kind, dptr, w_nbytes, x, out, m, k,
+                        )
                     } {
                         return true;
                     }
